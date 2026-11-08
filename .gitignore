@@ -1,0 +1,11 @@
+node_modules/
+**/dist/
+.scratch/
+.playwright-mcp/
+
+.claude/
+.serena/
+reference/
+packages/ccw/README.md
+packages/ccw/LICENSE
+NUL

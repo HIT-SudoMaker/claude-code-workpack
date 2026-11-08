@@ -1,0 +1,8 @@
+node_modules/
+**/dist/
+.scratch/
+reference/
+**/*.md
+**/assets/
+package-lock.json
+.serena/

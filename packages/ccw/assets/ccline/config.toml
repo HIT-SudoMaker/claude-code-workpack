@@ -1,0 +1,34 @@
+version = 2
+preset = "cometix"
+palette = "powerline-light"
+skin = "plain"
+fill = "solid"
+glyphs = "unicode"
+color_depth = "truecolor"
+separator = " | "
+
+[powerline]
+join = "flat"
+end = "flat"
+
+[layout]
+width = "auto"
+padding = "auto"
+reserve = 0
+
+[git]
+cache_ms = 2000
+
+[update]
+check = true
+interval_hours = 24
+
+[[line]]
+left = [
+    "model",
+    { metric = "dir", icon_color = "bright_yellow" },
+    "git",
+    { metric = "context", widget = "text", format = "{pct}%[ · {tokens} tokens]" },
+    "cache",
+]
+right = ["update"]

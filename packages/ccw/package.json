@@ -1,0 +1,46 @@
+{
+  "name": "@hit-sudomaker/ccw",
+  "version": "0.4.0",
+  "description": "Claude Code lifecycle management terminal",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HIT-SudoMaker/ccw.git",
+    "directory": "packages/ccw"
+  },
+  "homepage": "https://github.com/HIT-SudoMaker/ccw#readme",
+  "bugs": {
+    "url": "https://github.com/HIT-SudoMaker/ccw/issues"
+  },
+  "files": [
+    "dist/",
+    "assets/"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "bin": {
+    "ccw": "dist/main.js"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepack": "node build.mjs && node package-files.mjs prepare",
+    "postpack": "node package-files.mjs clean"
+  },
+  "dependencies": {
+    "ink": "8.0.0",
+    "react": "19.3.1",
+    "smol-toml": "1.9.1",
+    "string-width": "8.3.0",
+    "wrap-ansi": "10.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}
