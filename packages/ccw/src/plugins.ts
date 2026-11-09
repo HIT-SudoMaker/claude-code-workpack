@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 import { knownTitle } from './titles.js';
+import { ENABLED_PLUGINS_KEY } from './claude-config.js';
 import { marketplaceSources, pluginSpecs } from './management-catalog.js';
 import { errorCode, isObject } from './machine.js';
 import { cancelled, editFields, json, object, restOf, success, unchanged } from './model.js';
@@ -27,11 +28,24 @@ function pluginSource(name: string, markets: Record<string, unknown>) {
     : null;
 }
 
+/** 插件名的市场段：name@market 形态 */
+function marketOf(name: string) {
+  return name.split('@')[1];
+}
+
+/** 非目录插件的既存市场：用户自选来源只验市场记录在场，不做仓库白名单比对；
+ *  目录内插件一律返回 null，保持来源冲突防护 */
+function declaredMarketSource(name: string, markets: Record<string, unknown>) {
+  if (Object.hasOwn(pluginSpecs, name)) return null;
+  const marketName = marketOf(name);
+  return marketName !== undefined && isObject(markets[marketName]) ? { marketName } : null;
+}
+
 /** 解析插件标题：未安装方案入口用官方名；实际对象须市场记录在场且来源匹配，证据不足保留原始键名 */
 function pluginTitle(name: string, markets: Record<string, unknown> | null, isInstalled: boolean): string {
   if (!isInstalled) return knownTitle(`plugin:${name}`, name);
   if (markets === null) return name;
-  const marketName = name.split('@')[1];
+  const marketName = marketOf(name);
   return marketName !== undefined && markets[marketName] !== undefined && pluginSource(name, markets) !== null
     ? knownTitle(`plugin:${name}`, name)
     : name;
@@ -79,7 +93,7 @@ async function inspectPlugins(ctx: Context): Promise<Inspection> {
   let recordsProblem: string | undefined;
   let marketsProblem: string | undefined;
   try {
-    enabled = object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins);
+    enabled = object((await json(ctx.machine, ctx.settingsFile))[ENABLED_PLUGINS_KEY]);
   } catch (error) {
     settingsProblem = errorCode(error);
     problems.push(settingsProblem);
@@ -142,6 +156,8 @@ async function inspectPlugins(ctx: Context): Promise<Inspection> {
               ? (['update', 'reinstall', 'connect'] as const)
               : (['install'] as const)
             : []),
+          // 非目录插件停用后不是死对象：文件在场时提供恢复启用入口（经安装页复用启用通道）
+          ...(!isOffered && !problem && enabled[name] === false && hasFilesPresent ? (['connect'] as const) : []),
           ...(!settingsProblem && (enabled[name] === true || (enabled[name] === undefined && isInstalled))
             ? (['detach'] as const)
             : []),
@@ -168,38 +184,42 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
   const marketplaceFile = path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json');
   let markets: Record<string, unknown> | null = null;
   let source: ReturnType<typeof pluginSource> = null;
+  let declared: ReturnType<typeof declaredMarketSource> = null;
   try {
     markets = await json(ctx.machine, marketplaceFile);
     source = pluginSource(name, markets);
+    declared = source === null ? declaredMarketSource(name, markets) : null;
   } catch (error) {
     // 解除声明不依赖市场文件可读；取消仍由准备作用域向外传播
     if (action !== 'detach' || errorCode(error) === 'cancelled') throw error;
   }
   const settings = await json(ctx.machine, ctx.settingsFile);
-  const before = object(settings.enabledPlugins);
+  const before = object(settings[ENABLED_PLUGINS_KEY]);
+  const recordsNow = async () => userPluginRecords((await pluginRecords(ctx))[name]);
+  const enabledNow = async () => object((await json(ctx.machine, ctx.settingsFile))[ENABLED_PLUGINS_KEY]);
   if (action === 'detach') {
-    const installed = before[name] === true ? null : userPluginRecords((await pluginRecords(ctx))[name]);
+    const installed = before[name] === true ? null : await recordsNow();
     if (before[name] !== true && (before[name] !== undefined || !installed?.length)) throw new Error('no-connection');
     describe?.(pluginTitle(name, markets, before[name] !== undefined || (installed?.length ?? 0) > 0));
     return {
       writes: [ctx.settingsFile],
       changes: [{ code: 'plugin-disable', detail: name }, { code: 'keep-plugin-files' }],
       async run(report) {
-        if (installed !== null) unchanged(userPluginRecords((await pluginRecords(ctx))[name]), installed);
-        await editFields(ctx, ctx.settingsFile, before, { [name]: false }, 'enabledPlugins');
+        if (installed !== null) unchanged(await recordsNow(), installed);
+        await editFields(ctx, ctx.settingsFile, before, { [name]: false }, ENABLED_PLUGINS_KEY);
         report({ state: 'done', code: 'plugin-disabled', detail: name });
       },
     };
   }
-  if (source === null) throw new Error('marketplace-source-conflict');
-  const records = userPluginRecords((await pluginRecords(ctx))[name]);
+  if (source === null && declared === null) throw new Error('marketplace-source-conflict');
+  const records = await recordsNow();
   describe?.(pluginTitle(name, markets, records.length > 0 || before[name] !== undefined));
   const canReuse =
     action === 'install' &&
     records.length > 0 &&
     (await Promise.all(records.map(record => pluginFilePresent(ctx, record)))).every(Boolean);
   const help = action === 'reinstall' ? await claudeCommand(ctx, ['plugin', 'uninstall', '--help']) : null;
-  // 探测失败保持未知：不以「不支持保留」代替，阻断重装以免官方卸载删除插件数据
+  // 探测失败保持未知：不以「不支持保留」代替；重装一律阻断（官方卸载可能删除插件数据）
   if (help !== null && (help.failed || help.code !== 0)) throw new Error('plugin-keep-data-unconfirmed');
   const shouldKeepData = help !== null && help.stdout.includes('--keep-data');
   let isRemoved = false;
@@ -209,8 +229,15 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
   let expectedRecords = records;
   let expectedEnabled = before[name];
   const validateSource = async () => {
-    const current = pluginSource(name, await json(ctx.machine, marketplaceFile));
-    if (current === null || current.marketName !== source.marketName || current.repository !== source.repository)
+    const marketsNow = await json(ctx.machine, marketplaceFile);
+    if (source !== null) {
+      const current = pluginSource(name, marketsNow);
+      if (current === null || current.marketName !== source.marketName || current.repository !== source.repository)
+        throw new Error('marketplace-source-conflict');
+      return;
+    }
+    const current = declaredMarketSource(name, marketsNow);
+    if (current === null || declared === null || current.marketName !== declared.marketName)
       throw new Error('marketplace-source-conflict');
   };
   return {
@@ -234,8 +261,8 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       cancelled(signal);
       if (isCommandDone && !hasCommandSnapshot) throw new Error('program-installation-unconfirmed');
       await validateSource();
-      unchanged(object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins)[name], expectedEnabled);
-      unchanged(userPluginRecords((await pluginRecords(ctx))[name]), expectedRecords);
+      unchanged((await enabledNow())[name], expectedEnabled);
+      unchanged(await recordsNow(), expectedRecords);
       if (action === 'reinstall' && !isRemoved) {
         success(
           await claudeCommand(ctx, [
@@ -248,13 +275,9 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
           ]),
           'plugin-command-failed',
         );
-        if (
-          userPluginRecords((await pluginRecords(ctx))[name]).length > 0 ||
-          object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins)[name] === true
-        )
-          throw new Error('plugin-remains');
-        expectedRecords = userPluginRecords((await pluginRecords(ctx))[name]);
-        expectedEnabled = object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins)[name];
+        if ((await recordsNow()).length > 0 || (await enabledNow())[name] === true) throw new Error('plugin-remains');
+        expectedRecords = await recordsNow();
+        expectedEnabled = (await enabledNow())[name];
         isRemoved = true;
         report({ state: 'done', code: 'plugin-removed' });
         cancelled(signal);
@@ -262,7 +285,7 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       if (!isCommandDone && (action === 'install' || action === 'reinstall')) {
         await validateSource();
         const markets = await json(ctx.machine, marketplaceFile);
-        if (markets[source.marketName] === undefined)
+        if (source !== null && markets[source.marketName] === undefined)
           success(
             await claudeCommand(ctx, ['plugin', 'marketplace', 'add', source.repository]),
             'marketplace-command-failed',
@@ -275,8 +298,8 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
         isCommandDone = true;
         report({ state: 'done', code: 'plugin-command-completed' });
         try {
-          expectedRecords = userPluginRecords((await pluginRecords(ctx))[name]);
-          expectedEnabled = object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins)[name];
+          expectedRecords = await recordsNow();
+          expectedEnabled = (await enabledNow())[name];
           hasCommandSnapshot = true;
         } catch (error) {
           throw new Error('program-installation-unconfirmed', { cause: error });
@@ -301,11 +324,10 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
             selection.fields.secret,
           );
       }
-      const after = userPluginRecords((await pluginRecords(ctx))[name]);
+      const after = await recordsNow();
       if (after.length === 0) throw new Error('plugin-not-ready');
       for (const record of after) if (!(await pluginFilePresent(ctx, record))) throw new Error('plugin-not-ready');
-      if (action !== 'update' && object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins)[name] !== true)
-        throw new Error('plugin-not-enabled');
+      if (action !== 'update' && (await enabledNow())[name] !== true) throw new Error('plugin-not-enabled');
       report({ state: 'done', code: 'plugin-ready' });
     },
   };

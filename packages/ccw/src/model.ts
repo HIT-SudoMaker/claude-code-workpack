@@ -186,6 +186,17 @@ export function claudeEnvironment(ctx: Context) {
   return { CLAUDE_CONFIG_DIR: ctx.stateFile === path.join(ctx.home, '.claude.json') ? undefined : ctx.claudeRoot };
 }
 
+/** POSIX 用户级可执行目录：Claude 原生安装、uv 与非 Windows OfficeCLI 的共同落点 */
+export const userBinDirectory = (ctx: Context) => path.join(ctx.home, '.local/bin');
+/** 用户级可执行目录内的平台二进制名（win32 补 .exe 后缀） */
+export const userBinary = (ctx: Context, name: string) =>
+  path.join(userBinDirectory(ctx), ctx.platform === 'win32' ? `${name}.exe` : name);
+
+/** 状态文件内 MCP 注册表的键名与读取面：mcp、officecli 与退役迁移共用 */
+export const MCP_SERVERS_KEY = 'mcpServers';
+export const readMcpServers = async (ctx: Context): Promise<Record<string, unknown>> =>
+  object((await json(ctx.machine, ctx.stateFile))[MCP_SERVERS_KEY]);
+
 export function claudeProcessActive(name: string, command: string): boolean {
   return (
     /(?:^|[\\/])(?:claude|Claude Code)(?:\.exe)?$/i.test(name) ||
@@ -211,6 +222,13 @@ export function restOf(id: string): string | undefined {
   const index = id.indexOf(':');
   return index === -1 ? undefined : id.slice(index + 1);
 }
+
+/** Claude 用户数据清理项的固定 id：编排、路由、渲染与标题表共用 */
+export const CLAUDE_DATA_ID = 'data:claude';
+/** 「备份并替换」表单同意值：终端产生，技能与 OfficeCLI 域消费 */
+export const REPLACE_CONSENT = 'yes';
+/** 普通安装任务的默认动作：settings 项进入配置而非重装 */
+export const defaultInstallAction = (id: string): Action => (id === 'settings' ? 'configure' : 'install');
 
 /** 归一路径用于等价比较：win32 大小写不敏感 */
 export function normalizePath(platform: Context['platform'], file: string) {

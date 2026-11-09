@@ -12,8 +12,10 @@ const PROCESS_RECHECK_INTERVAL_MS = 1_000;
 type Category = DataCategory;
 
 /** 清理结果仍有保留（新增、再生或共享链接）时标题须警示：清理承诺删除所选数据，保留是异常；
- *  卸载/安装的保留项是承诺，不警示 */
-export const CLEANUP_RESIDUE_CODES: readonly string[] = ['data-remains-or-regenerated', 'cleanup-link-kept'];
+ *  卸载/安装的保留项是承诺，不警示；发射点与消费表共用同名常量，新增保留码不得漏登记 */
+const RESIDUE_REGENERATED = 'data-remains-or-regenerated';
+const RESIDUE_LINK_KEPT = 'cleanup-link-kept';
+export const CLEANUP_RESIDUE_CODES: readonly string[] = [RESIDUE_REGENERATED, RESIDUE_LINK_KEPT];
 type Group = Category | 'projects';
 interface DataFile {
   readonly file: string;
@@ -61,9 +63,26 @@ const FILES: Readonly<Record<string, Category>> = {
 function isCategory(value: string): value is Category {
   return CATEGORIES.some(category => category === value);
 }
-function size(files: readonly DataFile[]) {
-  return `${files.length} · ${files.reduce((sum, file) => sum + file.sizeBytes, 0n)} B`;
+/** 人类可读字节：满 1024 即换算到下一单位（B/KB/MB/GB/TB），保留 1 位小数 */
+export function formatBytes(bytes: bigint): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
+  let value = bytes * 10n;
+  let unit = 0;
+  while (unit < units.length - 1 && value >= 10n * 1024n) {
+    value = (value + 512n) / 1024n;
+    unit++;
+  }
+  return unit === 0 ? `${value / 10n} B` : `${value / 10n}.${value % 10n} ${units[unit]}`;
 }
+function size(files: readonly DataFile[]) {
+  return `${files.length} · ${formatBytes(files.reduce((sum, file) => sum + file.sizeBytes, 0n))}`;
+}
+
+/** 「文件数 · 逻辑大小」事实的读取面：详情提取与空类别判定跟生产格式同处一地，消费者不反解格式 */
+export const dataSizeDetailOf = (item: { readonly facts: readonly Change[] }) =>
+  item.facts.find(fact => fact.code === 'data-size')?.detail;
+export const isEmptyDataSize = (detail: string | undefined): boolean =>
+  detail === undefined || detail.startsWith('0 · ');
 
 /** 清点白名单；projects 的记忆独立选择，读取缺口按类别保留 */
 async function candidates(ctx: Context, selected?: Category): Promise<Record<Category, Inventory>> {
@@ -77,7 +96,7 @@ async function candidates(ctx: Context, selected?: Category): Promise<Record<Cat
     for (const category of groups(group)) result[category].problems.push({ code: errorCode(error), detail: file });
   };
   const preserve = (group: Group, file: string) => {
-    for (const category of groups(group)) result[category].preserved.push({ code: 'cleanup-link-kept', detail: file });
+    for (const category of groups(group)) result[category].preserved.push({ code: RESIDUE_LINK_KEPT, detail: file });
   };
   const regularFile = (file: string, category: Category, sizeBytes: bigint) => {
     if (!groups(category).length) return;
@@ -250,8 +269,7 @@ async function prepareCleanup(ctx: Context, category: string): Promise<Prepared>
       isComplete = true;
       report({ state: 'done', code: 'data-selected-cleared', detail: size(removed) });
       for (const preserved of remaining.preserved) report({ state: 'kept', ...preserved });
-      if (remaining.files.length)
-        report({ state: 'kept', code: 'data-remains-or-regenerated', detail: size(remaining.files) });
+      if (remaining.files.length) report({ state: 'kept', code: RESIDUE_REGENERATED, detail: size(remaining.files) });
       if (files.length === 0 && directories.length === 0) report({ state: 'kept', code: 'no-data' });
     },
     remaining: () => (isComplete ? undefined : operation),

@@ -9,7 +9,7 @@ import { createMcpDomain } from './mcp.js';
 import { createPluginsDomain } from './plugins.js';
 import { createSkillsDomain } from './skills.js';
 import { errorCode } from './machine.js';
-import { cancelled, context, kindOf, normalizePath, restOf } from './model.js';
+import { CLAUDE_DATA_ID, cancelled, context, defaultInstallAction, kindOf, normalizePath, restOf } from './model.js';
 import type {
   CcwOptions,
   Change,
@@ -28,8 +28,9 @@ import type {
   RunResult,
   Selection,
 } from './model.js';
-import { createOfficecli } from './officecli.js';
+import { createOfficecli, OFFICECLI_ENTRY_IDS } from './officecli.js';
 import { createReadMachine } from './read-machine.js';
+import { writeLastRun } from './storage.js';
 
 export type { Action, Inspection, Item, Pick, Plan, Request } from './model.js';
 export interface Ccw {
@@ -56,6 +57,19 @@ const INVALID_PROGRAM_PLAN_REASONS = new Set([
   'npm-changed',
 ]);
 
+/** 内容域清单单一出处：kind 键供计划路由，标签进检查问题详情 */
+const CONTENT_DOMAINS: ReadonlyArray<
+  readonly [keys: readonly string[], label: string, factory: (ctx: Context) => Domain]
+> = [
+  [['claude'], 'claude', createClaudeDomain],
+  [['officecli'], 'officecli', createOfficecli],
+  [['settings'], 'settings', createSettingsDomain],
+  [['plugin'], 'plugins', createPluginsDomain],
+  [['mcp'], 'mcp', createMcpDomain],
+  [['skill', 'skill-set', 'command'], 'skills', createSkillsDomain],
+  [['ccline'], 'ccline', createCcline],
+];
+
 /** 约束观察器：回调失败即自失效，绝不打断流程 */
 function progressGuard<P>(callback?: (event: P) => unknown) {
   let observer = callback;
@@ -74,16 +88,16 @@ function progressGuard<P>(callback?: (event: P) => unknown) {
 /** 构造失败的 RunResult：problem 项失败、无 problem 项跳过 */
 function planFailure(
   items: readonly { readonly id: string; readonly title: string; readonly problem: string | null }[],
-) {
+): RunResult {
   return {
-    state: 'failed' as const,
+    state: 'failed',
     items: items.map(item => ({
       id: item.id,
       title: item.title,
-      state: 'failed' as const,
+      state: 'failed',
       effects: [
         {
-          state: item.problem ? ('failed' as const) : ('skipped' as const),
+          state: item.problem ? 'failed' : 'skipped',
           code: item.problem ?? 'changes-not-started',
         },
       ],
@@ -101,7 +115,6 @@ function planDisplayTitle(id: string, selected: readonly Selection[]): string {
       id,
       selected.map(other => other.id),
     )}`;
-  if (kind === 'data') return knownTitle(id);
   return knownTitle(id);
 }
 
@@ -155,19 +168,12 @@ export function createCcw(options: CcwOptions): Ccw {
   }>();
   const preparationContext = { ...ctx, machine: createReadMachine(ctx.machine, () => preparation.getStore()) };
   /** 登记 prepare 域：随 preparationContext 一次建成；inspect 域每次内联新建以吃当次读取预算 */
-  const skillsDomain = createSkillsDomain(preparationContext);
-  const prepareDomains = new Map<string, Domain>([
-    ['claude', createClaudeDomain(preparationContext)],
-    ['officecli', createOfficecli(preparationContext)],
-    ['settings', createSettingsDomain(preparationContext)],
-    ['plugin', createPluginsDomain(preparationContext)],
-    ['mcp', createMcpDomain(preparationContext)],
-    ['skill-set', skillsDomain],
-    ['skill', skillsDomain],
-    ['command', skillsDomain],
-    ['data', createCleanupDomain(preparationContext)],
-    ['ccline', createCcline(preparationContext)],
-  ]);
+  const prepareDomains = new Map<string, Domain>();
+  for (const [keys, , factory] of CONTENT_DOMAINS) {
+    const domain = factory(preparationContext);
+    for (const key of keys) prepareDomains.set(key, domain);
+  }
+  prepareDomains.set('data', createCleanupDomain(preparationContext));
   let lifecycle: PlanState = { phase: 'idle' };
   let remaining: { id: string; items: PlanItem[]; work: Map<string, Prepared> } | undefined;
 
@@ -191,15 +197,7 @@ export function createCcw(options: CcwOptions): Ccw {
     const results =
       scope === 'data'
         ? [await guard('data', createCleanupDomain(reading))]
-        : await Promise.all([
-            guard('claude', createClaudeDomain(reading)),
-            guard('officecli', createOfficecli(reading)),
-            guard('settings', createSettingsDomain(reading)),
-            guard('plugins', createPluginsDomain(reading)),
-            guard('mcp', createMcpDomain(reading)),
-            guard('skills', createSkillsDomain(reading)),
-            guard('ccline', createCcline(reading)),
-          ]);
+        : await Promise.all(CONTENT_DOMAINS.map(([, label, factory]) => guard(label, factory(reading))));
     cancelled(signal);
     const grouped = new Set(results.flatMap(result => result.grouped ?? []));
     return {
@@ -253,7 +251,7 @@ export function createCcw(options: CcwOptions): Ccw {
           const isProgram = ['claude', 'officecli', 'ccline'].includes(kindOf(pick.id));
           const action =
             snapshot.task === 'install'
-              ? (pick.maintenance ?? (pick.id === 'settings' ? 'configure' : 'install'))
+              ? (pick.maintenance ?? defaultInstallAction(pick.id))
               : snapshot.task === 'uninstall'
                 ? pick.removal === 'detach' || !isProgram
                   ? 'detach'
@@ -303,7 +301,7 @@ export function createCcw(options: CcwOptions): Ccw {
             const { changes, problem } = await attach(selection.id, async () => {
               if (seen.has(selection.id)) throw new Error('duplicate-selection');
               seen.add(selection.id);
-              if (hasOfficeConnectionChange && ['skill:officecli', 'mcp:officecli'].includes(selection.id))
+              if (hasOfficeConnectionChange && (OFFICECLI_ENTRY_IDS as readonly string[]).includes(selection.id))
                 throw new Error('overlapping-selection');
               return prepare(selection, resolved => {
                 cancelled(signal);
@@ -329,9 +327,9 @@ export function createCcw(options: CcwOptions): Ccw {
         );
         for (const result of workers) if (result.status === 'rejected') throw result.reason;
         if (shouldRemoveData) {
-          await preparation.run(observe('data:claude', knownTitle('data:claude')), async () => {
+          await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
             preparation.getStore()?.report('inspect');
-            const { changes, problem } = await attach('data:claude', () =>
+            const { changes, problem } = await attach(CLAUDE_DATA_ID, () =>
               prepareClaudeDataRemoval(preparationContext, async () => {
                 for (const selection of claudeRemovals) {
                   const program = work.get(selection.id);
@@ -340,7 +338,13 @@ export function createCcw(options: CcwOptions): Ccw {
                 }
               }),
             );
-            items.push({ id: 'data:claude', title: knownTitle('data:claude'), action: 'uninstall', changes, problem });
+            items.push({
+              id: CLAUDE_DATA_ID,
+              title: knownTitle(CLAUDE_DATA_ID),
+              action: 'uninstall',
+              changes,
+              problem,
+            });
           });
         }
         const plan: Plan = { id: randomUUID(), items, problem: items.length === 0 ? 'empty-selection' : null };
@@ -393,7 +397,7 @@ export function createCcw(options: CcwOptions): Ccw {
             if (
               hasClaudeFailure &&
               item.action !== 'detach' &&
-              (kindOf(item.id) === 'plugin' || item.action === 'login' || item.id === 'data:claude')
+              (kindOf(item.id) === 'plugin' || item.action === 'login' || item.id === CLAUDE_DATA_ID)
             )
               throw new Error('dependency-not-ready');
             const operation = current.work.get(item.id);
@@ -447,7 +451,7 @@ export function createCcw(options: CcwOptions): Ccw {
               .map(item => unfinishedItems.find(value => value.id === item.id) ?? item),
             work: unfinished,
           };
-        return {
+        const result: RunResult = {
           state: results.some(item => item.state === 'cancelled')
             ? 'cancelled'
             : results.every(item => item.state === 'done') && current.plan.problem === null
@@ -458,6 +462,9 @@ export function createCcw(options: CcwOptions): Ccw {
           items: results,
           ...(token ? { remaining: token } : {}),
         };
+        // 最近执行落盘供诊断收集读取，尽力而为
+        await writeLastRun(ctx, current.plan, result, token);
+        return result;
       } finally {
         lifecycle = { phase: 'idle' };
       }

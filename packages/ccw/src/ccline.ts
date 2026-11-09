@@ -5,11 +5,19 @@ import { isDeepStrictEqual } from 'node:util';
 import { parse } from 'smol-toml';
 
 import { knownTitle } from './titles.js';
+import { ENABLED_PLUGINS_KEY } from './claude-config.js';
 import { errorCode, isObject, READ_COMMAND_TIMEOUT_MS, succeeded } from './machine.js';
-import { cancelled, removeFields, sequence } from './model.js';
+import { cancelled, json, removeFields, sequence } from './model.js';
 import type { Action, Context, Inspection, Item, Prepared, Selection } from './model.js';
-import { npmInstallArgs, npmUninstallArgs, resolveNpmView } from './npm-registry.js';
+import {
+  isExactVersion,
+  NPM_ENABLE_SCRIPTS,
+  npmInstallArgs,
+  npmUninstallArgs,
+  resolveNpmView,
+} from './npm-registry.js';
 import type { NpmRegistry } from './npm-registry.js';
+import { compareVersions } from './programs.js';
 import { freezeNpmScope, npmVersion, samePath } from './program-channels.js';
 
 interface Observation {
@@ -24,16 +32,17 @@ interface Observation {
 const PACKAGE = '@cometix/ccline';
 const ASSET = fileURLToPath(new URL('../assets/ccline/config.toml', import.meta.url));
 const FIELDS = ['statusLine', 'subagentStatusLine'];
+const COMPANION_PLUGIN = 'cometix@ccline';
+/** ccline --version 输出形状：身份探测允许预发布后缀，执行确认要求精确 2.x.y */
+const CCLINE_IDENTITY = /^(?:ccline|ccometixline) \d+\.\d+\.\d+(?:[-+][\w.-]+)?\s*$/i;
+const CCLINE_BINARY_VERSION = /^(?:ccline|ccometixline) (2\.\d+\.\d+)\s*$/i;
 
 /** 准备 CCometixLine 变更；计划消费与执行互斥由调用方 CCW 统一管理 */
 export function createCcline(options: Context) {
   const { machine } = options;
-  const binaryFile = path.join(
-    options.home,
-    '.claude',
-    'ccline',
-    options.platform === 'win32' ? 'ccline.exe' : 'ccline',
-  );
+  /** ccline 固定落点：不受 CCLINE_HOME 影响 */
+  const defaultCclineDirectory = path.join(options.home, '.claude', 'ccline');
+  const binaryFile = path.join(defaultCclineDirectory, options.platform === 'win32' ? 'ccline.exe' : 'ccline');
   const settingsFile = options.settingsFile;
   // 保留重装中断后的接入模板，供重新准备恢复用户设置
   let resumeTemplates: Record<string, unknown> | undefined;
@@ -61,9 +70,7 @@ export function createCcline(options: Context) {
   const packageVersion = (root?: string) => npmVersion(options, PACKAGE, root, { needsNpm: true });
 
   async function observe(shouldIncludeNpm: boolean, shouldIncludeFiles = shouldIncludeNpm): Promise<Observation> {
-    const text = await machine.read(settingsFile);
-    const settings: unknown = text === null ? {} : JSON.parse(text);
-    if (!isObject(settings)) throw new Error('invalid-settings');
+    const settings = await json(machine, settingsFile);
     const fields = {
       ...Object.fromEntries(FIELDS.map(field => [field, settings[field]])),
       cclineHome: isObject(settings.env) ? settings.env.CCLINE_HOME : undefined,
@@ -83,19 +90,14 @@ export function createCcline(options: Context) {
       binary: shouldIncludeFiles ? await machine.fingerprint(binaryFile) : null,
       appearance: shouldIncludeFiles ? await machine.read(path.join(cclineDirectory(fields), 'config.toml')) : null,
       fields,
-      hasCompanionPlugin: isObject(settings.enabledPlugins) && settings.enabledPlugins['cometix@ccline'] === true,
+      hasCompanionPlugin:
+        isObject(settings[ENABLED_PLUGINS_KEY]) && settings[ENABLED_PLUGINS_KEY][COMPANION_PLUGIN] === true,
     };
   }
 
   function noDowngrade(version: string | null, release: string) {
     if (version === null) return;
-    const numbers = version.split('.').map(part => Number.parseInt(part, 10));
-    const target = release.split('.').map(Number);
-    for (let index = 0; index < 3; index++) {
-      const difference = (numbers[index] ?? 0) - (target[index] ?? 0);
-      if (difference > 0) throw new Error('newer-version-preserved');
-      if (difference < 0) return;
-    }
+    if (compareVersions(version, release) > 0) throw new Error('newer-version-preserved');
   }
 
   function validateAppearance(text: string) {
@@ -116,7 +118,7 @@ export function createCcline(options: Context) {
     const cclineHome = observed.fields.cclineHome;
     const appearanceRoot = shouldConnect ? cclineDirectory(observed.fields) : undefined;
     const shouldConfigureHome =
-      appearanceRoot !== undefined && appearanceRoot !== path.join(options.home, '.claude', 'ccline');
+      appearanceRoot !== undefined && !samePath(options, appearanceRoot, defaultCclineDirectory);
     const values = Object.fromEntries(
       selected.map(field => {
         const template = templates?.[field];
@@ -137,10 +139,8 @@ export function createCcline(options: Context) {
     let isWritten = false;
     const verify = async () => {
       if (!selected.length) return;
-      const after = await machine.read(settingsFile);
-      const value: unknown = after === null ? {} : JSON.parse(after);
+      const value = await json(machine, settingsFile);
       if (
-        !isObject(value) ||
         selected.some(field =>
           shouldConnect ? !isDeepStrictEqual(value[field], values[field]) : isCcline(value[field]),
         )
@@ -193,9 +193,7 @@ export function createCcline(options: Context) {
     if (stamp === null || !(await binaryAtHome())) return false;
     try {
       const result = await machine.execute(binaryFile, ['--version'], { timeoutMs: READ_COMMAND_TIMEOUT_MS });
-      return (
-        succeeded(result) && /^(?:ccline|ccometixline) \d+\.\d+\.\d+(?:[-+][\w.-]+)?\s*$/i.test(result.stdout.trim())
-      );
+      return succeeded(result) && CCLINE_IDENTITY.test(result.stdout.trim());
     } catch {
       return false;
     }
@@ -249,7 +247,7 @@ export function createCcline(options: Context) {
           : []),
       { code: 'keep-user-data' },
       { code: 'appearance-kept' },
-      ...(observed.hasCompanionPlugin ? [{ code: 'ccline-companion-kept', detail: 'cometix@ccline' }] : []),
+      ...(observed.hasCompanionPlugin ? [{ code: 'ccline-companion-kept', detail: COMPANION_PLUGIN }] : []),
     ];
     async function verifyPackage(expected: string | null) {
       await npmScope?.verify();
@@ -383,9 +381,9 @@ export function createCcline(options: Context) {
   }
 
   async function inspectItem(): Promise<Item> {
+    // 全量探测失败才降级只读探测
     let observed: Observation | null = null;
     try {
-      observed = await observe(false, false);
       observed = await observe(true);
       const isConnected = FIELDS.some(field => isCcline(observed?.fields[field]));
       let problem: string | undefined = observed.npmProblem ?? undefined;
@@ -418,17 +416,22 @@ export function createCcline(options: Context) {
           },
           { code: isConnected ? 'connected' : 'not-connected' },
           { code: observed.appearance !== null ? 'appearance-kept' : 'appearance-missing' },
+          { code: observed.hasCompanionPlugin ? 'ccline-companion-present' : 'ccline-companion-missing' },
         ],
         actions,
       };
     } catch (error) {
+      const fallback = await observe(false, false).catch(() => null);
       return {
         id: 'ccline',
         title: knownTitle('ccline'),
         kind: 'ccline',
         canInstall: true,
         facts: [],
-        actions: ['install', ...(FIELDS.some(field => isCcline(observed?.fields[field])) ? (['detach'] as const) : [])],
+        actions: [
+          'install',
+          ...(fallback && FIELDS.some(field => isCcline(fallback.fields[field])) ? (['detach'] as const) : []),
+        ],
         problem: errorCode(error),
       };
     }
@@ -474,7 +477,7 @@ export function createCcline(options: Context) {
         throw new Error('program-changed');
       if (action !== 'connect') {
         const resolved = await resolveNpmView(machine, `${PACKAGE}@latest`, 'version', value =>
-          typeof value === 'string' && /^\d+\.\d+\.\d+$/.test(value) ? value : null,
+          isExactVersion(value) ? value : null,
         );
         if (resolved === null) throw new Error('source-unavailable');
         release = resolved.value;
@@ -540,7 +543,7 @@ export function createCcline(options: Context) {
                 '-g',
                 ...(npmScope?.args ?? []),
                 ...(action === 'reinstall' ? ['--force'] : []),
-                '--ignore-scripts=false',
+                ...NPM_ENABLE_SCRIPTS,
                 `${PACKAGE}@${release}`,
               ],
               releaseRegistry,
@@ -567,7 +570,7 @@ export function createCcline(options: Context) {
             ...(versionSignal ? { signal: versionSignal } : {}),
           });
           if (versionSignal?.aborted) cancelled(signal);
-          const binaryVersion = /^(?:ccline|ccometixline) (2\.\d+\.\d+)\s*$/i.exec(version.stdout.trim())?.[1];
+          const binaryVersion = CCLINE_BINARY_VERSION.exec(version.stdout.trim())?.[1];
           if (!succeeded(version) || binaryVersion === undefined || (action !== 'connect' && binaryVersion !== release))
             throw new Error('binary-version-mismatch');
           programStamp = await machine.fingerprint(binaryFile);
@@ -623,7 +626,7 @@ export function createCcline(options: Context) {
                   : 'ccline-connect',
               detail: settingsFile,
             },
-            ...(cclineDirectory(observed.fields) !== path.join(options.home, '.claude', 'ccline')
+            ...(!samePath(options, cclineDirectory(observed.fields), defaultCclineDirectory)
               ? [{ code: 'ccline-root-configure', detail: cclineDirectory(observed.fields) }]
               : []),
           ],

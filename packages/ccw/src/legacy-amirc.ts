@@ -1,4 +1,13 @@
-import { cancelled, json, object, removeFields, sequence, unchanged } from './model.js';
+import {
+  cancelled,
+  json,
+  MCP_SERVERS_KEY,
+  object,
+  readMcpServers,
+  removeFields,
+  sequence,
+  unchanged,
+} from './model.js';
 import type { Context, Prepared } from './model.js';
 const OWNED_RULES = ['mcp__amirc__organize_papers', 'mcp__amirc__search_papers', 'mcp__amirc__get_papers'];
 
@@ -16,7 +25,7 @@ export async function hasLegacyAmircPermissions(ctx: Context): Promise<boolean> 
 
 /** 退役迁移只解除明确选择的旧注册与精确允许规则，保留技能与用户材料 */
 export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> {
-  const before = object((await json(ctx.machine, ctx.stateFile)).mcpServers);
+  const before = await readMcpServers(ctx);
   const allowBefore = allowedTools(await json(ctx.machine, ctx.settingsFile));
   if (before.amirc === undefined && !allowBefore.some(rule => OWNED_RULES.includes(rule)))
     throw new Error('no-connection');
@@ -66,7 +75,7 @@ export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> 
       { amirc: before.amirc },
       [{ code: 'mcp-remove-registration', detail: 'amirc' }, { code: 'mcp-keep-runtime' }],
       { state: 'done', code: 'registration-removed', detail: 'amirc' },
-      'mcpServers',
+      MCP_SERVERS_KEY,
     ),
     permissions,
   ]);

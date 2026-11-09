@@ -714,3 +714,16 @@ test('执行 npm：保留参数字面值', async t => {
   assert.equal(result.failed, false);
   assert.deepEqual(JSON.parse(result.stdout), ['--fixture', 'literal;echo', '$(no-command)', 'a b']);
 });
+
+for (const [label, settings, expected] of [
+  ['未装配套插件', undefined, 'ccline-companion-missing'],
+  ['已装配套插件', { enabledPlugins: { 'cometix@ccline': true } }, 'ccline-companion-present'],
+])
+  test(`配套插件在场性可见：${label}`, async t => {
+    const f = await fixture(t, { installed: true, ...(settings ? { settings } : {}) });
+    const item = (await f.ccw.inspect()).items.find(entry => entry.id === 'ccline');
+    assert.ok(
+      item.facts.some(fact => fact.code === expected),
+      expected,
+    );
+  });

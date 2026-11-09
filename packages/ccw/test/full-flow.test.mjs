@@ -7,9 +7,8 @@ import { test } from 'node:test';
 import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from '../dist/terminal.js';
-import { createEnv, exists, fail, ok, releaseContract } from './env.mjs';
+import { attribution, createEnv, exists, fail, ok, releaseContract, revision } from './env.mjs';
 
-const revision = '0123456789abcdef0123456789abcdef01234567';
 const defaultEnv = {
   DISABLE_TELEMETRY: '1',
   DISABLE_ERROR_REPORTING: '1',
@@ -17,7 +16,6 @@ const defaultEnv = {
   CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
 };
-const attribution = { commit: '', pr: '', sessionUrl: false };
 
 async function fixture(t, { platform = process.platform } = {}) {
   // layout 'root'：状态文件按 claudeRoot/.claude.json 派生；cclineRoot 仍取 home/.claude/ccline，与活动配置根分离

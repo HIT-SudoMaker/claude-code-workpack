@@ -5,7 +5,7 @@ import { test } from 'node:test';
 
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from '../dist/terminal.js';
-import { createEnv } from './env.mjs';
+import { attribution, createEnv, wait } from './env.mjs';
 
 const defaultEnv = {
   DISABLE_TELEMETRY: '1',
@@ -15,7 +15,6 @@ const defaultEnv = {
   CLAUDE_CODE_USE_POWERSHELL_TOOL: '1',
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
 };
-const attribution = { commit: '', pr: '', sessionUrl: false };
 
 async function fixture(t, initial = {}) {
   const f = await createEnv(t, { layout: 'root', seed: { settings: initial } });
@@ -74,14 +73,15 @@ test('重试官方登录：保留已保存配置', async t => {
   assert.ok(first.remaining);
   assert.equal((await f.read()).language, 'English');
   assert.equal((await f.read()).env.ANTHROPIC_API_KEY, undefined);
-  const writes = f.calls.filter(call => call.kind === 'editJson').length;
+  // 只统计业务写入：最近执行日志（last-run.json）在每次 apply 后都会尽力写入，与本测试意图无关
+  const business = call => call.kind === 'editJson' && call.target !== path.join(f.home, '.ccw', 'last-run.json');
+  const writes = f.calls.filter(business).length;
   f.state.failLogin = false;
   const rest = await f.ccw.plan({ resume: first.remaining });
   assert.equal((await f.ccw.apply(rest.id)).state, 'done');
-  assert.equal(f.calls.filter(call => call.kind === 'editJson').length, writes);
+  assert.equal(f.calls.filter(business).length, writes);
 });
 
-const wait = (_title, work) => work(new AbortController().signal);
 const pick = (choices, label) => {
   const index = choices.findIndex(choice => choice === label || choice.startsWith(`${label}  `));
   assert.notEqual(index, -1, `缺少选项 ${label}`);

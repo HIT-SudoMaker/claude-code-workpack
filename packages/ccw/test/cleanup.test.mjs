@@ -6,10 +6,23 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { createCcw } from '../dist/ccw.js';
 import { createMachine } from '../dist/machine.js';
+import { formatBytes } from '../dist/cleanup.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { describeResult } from '../dist/run-presentation.js';
 import { runTerminal } from '../dist/terminal.js';
 import { createEnv } from './env.mjs';
+
+test('人类可读字节换算', () => {
+  assert.equal(formatBytes(0n), '0 B');
+  assert.equal(formatBytes(512n), '512 B');
+  assert.equal(formatBytes(1023n), '1023 B');
+  assert.equal(formatBytes(1536n), '1.5 KB');
+  assert.equal(formatBytes(10240n), '10.0 KB');
+  assert.equal(formatBytes(1048575n), '1.0 MB');
+  assert.equal(formatBytes(1048576n), '1.0 MB');
+  assert.equal(formatBytes(1610612736n), '1.5 GB');
+  assert.equal(formatBytes(1073741824n * 1024n), '1.0 TB');
+});
 
 const directories = [
   'backup',

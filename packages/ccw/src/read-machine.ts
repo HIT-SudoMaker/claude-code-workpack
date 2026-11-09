@@ -15,7 +15,8 @@ interface ReadScope {
   readonly report?: (stage: PreparationStage) => void;
 }
 
-/** 统一只读阶段的时限、取消和进度；共享读取仅限单次检查，准备与执行不用缓存 */
+/** 统一只读阶段的时限、取消和进度；共享读取仅限单次检查，准备与执行不用缓存。
+ *  未覆写的 Machine 方法原样透传，不获本层的时限与取消 */
 export function createReadMachine(
   machine: Machine,
   current: () => ReadScope | undefined,
@@ -37,12 +38,9 @@ export function createReadMachine(
     const scope = current();
     cancelled(scope?.signal);
     try {
-      const result = await work(scope?.signal);
+      return await work(scope?.signal);
+    } finally {
       cancelled(scope?.signal);
-      return result;
-    } catch (error) {
-      cancelled(scope?.signal);
-      throw error;
     }
   };
   const command = async <T>(
@@ -67,16 +65,13 @@ export function createReadMachine(
         timeoutMs: Math.max(1, Math.ceil(Math.min(options?.timeoutMs ?? timeoutMs, timeoutMs, remainingMs))),
         ...(signal ? { signal } : {}),
       });
-      cancelled(signal);
       if (scope.deadlineMs !== undefined && performance.now() >= scope.deadlineMs)
         throw new Error('inspection-timeout');
       return result;
-    } catch (error) {
+    } finally {
       cancelled(signal);
-      throw error;
     }
   };
-  // 整体复用原 machine 的方法，只覆写需统一时限、取消或共享的读取面；新增 Machine 方法无需在此补转发
   return {
     ...machine,
     read: shared(file => read(() => machine.read(file))),

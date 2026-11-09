@@ -8,7 +8,7 @@ const source = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 export function packageRuntime() {
   const scratch = path.join(source, '.scratch');
   fs.mkdirSync(scratch, { recursive: true });
-  const destination = fs.mkdtempSync(path.join(scratch, 'runtime-0.4.0-'));
+  const destination = fs.mkdtempSync(path.join(scratch, 'runtime-'));
   for (const file of ['package.json', 'package-lock.json'])
     fs.copyFileSync(path.join(source, file), path.join(destination, file));
   for (const name of ['ccw']) {
@@ -31,7 +31,7 @@ export function packageRuntime() {
   );
   fs.writeFileSync(
     path.join(destination, 'README.md'),
-    '# CCW 0.4.0\n\n运行 `node packages/ccw/dist/main.js`，进入安装套件、检查套件、卸载套件或清理数据。\n安装直接执行；卸载和清理先预览确认。准备时显示当前步骤，Esc 取消准备。↑↓ 移动，空格选择，A 全选普通项，Enter 编辑或提交，Esc 返回；长详情使用 PgUp/PgDn。\n包含 CCometixLine 外观资产、AMIRC Research Skill 和生产依赖。运行 CCW 期间需保留本目录与 Node.js；已安装的 Skill 使用独立副本。其他安装来源需要网络及所选渠道的工具。\n',
+    '# CCW\n\n运行 `node packages/ccw/dist/main.js`，进入安装套件、检查套件、卸载套件或清理数据。\n安装直接执行；卸载和清理先预览确认。准备时显示当前步骤，Esc 取消准备。↑↓ 移动，空格选择，A 全选普通项，Enter 编辑或提交，Esc 返回；长详情使用 PgUp/PgDn。\n包含 CCometixLine 外观资产、AMIRC Research Skill 和生产依赖。运行 CCW 期间需保留本目录与 Node.js；已安装的 Skill 使用独立副本。其他安装来源需要网络及所选渠道的工具。\n',
   );
   return destination;
 }

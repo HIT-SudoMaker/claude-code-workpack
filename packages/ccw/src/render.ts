@@ -1,12 +1,21 @@
+import { createRequire } from 'node:module';
+
+import { dataSizeDetailOf } from './cleanup.js';
 import { knownTitle, programCopySuffix } from './titles.js';
 import { ERROR_MESSAGES } from './errors.js';
+import type { MessageText } from './errors.js';
 import { WARNING_MESSAGES } from './warnings.js';
-import { kindOf } from './model.js';
+import { isObject } from './machine.js';
+import { CLAUDE_DATA_ID, kindOf } from './model.js';
 import type { Action, Change, Inspection, Item, Kind, Pick, PreparationProgress } from './model.js';
 
+/** 版本唯一真值是 package.json；运行时读取，避免发布元数据与自报版本漂移 */
+const manifest: unknown = createRequire(import.meta.url)('../package.json');
+const packageVersion = isObject(manifest) && typeof manifest.version === 'string' ? manifest.version : '';
 export const BRAND = {
   title: 'Claude Code Workpack',
-  version: 'V0.4.0',
+  versionNumber: packageVersion,
+  version: `V${packageVersion}`,
   credit: 'Designed By AMIRC',
   logo: [
     ' ██████╗  ██████╗  ██╗    ██╗',
@@ -17,8 +26,20 @@ export const BRAND = {
     ' ╚═════╝  ╚═════╝  ╚══╝╚══╝',
   ],
 };
-export const HELP_TEXT = `CCW ${BRAND.version.slice(1)}\n无参数：打开菜单\n--inspect：检查环境\n--version：查看版本\n--help：查看帮助\n--details：显示本次启动异常详情\n安装：勾选后执行\n卸载、清理：预览后确认\n`;
-export const HOME_TITLE = `CCW ${BRAND.version.slice(1)} · 当前用户`;
+export const HELP_TEXT = `CCW ${BRAND.versionNumber}\n无参数：打开菜单\n--inspect：检查环境（默认摘要，--inspect --details 输出完整明细）\n--collect-logs：收集诊断日志到本地文件\n--version：查看版本\n--help：查看帮助\n--details：显示启动异常与检查完整明细\n安装：勾选后执行\n卸载、清理：预览后确认\n`;
+/** 标题范围后缀与未确认状态词：首页/检查标题、终端通知与诊断收集共用 */
+export const USER_SCOPE_SUFFIX = ' · 当前用户';
+export const UNCONFIRMED = '待确认';
+export const HOME_TITLE = `CCW ${BRAND.versionNumber}${USER_SCOPE_SUFFIX}`;
+/** 问题行与分组标题的固定记号：渲染、终端视图与诊断收集共用 */
+export const PROBLEM_MARK = '! ';
+export const GROUP_MARK = '── ';
+/** 横幅与边框的固定宽度：视图层五处引用 */
+export const BANNER_WIDTH = 62;
+/** 选择页与结果菜单的返回行标签 */
+export const BACK_TO_HOME = '返回主菜单';
+/** 平台与架构的摘要片段格式：诊断收集与界面页脚共用 */
+export const platformSummary = (platform: string, arch: string) => `${platform} (${arch})`;
 const CONTENT_ORDER: Readonly<Record<Kind, number>> = {
   claude: 0,
   settings: 1,
@@ -30,7 +51,7 @@ const CONTENT_ORDER: Readonly<Record<Kind, number>> = {
   officecli: 7,
   data: 8,
 };
-const GROUPS: Readonly<Record<Kind, string>> = {
+export const GROUPS: Readonly<Record<Kind, string>> = {
   claude: '基础配置',
   settings: '基础配置',
   plugin: 'Plugins',
@@ -54,12 +75,20 @@ export const ACTION_NAMES: Readonly<Record<Action, string>> = {
 };
 
 export function planVerb(item: { readonly id: string; readonly action: Action }): string {
-  if (item.id === 'data:claude') return '删除';
+  if (item.id === CLAUDE_DATA_ID) return '删除';
   return item.action === 'uninstall' ? '卸载' : ACTION_NAMES[item.action];
 }
 
-export function preparationTitle(task: 'install' | 'uninstall' | 'clean') {
-  return { install: '准备安装', uninstall: '准备卸载', clean: '准备清理' }[task];
+/** 任务动词词干：准备与检查标题共用，动词只写一次 */
+type PreparationTask = 'install' | 'uninstall' | 'clean';
+const TASK_VERBS: Readonly<Record<PreparationTask, string>> = {
+  install: '安装',
+  uninstall: '卸载',
+  clean: '清理',
+};
+
+export function preparationTitle(task: PreparationTask) {
+  return `准备${TASK_VERBS[task]}`;
 }
 
 export const MODEL_FIELDS = [
@@ -86,6 +115,8 @@ export const SETTINGS_FIELDS = {
   outputStyle: ['outputStyle'],
 } as const;
 export type SettingsEditor = keyof typeof SETTINGS_FIELDS;
+/** 偏好默认值：表单初值与行摘要共用；与选项表首项无关，是刻意的默认选择 */
+export const DEFAULT_PREFERENCES = { language: 'Simplified Chinese', outputStyle: 'Explanatory' } as const;
 interface ContentEntry {
   readonly item: Item;
   readonly editor?: SettingsEditor;
@@ -128,7 +159,7 @@ export function entryRows(entries: readonly ContentEntry[], drafts: ReadonlyMap<
         detail: effectiveConnection(fields, entry.item.facts) === 'api' ? '第三方 API' : '官方登录',
       };
     const choices = editor === 'language' ? SETTINGS_LANGUAGES : SETTINGS_STYLES;
-    const value = fields[editor] ?? (editor === 'language' ? 'Simplified Chinese' : 'Explanatory');
+    const value = fields[editor] ?? DEFAULT_PREFERENCES[editor];
     return {
       ...rows[index],
       label: editor === 'language' ? '默认输出语言' : '输出风格',
@@ -160,6 +191,9 @@ export function inspectedItems(items: readonly Item[]) {
 export function contentName(item: { readonly title: string }): string {
   return safeText(item.title);
 }
+/** 附加工具两类 kind；shortStatus 的残留配置与待接入分支共用 */
+const TOOL_KINDS: readonly Kind[] = ['ccline', 'officecli'];
+/** 摘要状态词：凡与事实码目录 brief 相同的一律经 reason() 取词，词表只活在目录里 */
 function shortStatus(item: Item) {
   const has = (code: string) => item.facts.some(fact => fact.code === code);
   if (
@@ -168,37 +202,44 @@ function shortStatus(item: Item) {
     )
   )
     return '配置异常';
-  if (item.problem || has('inspection-incomplete')) return '待确认';
-  if (has('program-missing')) return '程序入口缺失';
-  if (kindOf(item.id) === 'skill-set') return '';
-  if (item.kind === 'settings') return has('api-configured') ? '已有连接字段' : '默认连接';
+  if (item.problem || has('inspection-incomplete')) return UNCONFIRMED;
+  if (has('program-missing')) return reason('program-missing');
+  if (kindOf(item.id) === 'skill-set') {
+    const members = item.facts.find(fact => fact.code === 'skill-members-present')?.detail;
+    return has('not-installed') ? reason('not-installed') : members ? `已装 ${members} 项` : UNCONFIRMED;
+  }
+  if (item.kind === 'settings') return has('api-configured') ? reason('api-configured') : reason('official-connection');
   if (item.kind === 'plugin')
     return has('plugin-files-missing')
-      ? '插件文件缺失'
+      ? reason('plugin-files-missing')
       : has('plugin-installed')
         ? has('declared-disabled')
-          ? '已停用'
+          ? reason('declared-disabled')
           : '已安装'
         : has('declared-enabled')
           ? '残留声明'
-          : '未安装';
+          : reason('not-installed');
   if (item.kind === 'mcp')
-    return has('registration-exists') ? '已注册' : has('amirc-permissions-present') ? '残留许可' : '未安装';
-  if (item.kind === 'data') return item.facts.find(fact => fact.code === 'data-size')?.detail ?? '无数据';
+    return has('registration-exists')
+      ? '已注册'
+      : has('amirc-permissions-present')
+        ? '残留许可'
+        : reason('not-installed');
+  if (item.kind === 'data') return dataSizeDetailOf(item) ?? '无数据';
   if (has('shared-link') || has('entry-exists')) return '已安装';
-  if (has('program-identity-unchecked')) return '待确认';
-  if (['ccline', 'officecli'].includes(item.kind) && !has('program-exists') && has('connected')) return '残留配置';
+  if (has('program-identity-unchecked')) return UNCONFIRMED;
+  if (TOOL_KINDS.includes(item.kind) && !has('program-exists') && has('connected')) return '残留配置';
   if (has('program-exists')) {
     const version = item.facts.find(fact => fact.code === 'program-version')?.detail;
     const status =
-      ['ccline', 'officecli'].includes(item.kind) && !has('connected')
+      TOOL_KINDS.includes(item.kind) && !has('connected')
         ? '待接入'
         : item.kind === 'ccline' && has('appearance-missing')
           ? '待配置'
           : '已安装';
     return `${status}${version ? ` ${version}` : ''}`;
   }
-  return '未安装';
+  return reason('not-installed');
 }
 export function contentRows(items: readonly Item[]): MenuRow[] {
   return items.map(item => ({
@@ -211,7 +252,7 @@ export function contentRows(items: readonly Item[]): MenuRow[] {
   }));
 }
 
-export const TEXT: Readonly<Record<string, { readonly brief: string; readonly detail: string }>> = {
+export const TEXT: Readonly<Record<string, MessageText>> = {
   'skill-confirm': { brief: '确认技能', detail: '确认技能文件' },
   'claude-data-remove': { brief: '删除用户数据', detail: '删除 Claude 配置和数据' },
   'claude-state-remove': { brief: '删除用户状态', detail: '删除 Claude 用户状态' },
@@ -244,6 +285,7 @@ export const TEXT: Readonly<Record<string, { readonly brief: string; readonly de
   'program-exists': { brief: '程序存在', detail: '程序存在' },
   'program-version': { brief: '程序版本', detail: '程序版本' },
   'not-installed': { brief: '未安装', detail: '未安装' },
+  'skill-members-present': { brief: '已装成员', detail: '套件在本机已发现的成员数量' },
   'not-connected': { brief: '未接入', detail: '未接入' },
   'appearance-missing': { brief: '外观待配置', detail: '外观未配置' },
   'program-install': { brief: '安装程序', detail: '安装程序' },
@@ -262,6 +304,7 @@ export const TEXT: Readonly<Record<string, { readonly brief: string; readonly de
   'keep-plugin-files': { brief: '保留插件文件', detail: '保留插件文件和市场' },
   'plugin-disabled': { brief: '插件已停用', detail: '停用用户插件' },
   'plugin-install': { brief: '安装插件', detail: '安装插件' },
+  'plugin-connect': { brief: '启用插件', detail: '启用用户插件' },
   'plugin-keep-data': { brief: '保留插件数据', detail: '保留插件数据' },
   'plugin-delete-own-data': { brief: '可能删除数据', detail: '官方卸载可能删除插件数据' },
   'plugin-credentials-removed': { brief: '可能清除认证', detail: '官方卸载可能清除插件设置和认证' },
@@ -320,6 +363,8 @@ export const TEXT: Readonly<Record<string, { readonly brief: string; readonly de
   'appearance-kept': { brief: '外观已保留', detail: '保留外观配置' },
   'ccline-disconnect-before-uninstall': { brief: '先解除状态栏', detail: '解除 CCometixLine 主状态栏与子状态栏' },
   'ccline-companion-kept': { brief: '保留配套插件', detail: '保留配套插件与市场' },
+  'ccline-companion-present': { brief: '配套插件已装', detail: 'CCometixLine 配套插件在场' },
+  'ccline-companion-missing': { brief: '配套插件未装', detail: 'CCometixLine 配套插件不在场；需要时可重装程序补齐' },
   'ccline-detach': { brief: '解除状态栏', detail: '解除 CCometixLine 接入；保留程序与外观' },
   'ccline-program-kept': { brief: '程序已保留', detail: '保留 CCometixLine 程序' },
   'ccline-program-update': { brief: '更新程序', detail: '更新 npm 程序' },
@@ -372,19 +417,21 @@ export function reason(code: string) {
 function message(code: string) {
   return ERROR_MESSAGES[code] ?? WARNING_MESSAGES[code] ?? TEXT[code];
 }
+const FAILURE_LABELS: Readonly<Record<Action, string>> = {
+  install: '安装失败',
+  connect: '安装失败',
+  update: '更新失败',
+  reinstall: '重装失败',
+  configure: '配置失败',
+  login: '登录失败',
+  detach: '解除失败',
+  uninstall: '卸载失败',
+  clean: '清理失败',
+};
+
 export function failureLabel(action?: Action) {
   if (action === undefined) return '操作失败';
-  return {
-    install: '安装失败',
-    connect: '安装失败',
-    update: '更新失败',
-    reinstall: '重装失败',
-    configure: '配置失败',
-    login: '登录失败',
-    detach: '解除失败',
-    uninstall: '卸载失败',
-    clean: '清理失败',
-  }[action];
+  return FAILURE_LABELS[action];
 }
 export function startupFailure(code: string, shouldShowDetails: boolean) {
   const brief = ['unknown-argument', 'interactive-terminal-required', 'unsupported-platform'].includes(code)
@@ -392,9 +439,13 @@ export function startupFailure(code: string, shouldShowDetails: boolean) {
     : '启动失败';
   return shouldShowDetails ? `${brief}\n${describeDiagnostic({ code })}` : brief;
 }
-export function describePreparation(event: PreparationProgress, task: 'install' | 'uninstall' | 'clean' = 'install') {
-  const inspect = { install: '检查安装', uninstall: '检查卸载', clean: '检查清理' }[task];
-  const actions = { inspect, metadata: '查询来源', download: '下载程序', source: '获取技能' };
+export function describePreparation(event: PreparationProgress, task: PreparationTask = 'install') {
+  const actions = {
+    inspect: `检查${TASK_VERBS[task]}`,
+    metadata: '查询来源',
+    download: '下载程序',
+    source: '获取技能',
+  };
   return `${actions[event.stage]}：${contentName(event)}`;
 }
 /** detail 一律原文：注册键、配置键、成员名与路径不在此改名 */
@@ -410,16 +461,26 @@ export function describeItem(item: Item, shouldShowDetails = false) {
     ? [
         `标识：${safeText(item.id)}`,
         ...item.facts.map(describeDiagnostic),
-        ...(item.problem ? [`! ${describeDiagnostic({ code: item.problem })}`] : []),
+        ...(item.problem ? [`${PROBLEM_MARK}${describeDiagnostic({ code: item.problem })}`] : []),
       ]
     : [shortStatus(item)];
   return `${contentName(item)}\n${body.filter(Boolean).join('\n')}${item.location ? `\n位置：${safeText(item.location)}` : ''}`;
 }
-export function describeInspection(view: Inspection) {
-  return [
-    ...inspectedItems(view.items).map(item => describeItem(item, true)),
-    ...view.problems.map(problem => `! ${describeInspectionProblem(problem)}`),
-  ].join('\n');
+/** 检查输出默认摘要（每项一行，与界面列表同形）；--details 才展开完整明细 */
+export function describeInspection(view: Inspection, shouldShowDetails = false) {
+  if (shouldShowDetails)
+    return [
+      ...inspectedItems(view.items).map(item => describeItem(item, true)),
+      ...view.problems.map(problem => `${PROBLEM_MARK}${describeInspectionProblem(problem)}`),
+    ].join('\n');
+  const lines: string[] = [];
+  let previous: string | undefined;
+  for (const row of contentRows(inspectedItems(contentOrder(view.items)))) {
+    if (row.group && row.group !== previous) lines.push(`${GROUP_MARK}${row.group}`);
+    previous = row.group;
+    lines.push(row.detail ? `${row.label}：${row.detail}` : row.label);
+  }
+  return [...lines, ...view.problems.map(problem => `${PROBLEM_MARK}${describeInspectionProblem(problem)}`)].join('\n');
 }
 
 /** 检查问题按读取来源归组：集合名映射到列表分组，其余来源用已知标题表 */

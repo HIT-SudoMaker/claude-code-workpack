@@ -1,24 +1,30 @@
 import path from 'node:path';
 
 import { knownTitle } from './titles.js';
-import { officeIntegration } from './management-catalog.js';
+import { OFFICECLI_REPO_SLUG, officeIntegration, SKILL_ENTRY } from './management-catalog.js';
 import { currentSkill, prepareSkillFiles, skillFilesStamp } from './skill-files.js';
 import { prepareSkill } from './skills.js';
 import { prepareMcp } from './mcp.js';
-import { errorCode, isObject } from './machine.js';
-import { cancelled, json, object, sequence, unchanged } from './model.js';
+import { errorCode, isGitRevision, isObject } from './machine.js';
+import { cancelled, json, readMcpServers, REPLACE_CONSENT, sequence, unchanged } from './model.js';
 import type { Action, Change, Context, Inspection, Item, Prepared, Selection } from './model.js';
-import { resolveNpmView } from './npm-registry.js';
+import { isExactVersion, resolveNpmView } from './npm-registry.js';
 import type { NpmRegistry } from './npm-registry.js';
 import { officeBinary, samePath } from './program-channels.js';
 import { officeVersion, prepareProgram, programs } from './programs.js';
+import { sourcesFile } from './storage.js';
+
+/** OfficeCLI 接入入口的 id 集合：域内入口类型与计划层的重叠门判共用 */
+export const OFFICECLI_ENTRY_IDS = ['skill:officecli', 'mcp:officecli'] as const;
 
 interface OfficeEntry {
-  readonly id: 'skill:officecli' | 'mcp:officecli';
+  readonly id: (typeof OFFICECLI_ENTRY_IDS)[number];
   readonly owner: string | null | undefined;
 }
 
 const OFFICECLI_SKILL = 'officecli';
+/** 随包技能的读取落点：检查与准备共用 */
+const officeSkillDirectory = (ctx: Context) => path.join(ctx.claudeRoot, 'skills', OFFICECLI_SKILL);
 /** 区分技能入口证据：来源记录确认，或仅 frontmatter 形态相似；形态不构成认领证据 */
 type SkillEvidence = 'confirmed' | 'shape' | 'none';
 
@@ -37,7 +43,7 @@ interface Observation {
 
 /** 管理 OfficeCLI 程序与所选 Claude 入口，计划及剩余工作由 CCW 消费 */
 export function createOfficecli(ctx: Context) {
-  const directory = path.join(ctx.claudeRoot, 'skills', OFFICECLI_SKILL);
+  const directory = officeSkillDirectory(ctx);
 
   async function commandOwner(command: string, found: Observation['found']): Promise<string | undefined> {
     const candidates = path.isAbsolute(command)
@@ -77,20 +83,20 @@ export function createOfficecli(ctx: Context) {
     let registration: unknown;
     let metadata: Record<string, unknown> = {};
     try {
-      metadata = await json(ctx.machine, path.join(ctx.storage, 'sources.json'));
+      metadata = await json(ctx.machine, sourcesFile(ctx));
     } catch {
       problems.push({ code: 'source-metadata-unavailable', detail: 'officecli' });
     }
     try {
       skillStamp = await ctx.machine.treeStamp(directory);
-      const text = skillStamp !== null ? await ctx.machine.read(path.join(directory, 'SKILL.md')) : null;
+      const text = skillStamp !== null ? await ctx.machine.read(path.join(directory, SKILL_ENTRY)) : null;
       skillEvidence = officeSkillEvidence(text, metadata[directory], skillStamp);
     } catch (error) {
       isConnectionsUnknown = true;
       problems.push({ code: errorCode(error), detail: directory });
     }
     try {
-      registration = object((await json(ctx.machine, ctx.stateFile)).mcpServers).officecli;
+      registration = (await readMcpServers(ctx)).officecli;
       mcpCommand = officeMcpCommand(registration);
     } catch (error) {
       isConnectionsUnknown = true;
@@ -137,7 +143,7 @@ export function createOfficecli(ctx: Context) {
       const verify = async () => {
         if (!isComplete || action === 'reinstall') return;
         if (entry.id === 'skill:officecli') unchanged(await ctx.machine.treeStamp(directory), null);
-        else unchanged(object((await json(ctx.machine, ctx.stateFile)).mcpServers).officecli, undefined);
+        else unchanged((await readMcpServers(ctx)).officecli, undefined);
       };
       const step: Prepared = {
         ...(operation.writes ? { writes: operation.writes } : {}),
@@ -391,26 +397,25 @@ async function officeRevision(ctx: Context, target: OfficeTarget): Promise<strin
       ctx.machine,
       '@officecli/officecli@' + version,
       'gitHead',
-      value => (typeof value === 'string' && /^[a-f0-9]{40}$/.test(value) ? value : null),
+      value => (typeof value === 'string' && isGitRevision(value) ? value : null),
       target.registry ?? null,
     );
     if (resolved === null) throw new Error('source-version-unavailable');
     return resolved.value;
   }
-  if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('source-version-unavailable');
+  if (!isExactVersion(version)) throw new Error('source-version-unavailable');
   const reference: unknown = JSON.parse(
-    await ctx.machine.fetchText('https://api.github.com/repos/iOfficeAI/OfficeCLI/git/ref/tags/v' + version),
+    await ctx.machine.fetchText(`https://api.github.com/repos/${OFFICECLI_REPO_SLUG}/git/ref/tags/v${version}`),
   );
   if (!isObject(reference) || reference.ref !== 'refs/tags/v' + version || !isObject(reference.object))
     throw new Error('source-version-unavailable');
   let object = reference.object;
   for (let depth = 0; depth < 4; depth++) {
-    if (typeof object.sha !== 'string' || !/^[a-f0-9]{40}$/.test(object.sha))
-      throw new Error('source-version-unavailable');
+    if (typeof object.sha !== 'string' || !isGitRevision(object.sha)) throw new Error('source-version-unavailable');
     if (object.type === 'commit') return object.sha;
     if (object.type !== 'tag') throw new Error('source-version-unavailable');
     const tag: unknown = JSON.parse(
-      await ctx.machine.fetchText('https://api.github.com/repos/iOfficeAI/OfficeCLI/git/tags/' + object.sha),
+      await ctx.machine.fetchText(`https://api.github.com/repos/${OFFICECLI_REPO_SLUG}/git/tags/${object.sha}`),
     );
     if (!isObject(tag) || tag.sha !== object.sha || !isObject(tag.object))
       throw new Error('source-version-unavailable');
@@ -425,7 +430,7 @@ async function prepareOfficeConnection(
   observed: Observation,
   target: OfficeTarget,
 ): Promise<Prepared> {
-  const directory = path.join(ctx.claudeRoot, 'skills', OFFICECLI_SKILL);
+  const directory = officeSkillDirectory(ctx);
   const { skillStamp: before, sourceRecord: record, mcpCommand: command } = observed;
   const hasMcp = command !== undefined && (!path.isAbsolute(command) || samePath(ctx, command, target.binary));
   const integration = selection.fields?.connection;
@@ -479,7 +484,11 @@ async function prepareOfficeConnection(
     (isReinstall &&
       ((hasMcp && integration !== 'mcp') || (observed.skillEvidence !== 'none' && integration === 'mcp')));
   if (integration === 'mcp' && !shouldConnectBoth) return mcp('connect', isReinstall);
-  if (before !== null && selection.fields?.replace !== 'yes' && (!isObject(record) || record.stamp !== before))
+  if (
+    before !== null &&
+    selection.fields?.replace !== REPLACE_CONSENT &&
+    (!isObject(record) || record.stamp !== before)
+  )
     throw new Error('local-edits-preserved');
   if (isReinstall && before !== null && observed.skillEvidence === 'none')
     throw new Error('integration-source-conflict');

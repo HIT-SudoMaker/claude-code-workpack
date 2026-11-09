@@ -4,9 +4,22 @@ import { randomUUID } from 'node:crypto';
 import { knownTitle } from './titles.js';
 import { mcpSpecs } from './management-catalog.js';
 import { errorCode, isObject } from './machine.js';
-import { cancelled, editFields, json, object, removeFields, restOf, success, unchanged } from './model.js';
-import type { Context, Describe, Domain, Item, Prepared, Selection } from './model.js';
+import {
+  cancelled,
+  editFields,
+  MCP_SERVERS_KEY,
+  readMcpServers,
+  removeFields,
+  restOf,
+  success,
+  unchanged,
+  userBinDirectory,
+  userBinary,
+} from './model.js';
+import { isExactVersion } from './npm-registry.js';
+import type { Context, Describe, Domain, Effect, Item, Prepared, Selection } from './model.js';
 import { hasLegacyAmircPermissions, prepareLegacyAmircDetach } from './legacy-amirc.js';
+import { installScratch } from './storage.js';
 
 const MCP_PROTOCOLS: Readonly<Record<string, readonly string[]>> = {
   http: ['http:', 'https:'],
@@ -31,6 +44,9 @@ function validRegistration(value: unknown) {
   }
 }
 
+/** Serena 命令形状判定：注册身份确认与更新渠道守卫共用同一谓词 */
+const isSerenaCommand = (command: string): boolean => /(?:^|[\\/])serena(?:\.exe)?$/.test(command);
+
 /** 以本地形状证据判定注册身份：与 CCW 写入模板一致才算确认，证据不足保留原始键名；
  *  不联网、不启动程序 */
 function confirmedMcpTitle(name: string, registration: unknown): string {
@@ -44,7 +60,7 @@ function confirmedMcpTitle(name: string, registration: unknown): string {
   if (name === 'serena')
     return (registration.type === undefined || registration.type === 'stdio') &&
       typeof registration.command === 'string' &&
-      /(?:^|[\\/])serena(?:\.exe)?$/.test(registration.command) &&
+      isSerenaCommand(registration.command) &&
       Array.isArray(registration.args) &&
       registration.args[0] === mcpSpecs.serena.registration.args[0]
       ? knownTitle('mcp:serena')
@@ -87,7 +103,7 @@ async function inspectMcp(ctx: Context): Promise<Item[]> {
   let registrations: Record<string, unknown> = {};
   let readProblem: string | undefined;
   try {
-    registrations = object((await json(ctx.machine, ctx.stateFile)).mcpServers);
+    registrations = await readMcpServers(ctx);
   } catch (error) {
     readProblem = errorCode(error);
   }
@@ -139,7 +155,7 @@ async function inspectMcp(ctx: Context): Promise<Item[]> {
 interface PrepareMcpOptions {
   /** 目录外产品的完整注册对象，由所属领域提供（如 officecli 的连接形状） */
   readonly registration?: () => Record<string, unknown>;
-  /** 程序卸载后重挂接入：先清旧注册再写新注册 */
+  /** 程序卸载后重挂：旧注册已由调用方清除，此处写新注册 */
   readonly hasDetached?: boolean;
   /** 证据读取后补全计划标题 */
   readonly describe?: Describe;
@@ -154,7 +170,8 @@ export async function prepareMcp(
   const { registration: customRegistration, hasDetached = false, describe } = options;
   if (name === 'amirc' && selection.action === 'detach') return prepareLegacyAmircDetach(ctx);
   if (name === 'amirc') throw new Error('action-unavailable');
-  const before = object((await json(ctx.machine, ctx.stateFile)).mcpServers);
+  const registrationsNow = () => readMcpServers(ctx);
+  const before = await registrationsNow();
   describe?.(confirmedMcpTitle(name, before[name]));
   const action = selection.action;
   if (
@@ -170,7 +187,7 @@ export async function prepareMcp(
       { [name]: before[name] },
       [{ code: 'mcp-remove-registration', detail: name }, { code: 'mcp-keep-runtime' }, { code: 'mcp-auth-unchanged' }],
       { state: 'done', code: 'registration-removed', detail: name },
-      'mcpServers',
+      MCP_SERVERS_KEY,
     );
   if (!/^[\w.:-]+$/.test(name)) throw new Error('invalid-mcp-name');
   if (!Object.hasOwn(mcpSpecs, name) && customRegistration === undefined) throw new Error('not-in-update-catalog');
@@ -179,11 +196,11 @@ export async function prepareMcp(
     return {
       changes: [{ code: 'registration-kept', detail: name }],
       async run(report) {
-        unchanged(object((await json(ctx.machine, ctx.stateFile)).mcpServers)[name], value);
+        unchanged((await registrationsNow())[name], value);
         report({ state: 'kept', code: 'registration-kept', detail: name });
       },
       async verify() {
-        unchanged(object((await json(ctx.machine, ctx.stateFile)).mcpServers)[name], value);
+        unchanged((await registrationsNow())[name], value);
       },
     };
   }
@@ -191,41 +208,130 @@ export async function prepareMcp(
   if (
     name === 'serena' &&
     action === 'update' &&
-    (typeof value.command !== 'string' || !/(^|[\\/])serena(?:\.exe)?$/.test(value.command))
+    (typeof value.command !== 'string' || !isSerenaCommand(value.command))
   )
     throw new Error('channel-change-required');
-  let registration: Record<string, unknown>;
-  let targetVersion: string | undefined;
-  if (name === 'context7')
-    registration = {
-      ...mcpSpecs.context7.registration,
-      ...(selection.fields?.secret
-        ? { headers: { Authorization: `Bearer ${selection.fields.secret}` } }
-        : value.headers !== undefined
-          ? { headers: value.headers }
-          : {}),
-    };
-  else if (customRegistration !== undefined) registration = customRegistration();
-  else {
+  /** 注册目标解析：context7 合并既有凭据，外部产品由所属域提供，其余拉取 Serena 发布元数据 */
+  const resolveTarget = async (): Promise<{ registration: Record<string, unknown>; targetVersion?: string }> => {
+    if (name === 'context7')
+      return {
+        registration: {
+          ...mcpSpecs.context7.registration,
+          ...(selection.fields?.secret
+            ? { headers: { Authorization: `Bearer ${selection.fields.secret}` } }
+            : value.headers !== undefined
+              ? { headers: value.headers }
+              : {}),
+        },
+      };
+    if (customRegistration !== undefined) return { registration: customRegistration() };
     const release: unknown = JSON.parse(await ctx.machine.fetchText(mcpSpecs.serena.release.metadataUrl));
-    if (
-      !isObject(release) ||
-      !isObject(release.info) ||
-      typeof release.info.version !== 'string' ||
-      !/^\d+\.\d+\.\d+$/.test(release.info.version)
-    )
+    if (!isObject(release) || !isObject(release.info) || !isExactVersion(release.info.version))
       throw new Error('invalid-release');
-    targetVersion = release.info.version;
-    registration = {
-      command: 'serena',
-      args: [...mcpSpecs.serena.registration.args],
+    return {
+      registration: { command: 'serena', args: [...mcpSpecs.serena.registration.args] },
+      targetVersion: release.info.version,
     };
-  }
+  };
+  const resolved = await resolveTarget();
+  const registration = resolved.registration;
+  const targetVersion = resolved.targetVersion;
   let isRemoved = false;
   let isToolReady = false;
   let isInitialized = false;
   let isRegistrationSaved = false;
   let toolStamp: string | null = null;
+  /** 定位 uv；缺失时经官方脚本装入用户目录，脚本即用即清 */
+  const ensureUv = async (report: (effect: Effect) => void): Promise<string> => {
+    let uv = (await ctx.machine.locate('uv'))[0];
+    const localUv = userBinary(ctx, 'uv');
+    if (uv === undefined && (await ctx.machine.treeStamp(localUv)) !== null) uv = localUv;
+    if (uv !== undefined) return uv;
+    const file = installScratch(ctx, `uv-${randomUUID()}.${ctx.platform === 'win32' ? 'ps1' : 'sh'}`);
+    await ctx.machine.initialize(
+      file,
+      await ctx.machine.fetchText(`https://astral.sh/uv/install.${ctx.platform === 'win32' ? 'ps1' : 'sh'}`),
+    );
+    try {
+      success(
+        await ctx.machine.execute(
+          ctx.platform === 'win32' ? 'powershell.exe' : 'sh',
+          ctx.platform === 'win32' ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file] : [file],
+          { env: { UV_NO_MODIFY_PATH: '1', UV_INSTALL_DIR: userBinDirectory(ctx) } },
+        ),
+      );
+    } finally {
+      const stamp = await ctx.machine.treeStamp(file);
+      if (stamp !== null) await ctx.machine.removeTree(file, stamp);
+    }
+    report({ state: 'done', code: 'uv-installed' });
+    return localUv;
+  };
+  /** Serena 运行时链：uv 供给 → 固定版本安装 → 注册命令解析 → 首装初始化 */
+  const ensureSerenaRuntime = async (report: (effect: Effect) => void, signal: AbortSignal | undefined) => {
+    if (name !== 'serena') return;
+    if (isToolReady && (await ctx.machine.treeStamp(String(registration.command))) !== toolStamp)
+      throw new Error('program-changed');
+    if (!isToolReady) {
+      const uv = await ensureUv(report);
+      cancelled(signal);
+      const serenaIn = (text: string) =>
+        text
+          .split('\n')
+          .some(
+            line =>
+              line.trim().split(/\s+/).slice(0, 2).join(' ') === `${mcpSpecs.serena.release.package} v${targetVersion}`,
+          );
+      const currentTools = await ctx.machine.execute(uv, ['tool', 'list']);
+      const isAlreadyInstalled = !currentTools.failed && currentTools.code === 0 && serenaIn(currentTools.stdout);
+      if (!isAlreadyInstalled || action === 'reinstall')
+        success(
+          await ctx.machine.execute(uv, [
+            'tool',
+            'install',
+            '--python',
+            mcpSpecs.serena.release.python,
+            '--upgrade',
+            ...(action === 'reinstall' ? ['--reinstall'] : []),
+            `${mcpSpecs.serena.release.package}==${targetVersion}`,
+          ]),
+          'serena-install-failed',
+        );
+      const installed = success(await ctx.machine.execute(uv, ['tool', 'list']));
+      if (!serenaIn(installed)) throw new Error('binary-version-mismatch');
+      const bin = success(await ctx.machine.execute(uv, ['tool', 'dir', '--bin'])).trim();
+      if (!path.isAbsolute(bin) || /[\r\n]/.test(bin)) throw new Error('invalid-tool-directory');
+      registration.command = path.join(bin, ctx.platform === 'win32' ? 'serena.exe' : 'serena');
+      if ((await ctx.machine.treeStamp(String(registration.command))) === null) throw new Error('program-not-ready');
+      toolStamp = await ctx.machine.treeStamp(String(registration.command));
+      isToolReady = true;
+      report({ state: 'done', code: 'serena-installed' });
+    }
+    cancelled(signal);
+    if (action !== 'update' && !isInitialized) {
+      success(await ctx.machine.execute(String(registration.command), ['init']), 'serena-initialization-failed');
+      isInitialized = true;
+      report({ state: 'done', code: 'serena-initialized' });
+    }
+  };
+  const removeExistingRegistration = async (report: (effect: Effect) => void) => {
+    await editFields(ctx, ctx.stateFile, before, { [name]: undefined }, MCP_SERVERS_KEY, () => {
+      before[name] = undefined;
+      isRemoved = true;
+      report({ state: 'done', code: 'registration-removed' });
+    });
+  };
+  const saveRegistration = async (report: (effect: Effect) => void) => {
+    if (isRegistrationSaved) {
+      unchanged((await registrationsNow())[name], registration);
+      return;
+    }
+    await editFields(ctx, ctx.stateFile, before, { [name]: registration }, MCP_SERVERS_KEY, () => {
+      isRegistrationSaved = true;
+      before[name] = registration;
+      report({ state: 'done', code: 'registration-saved', detail: name });
+    });
+  };
   return {
     get changes() {
       if (isRegistrationSaved) return [{ code: 'mcp-registration-confirm', detail: name }];
@@ -241,97 +347,12 @@ export async function prepareMcp(
       ];
     },
     async run(report, signal) {
-      unchanged(object((await json(ctx.machine, ctx.stateFile)).mcpServers)[name], before[name]);
+      unchanged((await registrationsNow())[name], before[name]);
       cancelled(signal);
-      if (action === 'reinstall' && !isRemoved)
-        await editFields(ctx, ctx.stateFile, before, { [name]: undefined }, 'mcpServers', () => {
-          before[name] = undefined;
-          isRemoved = true;
-          report({ state: 'done', code: 'registration-removed' });
-        });
-      if (name === 'serena') {
-        if (isToolReady && (await ctx.machine.treeStamp(String(registration.command))) !== toolStamp)
-          throw new Error('program-changed');
-        if (!isToolReady) {
-          let uv = (await ctx.machine.locate('uv'))[0];
-          const localUv = path.join(ctx.home, '.local/bin', ctx.platform === 'win32' ? 'uv.exe' : 'uv');
-          if (uv === undefined && (await ctx.machine.treeStamp(localUv)) !== null) uv = localUv;
-          if (uv === undefined) {
-            const file = path.join(
-              ctx.storage,
-              `install-uv-${randomUUID()}.${ctx.platform === 'win32' ? 'ps1' : 'sh'}`,
-            );
-            await ctx.machine.initialize(
-              file,
-              await ctx.machine.fetchText(`https://astral.sh/uv/install.${ctx.platform === 'win32' ? 'ps1' : 'sh'}`),
-            );
-            try {
-              success(
-                await ctx.machine.execute(
-                  ctx.platform === 'win32' ? 'powershell.exe' : 'sh',
-                  ctx.platform === 'win32' ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file] : [file],
-                  { env: { UV_NO_MODIFY_PATH: '1', UV_INSTALL_DIR: path.join(ctx.home, '.local/bin') } },
-                ),
-              );
-            } finally {
-              const stamp = await ctx.machine.treeStamp(file);
-              if (stamp !== null) await ctx.machine.removeTree(file, stamp);
-            }
-            uv = localUv;
-            report({ state: 'done', code: 'uv-installed' });
-          }
-          cancelled(signal);
-          const serenaIn = (text: string) =>
-            text
-              .split('\n')
-              .some(
-                line =>
-                  line.trim().split(/\s+/).slice(0, 2).join(' ') ===
-                  `${mcpSpecs.serena.release.package} v${targetVersion}`,
-              );
-          const currentTools = await ctx.machine.execute(uv, ['tool', 'list']);
-          const isAlreadyInstalled = !currentTools.failed && currentTools.code === 0 && serenaIn(currentTools.stdout);
-          if (!isAlreadyInstalled || action === 'reinstall')
-            success(
-              await ctx.machine.execute(uv, [
-                'tool',
-                'install',
-                '--python',
-                mcpSpecs.serena.release.python,
-                '--upgrade',
-                ...(action === 'reinstall' ? ['--reinstall'] : []),
-                `${mcpSpecs.serena.release.package}==${targetVersion}`,
-              ]),
-              'serena-install-failed',
-            );
-          const installed = success(await ctx.machine.execute(uv, ['tool', 'list']));
-          if (!serenaIn(installed)) throw new Error('binary-version-mismatch');
-          const bin = success(await ctx.machine.execute(uv, ['tool', 'dir', '--bin'])).trim();
-          if (!path.isAbsolute(bin) || /[\r\n]/.test(bin)) throw new Error('invalid-tool-directory');
-          registration.command = path.join(bin, ctx.platform === 'win32' ? 'serena.exe' : 'serena');
-          if ((await ctx.machine.treeStamp(String(registration.command))) === null)
-            throw new Error('program-not-ready');
-          toolStamp = await ctx.machine.treeStamp(String(registration.command));
-          isToolReady = true;
-          report({ state: 'done', code: 'serena-installed' });
-        }
-        cancelled(signal);
-        if (action !== 'update' && !isInitialized) {
-          success(await ctx.machine.execute(String(registration.command), ['init']), 'serena-initialization-failed');
-          isInitialized = true;
-          report({ state: 'done', code: 'serena-initialized' });
-        }
-      }
+      if (action === 'reinstall' && !isRemoved) await removeExistingRegistration(report);
+      await ensureSerenaRuntime(report, signal);
       cancelled(signal);
-      if (action !== 'update') {
-        if (!isRegistrationSaved)
-          await editFields(ctx, ctx.stateFile, before, { [name]: registration }, 'mcpServers', () => {
-            isRegistrationSaved = true;
-            before[name] = registration;
-            report({ state: 'done', code: 'registration-saved', detail: name });
-          });
-        else unchanged(object((await json(ctx.machine, ctx.stateFile)).mcpServers)[name], registration);
-      }
+      if (action !== 'update') await saveRegistration(report);
     },
   };
 }

@@ -3,6 +3,8 @@ import { test } from 'node:test';
 
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from '../dist/terminal.js';
+import { isIgnoredText } from '../dist/terminal-view.js';
+import { wait } from './env.mjs';
 
 const item = {
   id: 'ccline',
@@ -12,7 +14,6 @@ const item = {
   facts: [{ code: 'not-installed' }],
   actions: ['install'],
 };
-const wait = (_title, work) => work(new AbortController().signal);
 
 test('浏览检查详情：复用快照', async () => {
   let inspections = 0;
@@ -196,8 +197,8 @@ test('检查技能：只显示实际成员', async () => {
           return lists++ ? 3 : 0;
         }
         assert.ok(title.startsWith('ssre2-design'));
-        assert.deepEqual(choices, ['进入卸载', '返回', '查看详情']);
-        return 1;
+        assert.deepEqual(choices, ['进入更新', '进入卸载', '返回', '查看详情']);
+        return 2;
       },
       async select(page) {
         assert.equal(page.rows.length, 1);
@@ -302,4 +303,119 @@ test('清理数据：空选择不确认', async () => {
     },
   );
   assert.equal(plans, 1);
+});
+
+test('成员更新与套件整装互斥：提交前阻断', async () => {
+  const member = {
+    id: 'skill:tdd',
+    title: 'tdd',
+    kind: 'skill',
+    skillSet: 'mattpocock',
+    actions: ['update', 'detach'],
+    facts: [{ code: 'entry-exists' }],
+  };
+  const suite = {
+    id: 'skill-set:mattpocock',
+    title: 'Matt Pocock/Skills',
+    kind: 'skill',
+    canInstall: true,
+    actions: ['install'],
+    facts: [{ code: 'skill-members-present', detail: '2' }],
+  };
+  let homes = 0;
+  let selections = 0;
+  let planned = 0;
+  await runTerminal(
+    {
+      async inspect() {
+        return { items: [member, suite], problems: [] };
+      },
+      async plan() {
+        planned++;
+        throw new Error('should not plan');
+      },
+    },
+    {
+      wait,
+      show() {},
+      handoff: work => work(),
+      async choose(title, choices) {
+        if (title === HOME_TITLE) return [1, 4][homes++];
+        if (title.startsWith('检查套件')) {
+          assert.deepEqual(choices, [{ label: 'tdd', detail: '已安装', group: 'Skills' }, '刷新检查', '返回主菜单']);
+          return 0;
+        }
+        assert.ok(title.startsWith('tdd'), String(title));
+        assert.deepEqual(choices, ['进入更新', '进入卸载', '返回', '查看详情']);
+        return 0;
+      },
+      async select(page, change) {
+        if (selections++ === 0) {
+          assert.equal(page.rows.length, 2);
+          assert.deepEqual(page.rows[0], {
+            label: 'tdd',
+            detail: '已安装 · 已选更新',
+            group: 'Skills',
+            checked: true,
+            enter: 'toggle',
+          });
+          assert.equal(page.rows[1].detail, '已装 2 项');
+          const afterAll = change({ kind: 'all' });
+          assert.equal(afterAll.rows[0].checked, true, '全选不得降级更新勾选');
+          assert.equal(afterAll.rows[0].detail, '已安装 · 已选更新');
+          assert.equal(afterAll.rows[1].checked, true);
+          return { kind: 'submit', index: 2 };
+        }
+        assert.match(page.title, /! 安装失败/, page.title);
+        assert.equal(page.rows[0].detail, '安装失败 · 已选更新');
+        assert.equal(page.rows[0].enter, 'open');
+        return { kind: 'cancel', index: 0 };
+      },
+    },
+  );
+  assert.equal(planned, 0, '冲突组合不应进入计划');
+});
+
+test('输入闸门：仅放行非命名的自由文本', () => {
+  const key = over => ({
+    escape: false,
+    return: false,
+    tab: false,
+    backspace: false,
+    delete: false,
+    upArrow: false,
+    downArrow: false,
+    leftArrow: false,
+    rightArrow: false,
+    pageUp: false,
+    pageDown: false,
+    home: false,
+    end: false,
+    ctrl: false,
+    meta: false,
+    ...over,
+  });
+  assert.equal(isIgnoredText('你好', key()), true);
+  assert.equal(isIgnoredText('ｒ', key()), true);
+  assert.equal(isIgnoredText('　', key()), true);
+  assert.equal(isIgnoredText('r', key()), true);
+  assert.equal(isIgnoredText('', key()), false);
+  for (const flag of [
+    'escape',
+    'return',
+    'tab',
+    'backspace',
+    'delete',
+    'upArrow',
+    'downArrow',
+    'leftArrow',
+    'rightArrow',
+    'pageUp',
+    'pageDown',
+    'home',
+    'end',
+    'ctrl',
+    'meta',
+  ])
+    assert.equal(isIgnoredText('你', key({ [flag]: true })), false, flag);
 });

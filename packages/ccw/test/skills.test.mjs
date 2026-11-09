@@ -4,9 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
-import { createEnv, exists, ok } from './env.mjs';
-
-const revision = '0123456789abcdef0123456789abcdef01234567';
+import { createEnv, exists, ok, revision } from './env.mjs';
 
 /** 技能域世界：git 修订单源、来源载荷应答与 replaceTree/treeStamp 写入旋钮，只装技能安装所需能力 */
 async function fixture(t) {
@@ -202,6 +200,13 @@ test('安装技能方案：来源记录读取失败保持未知', async t => {
   assert.equal(await exists(path.join(f.claudeRoot, 'skills/tdd')), false);
 });
 
+test('安装未收录技能：记录库不可读不以目录查无代替未知', async t => {
+  const f = await fixture(t);
+  await f.write(path.join(f.home, '.ccw/sources.json'), 'not json');
+  const blocked = await f.ccw.plan({ task: 'install', selected: [{ id: 'skill:not-in-any-catalog' }] });
+  assert.equal(blocked.items[0].problem, 'source-metadata-unavailable');
+});
+
 test('更新技能：来源记录冲突外部优先', async t => {
   const f = await fixture(t);
   const directory = path.join(f.claudeRoot, 'skills/ssre2-design');
@@ -338,4 +343,67 @@ test('替换技能链接：仅修改本端入口', async t => {
   );
   assert.equal((await fs.lstat(entry)).isSymbolicLink(), false);
   assert.equal(await fs.readFile(path.join(source, 'SKILL.md'), 'utf8'), 'shared text');
+});
+
+test('套件入口：干净环境推导未安装状态', async t => {
+  const f = await fixture(t);
+  const items = (await f.ccw.inspect()).items;
+  for (const id of ['skill-set:mattpocock', 'skill-set:ssre2'])
+    assert.deepEqual(items.find(item => item.id === id).facts, [{ code: 'not-installed' }], id);
+});
+
+test('套件入口：聚合已发现的动态成员', async t => {
+  const f = await fixture(t);
+  await f.apply({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] });
+  const items = (await f.ccw.inspect()).items;
+  assert.deepEqual(items.find(item => item.id === 'skill-set:mattpocock').facts, [
+    { code: 'skill-members-present', detail: '2' },
+  ]);
+  assert.deepEqual(items.find(item => item.id === 'skill-set:ssre2').facts, [{ code: 'not-installed' }]);
+});
+
+test('套件入口：登记成员显示已装比例', async t => {
+  const f = await fixture(t);
+  await f.apply({ task: 'install', selected: [{ id: 'skill:ssre2-design' }] });
+  assert.deepEqual((await f.ccw.inspect()).items.find(item => item.id === 'skill-set:ssre2').facts, [
+    { code: 'skill-members-present', detail: '1/2' },
+  ]);
+});
+
+test('套件成员凭来源记录获得更新资格', async t => {
+  const f = await fixture(t);
+  await f.apply({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] });
+  const member = (await f.ccw.inspect()).items.find(item => item.id === 'skill:tdd');
+  assert.equal(member.skillSet, 'mattpocock');
+  assert.ok(member.actions.includes('update'));
+  assert.equal(
+    (await f.apply({ task: 'install', selected: [{ id: 'skill:tdd', maintenance: 'update' }] })).state,
+    'done',
+  );
+});
+
+test('解除技能：清除过期来源记录，同路径新内容不再误归属', async t => {
+  const f = await fixture(t);
+  await f.apply({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] });
+  const directory = path.join(f.claudeRoot, 'skills/tdd');
+  const records = path.join(f.home, '.ccw/sources.json');
+  assert.ok(Object.hasOwn(await f.readJson(records), directory));
+  await f.apply({ task: 'uninstall', selected: [{ id: 'skill:tdd' }] });
+  assert.equal((await f.readJson(records))[directory], undefined);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'SKILL.md'), '---\nname: tdd\n---\nforeign copy\n');
+  const foreign = (await f.ccw.inspect()).items.find(item => item.id === 'skill:tdd');
+  assert.equal(foreign.skillSet, undefined);
+  assert.ok(!foreign.actions.includes('update'));
+});
+
+test('解除技能：来源记录不可读时降级提示', async t => {
+  const f = await fixture(t);
+  await f.apply({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] });
+  await fs.writeFile(path.join(f.home, '.ccw/sources.json'), '{broken json');
+  const result = await f.apply({ task: 'uninstall', selected: [{ id: 'skill:tdd' }] });
+  assert.equal(result.state, 'done');
+  assert.ok(
+    result.items[0].effects.some(effect => effect.state === 'kept' && effect.code === 'source-metadata-unavailable'),
+  );
 });

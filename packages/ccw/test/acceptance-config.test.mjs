@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from '../dist/terminal.js';
-import { createEnv, fail, ok } from './env.mjs';
+import { createEnv, fail, ok, revision } from './env.mjs';
 
 const plugin = 'github@claude-plugins-official';
 const claudePackage = '@anthropic-ai/claude-code';
@@ -335,7 +335,6 @@ test('安装 MCP：保留现有接入', async t => {
 
 test('重试技能安装：固定剩余成员', async t => {
   const f = await fixture(t);
-  const revision = '0123456789abcdef0123456789abcdef01234567';
   const state = { failReplaceTree: null, forbidSource: false };
   // 局部 machine 覆盖：方案载荷与修订由本测试固定应答，replaceTree 按成员基名注入写入失败
   const baseReplaceTree = f.machine.replaceTree;

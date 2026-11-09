@@ -7,8 +7,7 @@ import { describeRun } from '../dist/run-presentation.js';
 import { HOME_TITLE, TEXT } from '../dist/render.js';
 import { runTerminal } from '../dist/terminal.js';
 import { WARNING_MESSAGES } from '../dist/warnings.js';
-
-const wait = (_title, work) => work(new AbortController().signal);
+import { wait } from './env.mjs';
 
 test('拒绝目录外抛出码', async () => {
   const catalog = new Set([...Object.keys(ERROR_MESSAGES), ...Object.keys(WARNING_MESSAGES), ...Object.keys(TEXT)]);

@@ -41,7 +41,7 @@ export interface Machine {
   editJson(file: string, edit: (value: Record<string, unknown>) => void): Promise<void>;
   remove(file: string, expected: string): Promise<void>;
   /** 使用本实例固定的 npm；入口被替换时抛出 npm-changed，须重启后重新准备 */
-  npm(args: readonly string[], options?: Pick<CommandOptions, 'timeoutMs' | 'signal'>): Promise<CommandResult>;
+  npm(args: readonly string[], options?: ReadOptions): Promise<CommandResult>;
   entries(directory: string): Promise<readonly FileEntry[]>;
   treeStamp(file: string, signal?: AbortSignal): Promise<string | null>;
   removeTree(file: string, expected: string, preserveAt?: string): Promise<void>;
@@ -75,6 +75,9 @@ export const GIT_COMMAND_TIMEOUT_MS = 15_000;
 export const FETCH_TEXT_TIMEOUT_MS = 30_000;
 export const FETCH_BYTES_TIMEOUT_MS = 120_000;
 export const SOURCE_TIMEOUT_MS = 120_000;
+
+/** git 提交号形状：40 位十六进制小写 */
+export const isGitRevision = (value: string): boolean => /^[a-f0-9]{40}$/.test(value);
 
 /** 限制整读内容的内存占用 */
 const FILE_LIMIT_BYTES = 2 * 1024 * 1024;
@@ -330,7 +333,7 @@ async function run(
     }
   }
   return new Promise(resolve => {
-    const child = spawn(executable, [...args], {
+    const child = spawn(executable, args, {
       cwd,
       env: environment,
       windowsHide: true,
@@ -685,7 +688,7 @@ export function createMachine(
     },
     async source(repository, revision, subdirectory, options = {}) {
       return remoteRead(options, SOURCE_TIMEOUT_MS, async reading => {
-        if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\.git)?$/.test(repository) || !/^[a-f0-9]{40}$/.test(revision))
+        if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\.git)?$/.test(repository) || !isGitRevision(revision))
           throw new Error('invalid-source');
         const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-source-'));
         const git = async (args: readonly string[]) => {

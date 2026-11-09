@@ -92,10 +92,46 @@ test('主动展开对象检查记录', () => {
     location: '/tools/claude',
   };
   assert.equal(describeItem(item), 'Claude Code\n待确认\n位置：/tools/claude');
-  const explicit = describeInspection({ items: [item], problems: [] });
+  const explicit = describeInspection({ items: [item], problems: [] }, true);
   assert.match(explicit, /标识：claude:npm:chosen/);
   assert.match(explicit, /代码：inspection-timeout/);
   assert.match(explicit, /程序存在：npm/);
+});
+
+test('检查输出默认摘要：每项一行并按组归段', () => {
+  const item = {
+    id: 'claude:npm:chosen',
+    title: 'Claude Code',
+    kind: 'claude',
+    actions: [],
+    facts: [
+      { code: 'program-exists', detail: 'npm' },
+      { code: 'program-version', detail: '2.1.316' },
+    ],
+    location: '/tools/claude',
+  };
+  const plugin = {
+    id: 'plugin:github@claude-plugins-official',
+    title: 'GitHub',
+    kind: 'plugin',
+    actions: [],
+    facts: [{ code: 'plugin-installed' }],
+  };
+  const summary = describeInspection({
+    items: [item, plugin],
+    problems: [{ code: 'inspection-timeout', detail: 'skills' }],
+  });
+  assert.equal(
+    summary,
+    [
+      '── 基础配置',
+      'Claude Code：已安装 2.1.316',
+      '── Plugins',
+      'GitHub：已安装',
+      '! 检查超时，请刷新重试：Skills\n代码：inspection-timeout',
+    ].join('\n'),
+  );
+  assert.equal(describeInspection({ items: [], problems: [] }), '');
 });
 
 test('回退未知原因码', () => {

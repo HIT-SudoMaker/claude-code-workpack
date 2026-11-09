@@ -4,9 +4,8 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createEnv, ok } from './env.mjs';
-
-const revision = '0123456789abcdef0123456789abcdef01234567';
+import { createEnv, ok, revision } from './env.mjs';
+import { createCcw } from '../dist/ccw.js';
 
 async function catalogProbe(t, additions) {
   const scratch = fileURLToPath(new URL('../../../.scratch/', import.meta.url));
@@ -234,4 +233,38 @@ test('拒绝套件来源越级：不开始远程获取', async t => {
   const plan = await ccw.plan({ task: 'install', selected: [{ id: 'skill-set:virtual-invalid' }] });
   assert.equal(plan.items[0].problem, 'invalid-target');
   assert.equal(f.calls.length, 0);
+});
+
+test('第三方插件：停用后经安装页恢复启用', async t => {
+  const f = await createEnv(t);
+  const name = 'superpowers@claude-plugins-official';
+  const installPath = path.join(f.claudeRoot, 'plugins/cache/superpowers');
+  await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
+  await f.json(path.join(f.claudeRoot, 'plugins/installed_plugins.json'), {
+    plugins: { [name]: [{ scope: 'user', installPath }] },
+  });
+  await f.json(path.join(f.claudeRoot, 'plugins/known_marketplaces.json'), {
+    'claude-plugins-official': { source: { repo: 'anthropics/claude-plugins-official' } },
+  });
+  await f.json(f.settingsFile, { enabledPlugins: { [name]: false } });
+  const binary = path.join(f.home, '.local/bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
+  await f.write(binary, 'Claude fixture');
+  const machine = f.machine({
+    npm: async () => ok('{}'),
+    execute: async (file, args) => {
+      assert.equal(file, binary);
+      assert.deepEqual(args, ['plugin', 'enable', name, '--scope', 'user']);
+      await f.json(f.settingsFile, { enabledPlugins: { [name]: true } });
+      return ok();
+    },
+  });
+  const ccw = createCcw(ccwOptions(f, machine));
+  const item = (await ccw.inspect()).items.find(entry => entry.id === `plugin:${name}`);
+  assert.deepEqual(item.actions, ['connect']);
+  assert.equal(item.canInstall, false);
+  const plan = await ccw.plan({ task: 'install', selected: [{ id: `plugin:${name}` }] });
+  assert.equal(plan.items[0].problem, null);
+  assert.ok(plan.items[0].changes.some(change => change.code === 'plugin-reuse'));
+  assert.equal((await ccw.apply(plan.id)).state, 'done');
+  assert.equal((await f.read(f.settingsFile)).enabledPlugins[name], true);
 });

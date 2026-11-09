@@ -1,4 +1,10 @@
-export const ERROR_MESSAGES: Readonly<Record<string, { readonly brief: string; readonly detail: string }>> = {
+/** 消息文案条目：brief 为一行摘要，detail 为明细；errors/warnings/render TEXT 三表共用此形状 */
+export interface MessageText {
+  readonly brief: string;
+  readonly detail: string;
+}
+
+export const ERROR_MESSAGES: Readonly<Record<string, MessageText>> = {
   'npm-changed': { brief: '环境已变化', detail: 'npm 已变化，请重启 CCW 后重新操作' },
   'inspection-timeout': { brief: '检查超时', detail: '检查超时，请刷新重试' },
   'source-timeout': { brief: '获取超时', detail: '获取资源失败：请求超时' },
@@ -96,13 +102,14 @@ export const ERROR_MESSAGES: Readonly<Record<string, { readonly brief: string; r
   'channel-change-required': { brief: '需要重新接入', detail: '接入服务失败：启动渠道不同；需重新接入' },
   'serena-initialization-failed': { brief: '服务初始化失败', detail: '初始化 Serena 失败' },
   'marketplace-source-conflict': { brief: '市场来源不符', detail: '保留同名市场：来源不同' },
-  'overlapping-selection': { brief: '选择范围重复', detail: '选择内容失败：入口已包含在 OfficeCLI 操作' },
+  'overlapping-selection': { brief: '选择范围重复', detail: '选择内容失败：与同批另一项的操作范围重叠' },
   'installer-unavailable': { brief: '安装未执行', detail: '安装程序失败：官方来源返回网页；未执行安装' },
   'selected-item-unavailable': { brief: '所选内容失效', detail: '选择内容失败：内容不在检查结果' },
   'integration-source-conflict': { brief: '接入来源待确认', detail: '接入内容失败：同名入口与程序关系未知' },
   'claude-running': { brief: '请先退出程序', detail: '执行 Claude 操作失败：Claude 正在运行' },
   'process-state-unconfirmed': { brief: '进程待确认', detail: '确认 Claude 进程失败：状态未知' },
   'backup-exists': { brief: '备份目标已存在', detail: '保存备份失败：目标已存在' },
+  'report-name-conflict': { brief: '报告文件冲突', detail: '保存诊断报告失败：同名报告过多' },
   'connection-not-applied': { brief: '接入未生效', detail: '确认接入失败：配置未生效' },
   'inspection-failed': { brief: '检查失败', detail: '检查内容失败' },
   'installer-conflict': { brief: '安装目标冲突', detail: '启动安装器失败：临时目标已存在' },
@@ -127,7 +134,7 @@ export const ERROR_MESSAGES: Readonly<Record<string, { readonly brief: string; r
   'unknown-selection': { brief: '选择无效', detail: '准备操作失败：所选内容不受支持' },
   'unknown-argument': {
     brief: '参数无效',
-    detail: '只接受一个模式：--help、--version 或 --inspect；可附加一次 --details；不接受其他参数',
+    detail: '只接受一个模式：--help、--version、--inspect 或 --collect-logs；可附加一次 --details；不接受其他参数',
   },
   'interactive-terminal-required': { brief: '需要交互终端', detail: '启动界面失败：需要交互终端' },
   'unsupported-platform': { brief: '系统暂不支持', detail: '启动 CCW 失败：系统不支持' },

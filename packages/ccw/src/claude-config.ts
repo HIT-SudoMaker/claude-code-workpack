@@ -106,6 +106,9 @@ type EnvField = OrderedField &
   );
 
 // 保留字段只定位已有键；偏好默认值由编辑器提交，不能变成 initializer 默认值
+/** settings 内用户插件启停表的键名：字段表、插件域与配套插件探测共用 */
+export const ENABLED_PLUGINS_KEY = 'enabledPlugins';
+
 const ROOT_FIELDS = {
   $schema: { placement: 'prefix', role: 'preserve' },
   defaultShell: { placement: 'prefix', role: 'preserve' },
@@ -115,7 +118,7 @@ const ROOT_FIELDS = {
   language: { placement: 'prefix', role: 'preference' },
   outputStyle: { placement: 'prefix', role: 'preference' },
   statusLine: { placement: 'prefix', role: 'preserve' },
-  enabledPlugins: { placement: 'prefix', role: 'preserve' },
+  [ENABLED_PLUGINS_KEY]: { placement: 'prefix', role: 'preserve' },
   autoCompactEnabled: { placement: 'prefix', role: 'preserve' },
   autoCompactWindow: { placement: 'prefix', role: 'preserve' },
   apiKeyHelper: { placement: 'suffix', role: 'helper' },

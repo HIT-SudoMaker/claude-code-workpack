@@ -47,11 +47,13 @@ const INDICATORS: Readonly<Record<RunState, Pick<RunRow, 'symbol' | 'status' | '
   cancelled: { symbol: '○', status: '已停止', tone: 'muted' },
 };
 
-const EFFECTS: Readonly<Record<Effect['state'], { readonly symbol: string; readonly tone: RunTone }>> = {
-  done: { symbol: '✔', tone: 'success' },
-  kept: { symbol: '—', tone: 'muted' },
-  failed: { symbol: '✕', tone: 'danger' },
-  skipped: { symbol: '○', tone: 'warning' },
+const EFFECTS: Readonly<
+  Record<Effect['state'], { readonly symbol: string; readonly tone: RunTone; readonly statement: string }>
+> = {
+  done: { symbol: '✔', tone: 'success', statement: '已完成' },
+  kept: { symbol: '—', tone: 'muted', statement: '已保留' },
+  failed: { symbol: '✕', tone: 'danger', statement: '未完成' },
+  skipped: { symbol: '○', tone: 'warning', statement: '未执行' },
 };
 
 function executionState(item: Pick<ExecutionItem, 'state' | 'effects'>): RunState {
@@ -71,7 +73,7 @@ function detail(effect: Effect): RunDetail {
   const presentation = EFFECTS[effect.state];
   return {
     symbol: presentation.symbol,
-    text: `${{ done: '已完成', kept: '已保留', failed: '未完成', skipped: '未执行' }[effect.state]} · ${describeDiagnostic(effect)}`,
+    text: `${EFFECTS[effect.state].statement} · ${describeDiagnostic(effect)}`,
     tone: presentation.tone,
   };
 }
@@ -132,7 +134,7 @@ function resultTitle(result: RunResult, items: readonly ExecutionItem[], action?
     const actions = new Set(items.map(item => item.action));
     return failureLabel(action ?? (actions.size === 1 ? items[0]?.action : undefined));
   }
-  return { done: '完成', partial: '部分完成', cancelled: '已停止' }[result.state];
+  return INDICATORS[result.state].status;
 }
 
 function resultView(result: RunResult, items: readonly ExecutionItem[], action?: Action, detailsId?: string): RunView {
@@ -199,12 +201,15 @@ export function createRunPresentation(plan: { readonly items: readonly PlanItem[
   };
 }
 
+/** 状态行文本形状：交互窄屏回退与非交互输出共用 */
+export const statusLine = (row: RunRow) => `${row.symbol} ${row.status}  ${row.title}`;
+
 export function describeRun(view: RunView) {
   return [
     view.title,
     view.summary,
     ...view.rows.flatMap(row => [
-      `${row.symbol} ${row.status}  ${row.title}`,
+      statusLine(row),
       ...row.details.map(value => `  ${value.symbol ? `${value.symbol} ` : ''}${value.text}`),
     ]),
   ]

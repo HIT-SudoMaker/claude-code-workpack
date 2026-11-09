@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { startupFailure } from '../dist/render.js';
+
+const { version } = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const main = fileURLToPath(new URL('../dist/main.js', import.meta.url));
 const run = (args, env = {}) =>
@@ -23,6 +26,7 @@ for (const args of [
   ['--version', 'secret-argument'],
   ['--help', '--version'],
   ['--inspect', '--inspect'],
+  ['--collect-logs', '--inspect'],
   ['--'],
 ])
   test(`拒绝无效参数：${args.join(' ')}`, () => {
@@ -56,8 +60,8 @@ for (const mode of ['--help', '--version'])
       const result = run(args, { CLAUDE_CONFIG_DIR: path.parse(process.cwd()).root });
       assert.equal(result.status, 0);
       assert.equal(result.stderr, '');
-      if (mode === '--version') assert.equal(result.stdout, '0.4.0\n');
-      else assert.match(result.stdout, /--details：显示本次启动异常详情/);
+      if (mode === '--version') assert.equal(result.stdout, `${version}\n`);
+      else assert.match(result.stdout, /--details：显示启动异常与检查完整明细/);
       assert.doesNotMatch(result.stdout, /代码：/);
     });
 

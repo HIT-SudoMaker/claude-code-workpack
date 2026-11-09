@@ -2,9 +2,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { knownTitle } from './titles.js';
-import { bundledSkills, skillMembers, skillSuites } from './management-catalog.js';
-import { errorCode, isObject } from './machine.js';
-import { json, kindOf, restOf, sequence, success, unchanged } from './model.js';
+import { bundledSkills, SKILL_ENTRY, skillMembers, skillSuites } from './management-catalog.js';
+import { errorCode, isGitRevision, isObject } from './machine.js';
+import { json, kindOf, REPLACE_CONSENT, restOf, sequence, success, unchanged } from './model.js';
 import type { Context, Domain, Inspection, Item, Prepared, Selection } from './model.js';
 import {
   currentSkill,
@@ -13,6 +13,7 @@ import {
   repairSkillSource,
   skillFilesStamp,
 } from './skill-files.js';
+import { sourcesFile } from './storage.js';
 
 const ASSET_ROOT = fileURLToPath(new URL('../assets/', import.meta.url));
 
@@ -33,15 +34,26 @@ function assertRelativeSkillPath(value: string): void {
 }
 
 /** 固定 Git 来源与载荷 */
+/** 套件载荷内技能入口的路径形状（入口名单一出处 SKILL_ENTRY） */
+const suiteEntryPattern = new RegExp(`^(?:[\\w.-]+/)+${SKILL_ENTRY.replaceAll('.', '\\.')}$`);
+
 async function gitSkillSource(ctx: Context, source: { repository: string; folder: string }) {
   assertRelativeSkillPath(source.folder);
   const revision = success(await ctx.machine.execute('git', ['ls-remote', source.repository, 'HEAD'])).split(/\s+/)[0];
-  if (!revision || !/^[a-f0-9]{40}$/.test(revision)) throw new Error('source-unavailable');
+  if (!revision || !isGitRevision(revision)) throw new Error('source-unavailable');
   const files = await ctx.machine.source(source.repository, revision, source.folder);
   return { repository: source.repository, revision, files };
 }
 
-async function memberSkillSource(ctx: Context, name: string) {
+/** 从来源记录反查套件：未登记成员（如 mattpocock 成员）凭 sources.json 获得更新来源 */
+function suiteOfRecord(saved: unknown) {
+  const repository = isObject(saved) ? saved.repository : undefined;
+  return typeof repository === 'string'
+    ? Object.values(skillSuites).find(source => source.repository === repository)
+    : undefined;
+}
+
+async function memberSkillSource(ctx: Context, name: string, saved?: unknown) {
   const bundled = Object.entries(bundledSkills).find(([id]) => id === name)?.[1];
   if (bundled !== undefined) {
     assertRelativeSkillPath(bundled.asset);
@@ -50,10 +62,10 @@ async function memberSkillSource(ctx: Context, name: string) {
     return {
       repository: bundled.repository,
       revision: bundled.revision,
-      files: [{ path: 'SKILL.md', data: Buffer.from(text) }],
+      files: [{ path: SKILL_ENTRY, data: Buffer.from(text) }],
     };
   }
-  const source = memberSuite(name);
+  const source = memberSuite(name) ?? (name.includes('/') ? undefined : suiteOfRecord(saved));
   if (source === undefined) throw new Error('not-in-update-catalog');
   return gitSkillSource(ctx, { repository: source.repository, folder: `${source.folder}/${name}` });
 }
@@ -61,7 +73,7 @@ async function memberSkillSource(ctx: Context, name: string) {
 /** 读取来源记录：损坏或不可读时保持未知，不以查无代替 */
 async function readSkillMetadata(ctx: Context): Promise<Record<string, unknown>> {
   try {
-    return await json(ctx.machine, path.join(ctx.storage, 'sources.json'));
+    return await json(ctx.machine, sourcesFile(ctx));
   } catch (error) {
     throw new Error('source-metadata-unavailable', { cause: error });
   }
@@ -86,11 +98,13 @@ export function createSkillsDomain(ctx: Context): Domain {
 async function inspectSkills(ctx: Context): Promise<Inspection> {
   const result: Item[] = [];
   let metadata: Record<string, unknown> = {};
+  let metadataReadable = true;
   const problems: Inspection['problems'][number][] = [];
   try {
-    metadata = await json(ctx.machine, path.join(ctx.storage, 'sources.json'));
+    metadata = await json(ctx.machine, sourcesFile(ctx));
   } catch {
-    problems.push({ code: 'source-metadata-unavailable', detail: path.join(ctx.storage, 'sources.json') });
+    metadataReadable = false;
+    problems.push({ code: 'source-metadata-unavailable', detail: sourcesFile(ctx) });
   }
   for (const group of ['skills', 'commands'] as const) {
     const root = path.join(ctx.claudeRoot, group);
@@ -115,7 +129,7 @@ async function inspectSkills(ctx: Context): Promise<Inspection> {
         let problem: string | undefined;
         if (group === 'skills') {
           try {
-            const text = await ctx.machine.read(path.join(location, 'SKILL.md'));
+            const text = await ctx.machine.read(path.join(location, SKILL_ENTRY));
             if (text === null && entry.kind === 'directory') continue;
             if (!text?.trim()) problem = 'skill-entry-invalid';
           } catch (error) {
@@ -123,8 +137,6 @@ async function inspectSkills(ctx: Context): Promise<Inspection> {
           }
         }
         const name = path.relative(root, location).split(path.sep).join('/');
-        const isOffered =
-          group === 'skills' && (Object.hasOwn(skillMembers, name) || Object.hasOwn(bundledSkills, name));
         const saved = metadata[location];
         const skillSet =
           group === 'skills'
@@ -133,8 +145,11 @@ async function inspectSkills(ctx: Context): Promise<Inspection> {
                   source.repository === (isObject(saved) ? saved.repository : memberSuite(name)?.repository),
               )?.[0]
             : undefined;
-        // 已发现条目标题用内联键真身（目录名/相对名）：与磁盘及 Claude 所见一致，
-        // 官方名只归方案入口承载——用户据此知道自己装的是什么、怎么解除
+        // 更新资格取并集：登记成员、捆绑技能，以及凭来源记录归属到套件的已装成员
+        const isOffered =
+          group === 'skills' &&
+          (Object.hasOwn(skillMembers, name) || Object.hasOwn(bundledSkills, name) || skillSet !== undefined);
+        // 已发现条目标题用内联键真身（目录名/相对名），与磁盘及 Claude 所见一致；官方名只归方案入口
         result.push({
           id: `${group === 'skills' ? 'skill' : 'command'}:${name}`,
           title: name,
@@ -161,16 +176,25 @@ async function inspectSkills(ctx: Context): Promise<Inspection> {
       actions: ['install'],
     });
   }
-  // 方案入口只有整套套件；检查只列实际发现的成员，不虚构未安装的成员占位
-  for (const id of Object.keys(skillSuites))
+  // 方案入口只有整套套件；状态从已发现的成员聚合推导（本地事实），不虚构未安装的成员占位
+  for (const id of Object.keys(skillSuites)) {
+    const members = result.filter(item => item.kind === 'skill' && item.skillSet === id).length;
+    const registered = Object.values(skillMembers).filter(member => member.suite === id).length;
     result.push({
       id: `skill-set:${id}`,
       title: knownTitle(`skill-set:${id}`),
       kind: 'skill',
       canInstall: true,
-      facts: [],
+      facts: [
+        ...(members > 0
+          ? [{ code: 'skill-members-present', detail: registered > 0 ? `${members}/${registered}` : `${members}` }]
+          : metadataReadable
+            ? [{ code: 'not-installed' }]
+            : []),
+      ],
       actions: ['install'],
     });
+  }
   return { items: result, problems };
 }
 
@@ -180,7 +204,7 @@ async function prepareSkillSet(ctx: Context, name: string, selection: Selection)
   if (!source || selection.action !== 'install') throw new Error('action-unavailable');
   const { revision, files } = await gitSkillSource(ctx, source);
   const candidates = files
-    .filter(file => /^(?:[\w.-]+\/)+SKILL\.md$/.test(file.path) && file.data.length > 0)
+    .filter(file => suiteEntryPattern.test(file.path) && file.data.length > 0)
     .map(file => path.posix.dirname(file.path))
     .filter(folder => folder.split('/').every(part => part !== '.' && part !== '..'))
     .sort((a, b) => a.length - b.length || a.localeCompare(b));
@@ -198,7 +222,7 @@ async function prepareSkillSet(ctx: Context, name: string, selection: Selection)
     const member = path.posix.basename(folder);
     const directory = path.join(ctx.claudeRoot, 'skills', member);
     const before = await ctx.machine.treeStamp(directory);
-    const entry = before === null ? null : await ctx.machine.read(path.join(directory, 'SKILL.md'));
+    const entry = before === null ? null : await ctx.machine.read(path.join(directory, SKILL_ENTRY));
     const isEmptyDirectory = before !== null && entry === null && (await ctx.machine.entries(directory)).length === 0;
     if (before !== null && !isEmptyDirectory) {
       if (entry === null || !entry.trim()) throw new Error('local-edits-preserved');
@@ -234,15 +258,8 @@ export async function prepareSkill(
   group: 'skills' | 'commands',
   selection: Selection,
 ): Promise<Prepared> {
-  if (
-    !name ||
-    name.includes('\\') ||
-    name.includes(':') ||
-    path.isAbsolute(name) ||
-    name.split('/').some(part => part === '.' || part === '..' || part === '') ||
-    (group === 'skills' && name.includes('/'))
-  )
-    throw new Error('invalid-target');
+  assertRelativeSkillPath(name);
+  if (group === 'skills' && name.includes('/')) throw new Error('invalid-target');
   const directory = path.join(ctx.claudeRoot, group, name);
   const before = await ctx.machine.treeStamp(directory);
   const action = selection.action;
@@ -255,19 +272,27 @@ export async function prepareSkill(
   if (
     action === 'install' &&
     before !== null &&
-    selection.fields?.replace !== 'yes' &&
-    (await ctx.machine.read(path.join(directory, 'SKILL.md')))?.trim()
+    selection.fields?.replace !== REPLACE_CONSENT &&
+    (await ctx.machine.read(path.join(directory, SKILL_ENTRY)))?.trim()
   )
     return currentSkill(ctx, name, directory, before);
-  if (!Object.hasOwn(skillMembers, name) && !(group === 'skills' && Object.hasOwn(bundledSkills, name)))
-    throw new Error('not-in-update-catalog');
   const metadata = await readSkillMetadata(ctx);
   const saved = metadata[directory];
-  const { repository, revision, files } = await memberSkillSource(ctx, name);
+  if (
+    !Object.hasOwn(skillMembers, name) &&
+    !(group === 'skills' && Object.hasOwn(bundledSkills, name)) &&
+    !(group === 'skills' && suiteOfRecord(saved) !== undefined)
+  )
+    throw new Error('not-in-update-catalog');
+  const { repository, revision, files } = await memberSkillSource(ctx, name, saved);
   const expected = skillFilesStamp(files);
   const target = { name, directory, stamp: before, sourceRecord: saved };
   const release = { repository, revision, files, stamp: expected };
-  if (before !== null && (!isObject(saved) || saved.stamp !== before) && selection.fields?.replace !== 'yes') {
+  if (
+    before !== null &&
+    (!isObject(saved) || saved.stamp !== before) &&
+    selection.fields?.replace !== REPLACE_CONSENT
+  ) {
     if (before === expected) return repairSkillSource(ctx, target, release);
     throw new Error('local-edits-preserved');
   }

@@ -46,6 +46,11 @@ export const pluginSpecs = {
   Record<string, { title: string; source: keyof typeof marketplaceSources; exposure: 'offer' | 'discovered' }>
 >;
 
+/** 技能套件目录。隐含不变量：repository 在目录内全局唯一（不与其他套件共享仓库）——
+ *  已装成员的套件归属与更新资格均以 repository 单字段匹配（skills.ts suiteOfRecord/memberSuite） */
+/** 技能入口文件名：载荷校验、套件成员发现与随包技能读取共用 */
+export const SKILL_ENTRY = 'SKILL.md';
+
 export const skillSuites = {
   mattpocock: {
     title: 'Matt Pocock/Skills',
@@ -94,9 +99,12 @@ export const mcpSpecs = {
 /** 抑制 OfficeCLI 自更新/自动安装的固定旗标：MCP 注册模板与版本探测共用同一份事实 */
 const officeSuppressSelfUpdate = { OFFICECLI_NO_AUTO_INSTALL: '1', OFFICECLI_SKIP_UPDATE: '1' } as const;
 
+/** OfficeCLI 上游仓库标识：目录登记、发布/标签 API 与下载 URL 派生共用 */
+export const OFFICECLI_REPO_SLUG = 'iOfficeAI/OfficeCLI';
+
 export const officeIntegration = {
   suppressSelfUpdate: officeSuppressSelfUpdate,
-  skill: { repository: 'https://github.com/iOfficeAI/OfficeCLI', folder: 'skills/officecli' },
+  skill: { repository: `https://github.com/${OFFICECLI_REPO_SLUG}`, folder: 'skills/officecli' },
   mcp: {
     args: ['mcp'],
     env: officeSuppressSelfUpdate,

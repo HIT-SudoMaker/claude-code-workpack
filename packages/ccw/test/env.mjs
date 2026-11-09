@@ -9,6 +9,12 @@ import { createMachine } from '../dist/machine.js';
 export const ok = (stdout = '') => ({ code: 0, stdout, failed: false });
 /** 构造命令/npm 失败结果：code 1、空 stdout、failed false */
 export const fail = () => ({ code: 1, stdout: '', failed: false });
+/** 测试共享的等待桩：不渲染界面，直接在取消作用域内执行任务 */
+export const wait = (_title, work) => work(new AbortController().signal);
+/** 测试共享的固定 git 修订单（40 位十六进制） */
+export const revision = '0123456789abcdef0123456789abcdef01234567';
+/** 测试共享的无归属环境注记：不携带 commit、PR 与会话链接 */
+export const attribution = { commit: '', pr: '', sessionUrl: false };
 /** 判定路径存在性：stat 成功即存在 */
 export const exists = file =>
   fs.stat(file).then(

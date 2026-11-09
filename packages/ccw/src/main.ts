@@ -3,27 +3,33 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createCcw } from './ccw.js';
+import { collectLogs } from './collect.js';
+import type { CcwOptions } from './model.js';
 import { createMachine, errorCode, isObject } from './machine.js';
 import { BRAND, describeInspection, HELP_TEXT, startupFailure } from './render.js';
 import { runTerminal } from './terminal.js';
 import { createTerminal } from './terminal-view.js';
 
-function parseArguments(args: readonly string[]) {
-  let mode: '--help' | '--version' | '--inspect' | undefined;
+/** CLI 模式清单单一出处：新增模式仍需人工同步 errors.ts 与 HELP_TEXT 的散文枚举 */
+const CLI_MODES = ['--help', '--version', '--inspect', '--collect-logs'] as const;
+const CLI_MODE_VALUES: readonly string[] = CLI_MODES;
+type Mode = (typeof CLI_MODES)[number] | undefined;
+const isMode = (value: string): value is (typeof CLI_MODES)[number] => CLI_MODE_VALUES.includes(value);
+function parseArguments(args: readonly string[]): { mode: Mode; hasDetails: boolean } {
+  let mode: Mode;
   let hasDetails = false;
   for (const argument of args) {
     if (argument === '--details' && !hasDetails) hasDetails = true;
-    else if ((argument === '--help' || argument === '--version' || argument === '--inspect') && mode === undefined)
-      mode = argument;
+    else if (isMode(argument) && mode === undefined) mode = argument;
     else throw new Error('unknown-argument');
   }
-  return mode;
+  return { mode, hasDetails };
 }
 
 async function main() {
-  const argument = parseArguments(process.argv.slice(2));
+  const { mode: argument, hasDetails } = parseArguments(process.argv.slice(2));
   if (argument === '--version') {
-    process.stdout.write(`${BRAND.version.slice(1)}\n`);
+    process.stdout.write(`${BRAND.versionNumber}\n`);
     return;
   }
   if (argument === '--help') {
@@ -47,7 +53,7 @@ async function main() {
     abort.abort();
   };
   const terminal = argument === undefined ? createTerminal(stop) : undefined;
-  const ccw = createCcw({
+  const options: CcwOptions = {
     machine: createMachine(process.env, process.cwd(), terminal ? work => terminal.handoff(work) : undefined),
     home,
     claudeRoot,
@@ -59,11 +65,17 @@ async function main() {
     arch: /arm64|aarch64/i.test(machineArch) ? 'arm64' : /x86_64|amd64|x64/i.test(machineArch) ? 'x64' : process.arch,
     ...(process.platform === 'linux' ? { libc } : {}),
     platform: process.platform,
-  });
+  };
+  const ccw = createCcw(options);
   if (argument === '--inspect') {
     const view = await ccw.inspect();
-    process.stdout.write(`${describeInspection(view)}\n`);
+    process.stdout.write(`${describeInspection(view, hasDetails)}\n`);
     if (view.problems.length || view.items.some(item => item.problem)) process.exitCode = 1;
+    return;
+  }
+  if (argument === '--collect-logs') {
+    const collected = await collectLogs(ccw, options);
+    process.stdout.write(`${collected.summary}\n`);
     return;
   }
   if (!terminal) return;

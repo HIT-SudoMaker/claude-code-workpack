@@ -23,7 +23,7 @@ local state -> inspect -> plan -> apply -> result
 
 ## Install
 
-CCW 0.4.0 需要 Node.js 22.20 或更高版本。使用 pnpm 或 npm 安装：
+CCW 需要 Node.js 22.20 或更高版本。使用 pnpm 或 npm 安装：
 
 ```bash
 pnpm add -g @hit-sudomaker/ccw

@@ -2,12 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import { knownTitle } from './titles.js';
-import { officeIntegration } from './management-catalog.js';
+import { OFFICECLI_REPO_SLUG, officeIntegration } from './management-catalog.js';
 import { errorCode, isObject, succeeded } from './machine.js';
 import type { CommandOptions } from './machine.js';
-import { cancelled, claudeEnvironment, claudeRunning, success } from './model.js';
-import { npmInstallArgs, npmUninstallArgs, NPM_OFFICIAL, resolveNpmView } from './npm-registry.js';
-import type { Context, Item, Prepared, Selection } from './model.js';
+import { cancelled, claudeEnvironment, claudeRunning, success, userBinary } from './model.js';
+import { isExactVersion, npmInstallArgs, npmUninstallArgs, NPM_OFFICIAL, resolveNpmView } from './npm-registry.js';
+import type { Context, Effect, Item, Prepared, Selection } from './model.js';
 import type { NpmRegistry, NpmResolution } from './npm-registry.js';
 import {
   channelCanPinVersion,
@@ -18,6 +18,7 @@ import {
   maintainProgramChannel,
   npmBinary,
   npmGlobalRoot,
+  npmScriptFlags,
   npmScopeArgs,
   npmVersion,
   officeBinary,
@@ -27,6 +28,7 @@ import {
   samePath,
 } from './program-channels.js';
 import type { NpmScope, Program, ProgramKind } from './program-channels.js';
+import { installScratch } from './storage.js';
 
 export async function programs(
   ctx: Context,
@@ -35,10 +37,7 @@ export async function programs(
   const values = new Map<string, Program>();
   const problems: string[] = [];
   const canonicalPaths: string[] = [];
-  const native =
-    kind === 'claude'
-      ? path.join(ctx.home, '.local/bin', ctx.platform === 'win32' ? 'claude.exe' : 'claude')
-      : officeBinary(ctx);
+  const native = kind === 'claude' ? userBinary(ctx, 'claude') : officeBinary(ctx);
   const add = (value: Program) => values.set(`${kind}:${value.channel}:${value.binary}`, value);
   try {
     const version = await npmVersion(ctx, PROGRAM_PACKAGES[kind]);
@@ -287,7 +286,7 @@ async function claudeVersion(ctx: Context, binary: string) {
 }
 
 function exactVersion(value: unknown) {
-  return typeof value === 'string' && /^\d+\.\d+\.\d+$/.test(value) ? value : null;
+  return isExactVersion(value) ? value : null;
 }
 
 async function stableClaudeVersion(ctx: Context): Promise<NpmResolution<string>> {
@@ -335,7 +334,7 @@ async function prepareClaudeInstall(
   let cmdStamp: string | null | undefined;
   let isCmdFailed = false;
   let installerCleanup: { directory: string; stamp?: string } | undefined;
-  const native = path.join(ctx.home, '.local/bin', ctx.platform === 'win32' ? 'claude.exe' : 'claude');
+  const native = userBinary(ctx, 'claude');
   try {
     npmScope = await freezeNpmScope(ctx);
   } catch (error) {
@@ -370,6 +369,130 @@ async function prepareClaudeInstall(
     stamp = await ctx.machine.treeStamp(binary);
     isComplete = true;
   };
+  // 五段顺次落差推进；段守卫兼作续办重入点
+  /** npm 首装段：复核空机与 npm 槽位后落包，留存清单与二进制指纹供后续段核对 */
+  const installViaNpm = async (report: (effect: Effect) => void) => {
+    if (stage !== 'npm') return;
+    const before = await programs(ctx, 'claude');
+    if (before.values.size) throw new Error('program-changed');
+    if (before.problems.length) throw new Error('installation-state-unconfirmed');
+    await npmScope?.verify();
+    stage = 'npm-confirm';
+    report({ state: 'kept', code: 'npm-install-started' });
+    if (npmRoot === undefined) return;
+    try {
+      const args = npmInstallArgs(
+        [
+          'install',
+          '-g',
+          ...npmScopeArgs(ctx, npmRoot),
+          ...npmScriptFlags('claude'),
+          `${PROGRAM_PACKAGES.claude}@${targetVersion}`,
+        ],
+        targetRegistry,
+      );
+      success(await ctx.machine.npm(args), 'npm-install-failed');
+      report({ state: 'done', code: 'package-command-completed' });
+    } catch (error) {
+      if (errorCode(error) === 'npm-changed') throw error;
+      npmFailure = errorCode(error);
+    }
+    const manifest = path.join(npmRoot, PROGRAM_PACKAGES.claude, 'package.json');
+    try {
+      const manifestStamp = await ctx.machine.treeStamp(manifest);
+      if (manifestStamp === null) npmSnapshot = { manifestStamp };
+      else {
+        const file = await npmBinary(ctx, 'claude', npmRoot);
+        npmSnapshot = { manifestStamp, binary: { file, stamp: await ctx.machine.treeStamp(file) } };
+      }
+    } catch (error) {
+      throw new Error('program-installation-unconfirmed', { cause: error });
+    }
+  };
+  /** npm 确认段：核对指纹并验收；非 Windows 无备选渠道，失败即终局 */
+  const confirmNpmInstallation = async (report: (effect: Effect) => void, signal: AbortSignal | undefined) => {
+    if (stage !== 'npm-confirm') return;
+    await npmScope?.verify();
+    await verifyNpmSnapshot();
+    const installed = await installedClaude(ctx, 'npm', targetVersion);
+    if (installed !== undefined) {
+      await confirm(installed);
+      report({ state: 'done', code: 'program-ready', detail: `npm · ${targetVersion}` });
+      cancelled(signal);
+      return;
+    }
+    cancelled(signal);
+    npmFailure ??= 'program-not-ready';
+    report({ state: 'kept', code: npmFailure });
+    if (ctx.platform !== 'win32') throw new Error(npmFailure);
+    stage = 'cleanup';
+  };
+  /** 失败清理段：仅清本次目标版本的 npm 残留，清毕转入 CMD 备选 */
+  const cleanupFailedNpmInstall = async (report: (effect: Effect) => void) => {
+    if (stage !== 'cleanup') return;
+    await npmScope?.verify();
+    if (!isCleanupCompleted) await verifyNpmSnapshot();
+    const remainder = await npmVersion(ctx, PROGRAM_PACKAGES.claude, npmRoot);
+    if (remainder !== null) {
+      if (remainder !== targetVersion || isCleanupCompleted) throw new Error('program-changed');
+      success(
+        await ctx.machine.npm(
+          npmUninstallArgs(['uninstall', '-g', ...npmScopeArgs(ctx, npmRoot), PROGRAM_PACKAGES.claude]),
+        ),
+        'failed-install-cleanup-failed',
+      );
+      isCleanupCompleted = true;
+      if ((await npmVersion(ctx, PROGRAM_PACKAGES.claude, npmRoot)) !== null)
+        throw new Error('failed-install-cleanup-failed');
+      report({ state: 'kept', code: 'failed-install-cleaned' });
+    }
+    stage = 'cmd';
+  };
+  /** CMD 备选段：拉取官方安装脚本到一次性目录执行，目录即用即清 */
+  const installViaCmd = async (report: (effect: Effect) => void, signal: AbortSignal | undefined) => {
+    if (stage !== 'cmd') return;
+    const current = await programs(ctx, 'claude');
+    if (current.values.size) throw new Error('program-changed');
+    if (current.problems.length) throw new Error('installation-state-unconfirmed');
+    cancelled(signal);
+    report({ state: 'kept', code: 'cmd-install-started' });
+    const script = await ctx.machine.fetchText('https://claude.ai/install.cmd');
+    if (/^\s*</.test(script) || !script.trim()) throw new Error('installer-unavailable');
+    const directory = installScratch(ctx, `claude-${randomUUID()}`);
+    const file = path.join(directory, 'install.cmd');
+    if (!(await ctx.machine.initialize(file, script))) throw new Error('installer-conflict');
+    installerCleanup = { directory };
+    try {
+      cancelled(signal);
+      stage = 'cmd-confirm';
+      const result = await ctx.machine.execute(
+        'cmd.exe',
+        ['/d', '/v:off', '/s', '/c', '.\\install.cmd', targetVersion],
+        { env: claudeEnvironment(ctx), cwd: directory },
+      );
+      isCmdFailed = !succeeded(result);
+      if (!isCmdFailed) report({ state: 'done', code: 'package-command-completed' });
+      try {
+        cmdStamp = await ctx.machine.treeStamp(native);
+      } catch (error) {
+        throw new Error('program-installation-unconfirmed', { cause: error });
+      }
+    } finally {
+      await cleanInstaller();
+    }
+  };
+  /** CMD 确认段：核对原生位指纹并验收 */
+  const confirmCmdInstallation = async (report: (effect: Effect) => void, signal: AbortSignal | undefined) => {
+    if (stage !== 'cmd-confirm') return;
+    await cleanInstaller();
+    if (cmdStamp === undefined) throw new Error('program-installation-unconfirmed');
+    if ((await ctx.machine.treeStamp(native)) !== cmdStamp) throw new Error('program-changed');
+    const installed = await installedClaude(ctx, 'native', targetVersion);
+    if (installed === undefined) throw new Error(isCmdFailed ? 'cmd-install-failed' : 'program-not-ready');
+    await confirm(installed);
+    report({ state: 'done', code: 'program-ready', detail: `CMD · ${targetVersion}` });
+    cancelled(signal);
+  };
   const operation: Prepared & { readonly targetVersion: string | null; readonly targetRegistry: NpmRegistry } = {
     targetVersion,
     targetRegistry,
@@ -389,122 +512,11 @@ async function prepareClaudeInstall(
     },
     async run(report, signal) {
       cancelled(signal);
-      if (stage === 'npm') {
-        const before = await programs(ctx, 'claude');
-        if (before.values.size) throw new Error('program-changed');
-        if (before.problems.length) throw new Error('installation-state-unconfirmed');
-        await npmScope?.verify();
-        stage = 'npm-confirm';
-        report({ state: 'kept', code: 'npm-install-started' });
-        if (npmRoot !== undefined) {
-          try {
-            const args = npmInstallArgs(
-              [
-                'install',
-                '-g',
-                ...npmScopeArgs(ctx, npmRoot),
-                '--ignore-scripts=false',
-                `--allow-scripts=${PROGRAM_PACKAGES.claude}`,
-                '--include=optional',
-                `${PROGRAM_PACKAGES.claude}@${targetVersion}`,
-              ],
-              targetRegistry,
-            );
-            success(await ctx.machine.npm(args), 'npm-install-failed');
-            report({ state: 'done', code: 'package-command-completed' });
-          } catch (error) {
-            if (errorCode(error) === 'npm-changed') throw error;
-            npmFailure = errorCode(error);
-          }
-          const manifest = path.join(npmRoot, PROGRAM_PACKAGES.claude, 'package.json');
-          try {
-            const manifestStamp = await ctx.machine.treeStamp(manifest);
-            if (manifestStamp === null) npmSnapshot = { manifestStamp };
-            else {
-              const file = await npmBinary(ctx, 'claude', npmRoot);
-              npmSnapshot = { manifestStamp, binary: { file, stamp: await ctx.machine.treeStamp(file) } };
-            }
-          } catch (error) {
-            throw new Error('program-installation-unconfirmed', { cause: error });
-          }
-        }
-      }
-      if (stage === 'npm-confirm') {
-        await npmScope?.verify();
-        await verifyNpmSnapshot();
-        const installed = await installedClaude(ctx, 'npm', targetVersion);
-        if (installed !== undefined) {
-          await confirm(installed);
-          report({ state: 'done', code: 'program-ready', detail: `npm · ${targetVersion}` });
-          cancelled(signal);
-          return;
-        }
-        cancelled(signal);
-        npmFailure ??= 'program-not-ready';
-        report({ state: 'kept', code: npmFailure });
-        if (ctx.platform !== 'win32') throw new Error(npmFailure);
-        stage = 'cleanup';
-      }
-      if (stage === 'cleanup') {
-        await npmScope?.verify();
-        if (!isCleanupCompleted) await verifyNpmSnapshot();
-        const remainder = await npmVersion(ctx, PROGRAM_PACKAGES.claude, npmRoot);
-        if (remainder !== null) {
-          if (remainder !== targetVersion || isCleanupCompleted) throw new Error('program-changed');
-          success(
-            await ctx.machine.npm(
-              npmUninstallArgs(['uninstall', '-g', ...npmScopeArgs(ctx, npmRoot), PROGRAM_PACKAGES.claude]),
-            ),
-            'failed-install-cleanup-failed',
-          );
-          isCleanupCompleted = true;
-          if ((await npmVersion(ctx, PROGRAM_PACKAGES.claude, npmRoot)) !== null)
-            throw new Error('failed-install-cleanup-failed');
-          report({ state: 'kept', code: 'failed-install-cleaned' });
-        }
-        stage = 'cmd';
-      }
-      if (stage === 'cmd') {
-        const current = await programs(ctx, 'claude');
-        if (current.values.size) throw new Error('program-changed');
-        if (current.problems.length) throw new Error('installation-state-unconfirmed');
-        cancelled(signal);
-        report({ state: 'kept', code: 'cmd-install-started' });
-        const script = await ctx.machine.fetchText('https://claude.ai/install.cmd');
-        if (/^\s*</.test(script) || !script.trim()) throw new Error('installer-unavailable');
-        const directory = path.join(ctx.storage, `install-claude-${randomUUID()}`);
-        const file = path.join(directory, 'install.cmd');
-        if (!(await ctx.machine.initialize(file, script))) throw new Error('installer-conflict');
-        installerCleanup = { directory };
-        try {
-          cancelled(signal);
-          stage = 'cmd-confirm';
-          const result = await ctx.machine.execute(
-            'cmd.exe',
-            ['/d', '/v:off', '/s', '/c', '.\\install.cmd', targetVersion],
-            { env: claudeEnvironment(ctx), cwd: directory },
-          );
-          isCmdFailed = !succeeded(result);
-          if (!isCmdFailed) report({ state: 'done', code: 'package-command-completed' });
-          try {
-            cmdStamp = await ctx.machine.treeStamp(native);
-          } catch (error) {
-            throw new Error('program-installation-unconfirmed', { cause: error });
-          }
-        } finally {
-          await cleanInstaller();
-        }
-      }
-      if (stage === 'cmd-confirm') {
-        await cleanInstaller();
-        if (cmdStamp === undefined) throw new Error('program-installation-unconfirmed');
-        if ((await ctx.machine.treeStamp(native)) !== cmdStamp) throw new Error('program-changed');
-        const installed = await installedClaude(ctx, 'native', targetVersion);
-        if (installed === undefined) throw new Error(isCmdFailed ? 'cmd-install-failed' : 'program-not-ready');
-        await confirm(installed);
-        report({ state: 'done', code: 'program-ready', detail: `CMD · ${targetVersion}` });
-        cancelled(signal);
-      }
+      await installViaNpm(report);
+      await confirmNpmInstallation(report, signal);
+      await cleanupFailedNpmInstall(report);
+      await installViaCmd(report, signal);
+      await confirmCmdInstallation(report, signal);
     },
     remaining: () => (isComplete ? undefined : operation),
     async verify() {
@@ -570,7 +582,7 @@ async function prepareOfficeNative(
   const updates = await officeUpdates(ctx, binary);
   const assetName = officeAsset(ctx);
   const release: unknown = JSON.parse(
-    await ctx.machine.fetchText('https://api.github.com/repos/iOfficeAI/OfficeCLI/releases/latest'),
+    await ctx.machine.fetchText(`https://api.github.com/repos/${OFFICECLI_REPO_SLUG}/releases/latest`),
   );
   if (
     !isObject(release) ||
@@ -582,7 +594,7 @@ async function prepareOfficeNative(
   )
     throw new Error('invalid-release');
   const targetVersion = release.tag_name.slice(1);
-  const baseUrl = `https://github.com/iOfficeAI/OfficeCLI/releases/download/${release.tag_name}/`;
+  const baseUrl = `https://github.com/${OFFICECLI_REPO_SLUG}/releases/download/${release.tag_name}/`;
   const assets = release.assets.filter(isObject);
   const asset = assets.find(value => value.name === assetName);
   const manifest = assets.find(value => value.name === 'SHA256SUMS');
@@ -670,6 +682,12 @@ async function prepareOfficeNative(
   return operation;
 }
 
+/** Claude 变更前的进程复核：枚举失败保留未知，不臆断未运行 */
+async function ensureClaudeNotRunning(ctx: Context) {
+  const isClaudeActive = await claudeRunning(ctx.machine);
+  if (isClaudeActive !== false) throw new Error(isClaudeActive ? 'claude-running' : 'process-state-unconfirmed');
+}
+
 async function prepareProgramRemoval(
   ctx: Context,
   kind: ProgramKind,
@@ -678,10 +696,7 @@ async function prepareProgramRemoval(
 ): Promise<Prepared & { readonly targetVersion: null }> {
   if (!program) throw new Error('program-not-installed');
   if (program.channel === 'manual') throw new Error('channel-not-supported');
-  if (kind === 'claude') {
-    const isClaudeActive = await claudeRunning(ctx.machine);
-    if (isClaudeActive !== false) throw new Error(isClaudeActive ? 'claude-running' : 'process-state-unconfirmed');
-  }
+  if (kind === 'claude') await ensureClaudeNotRunning(ctx);
   const before = await ctx.machine.treeStamp(program.binary);
   const scope = await freezeProgramScope(ctx, program);
   if (
@@ -735,10 +750,7 @@ async function prepareProgramRemoval(
     },
     async run(report, signal) {
       cancelled(signal);
-      if (kind === 'claude') {
-        const isClaudeActive = await claudeRunning(ctx.machine);
-        if (isClaudeActive !== false) throw new Error(isClaudeActive ? 'claude-running' : 'process-state-unconfirmed');
-      }
+      if (kind === 'claude') await ensureClaudeNotRunning(ctx);
       if (removals.length) {
         for (const target of removals) {
           if (target.isDone) {
@@ -806,7 +818,8 @@ async function prepareProgramRemoval(
   return operation;
 }
 
-function compareVersions(left: string, right: string) {
+/** 三段语义化版本比较：正值为左更新；ccline 的降级门共用 */
+export function compareVersions(left: string, right: string) {
   const a = left.split('.').map(Number);
   const b = right.split('.').map(Number);
   for (let index = 0; index < 3; index++) {

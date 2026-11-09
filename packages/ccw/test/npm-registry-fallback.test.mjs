@@ -14,6 +14,7 @@ import {
   ok,
   registryOf,
   releaseContract,
+  revision,
   scopedRegistryOf,
   versionProbe,
 } from './env.mjs';
@@ -74,7 +75,6 @@ test('安装 OfficeCLI：使用 GitHub 载荷', async t => {
   const localAppData = path.join(f.root, 'LocalAppData');
   const payload = Buffer.from('OfficeCLI GitHub release fixture');
   const digest = createHash('sha256').update(payload).digest('hex');
-  const revision = '0123456789abcdef0123456789abcdef01234567';
   const tag = 'v1.0.123';
   const asset = 'officecli-win-x64.exe';
   const release = `https://github.com/iOfficeAI/OfficeCLI/releases/download/${tag}/`;

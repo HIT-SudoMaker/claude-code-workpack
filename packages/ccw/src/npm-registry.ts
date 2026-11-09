@@ -13,8 +13,14 @@ export const NPM_OFFICIAL = 'https://registry.npmjs.org';
 export const NPM_READ_TIMEOUT_MS = 5_000;
 
 const NPM_AUDIT_FREE = ['--no-audit', '--no-fund'] as const;
+/** 需要安装期脚本的包（claude、ccline）以此启用脚本执行；字面量不得散布 */
+export const NPM_ENABLE_SCRIPTS = ['--ignore-scripts=false'] as const;
 const queryFlags = ['--fetch-retries=0', '--fetch-timeout=4000'] as const;
 const installFlags = ['--fetch-retries=1', '--fetch-timeout=30000'] as const;
+
+/** 精确三段版本号（无前后缀） */
+export const isExactVersion = (value: unknown): value is string =>
+  typeof value === 'string' && /^\d+\.\d+\.\d+$/.test(value);
 
 function registryFlags(registry: string, packageSpec: string) {
   const scope = /^(@[a-z0-9._-]+)\/[a-z0-9._-]+(?:@[^\s]+)?$/i.exec(packageSpec)?.[1];

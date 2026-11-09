@@ -8,6 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { packageRuntime } from './package-runtime.mjs';
 
+const { version } = JSON.parse(fs.readFileSync(new URL('../packages/ccw/package.json', import.meta.url), 'utf8'));
+
 test('验证独立运行包', async t => {
   const runtime = packageRuntime();
   const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ccw-runtime-sandbox-')));
@@ -24,7 +26,7 @@ test('验证独立运行包', async t => {
         encoding: 'utf8',
         windowsHide: true,
       }).trim(),
-      '0.4.0',
+      version,
     );
   });
   for (const [scenario, title] of [

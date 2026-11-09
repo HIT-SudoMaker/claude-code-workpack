@@ -7,12 +7,36 @@ import type { ReactNode } from 'react';
 import stringWidth from 'string-width';
 import wrapAnsi from 'wrap-ansi';
 
-import { BRAND, HOME_TITLE, safeText } from './render.js';
+import {
+  BACK_TO_HOME,
+  BANNER_WIDTH,
+  BRAND,
+  GROUP_MARK,
+  HOME_TITLE,
+  platformSummary,
+  PROBLEM_MARK,
+  safeText,
+} from './render.js';
 import type { MenuRow } from './render.js';
+import { statusLine } from './run-presentation.js';
 import type { RunDetail, RunRow, RunTone, RunView } from './run-presentation.js';
 import type { FormField, FormProblem, SelectionChange, SelectionPage, Terminal } from './terminal.js';
 
 const ACCENT = '#D97757';
+/** 选中行与未选中行的前缀对（等宽） */
+const CURSOR_PREFIX = '› ';
+const BLANK_PREFIX = '  ';
+/** 滚动窗口夹取：请求起点不越出 [0, total - visible] */
+const clampWindow = (requested: number, visible: number, total: number) =>
+  Math.min(Math.max(0, total - visible), Math.max(0, requested));
+/** 居中滚动窗口起点：活动行居中后夹取 */
+const windowStart = (active: number, height: number, total: number) =>
+  clampWindow(active - Math.floor(height / 2), height, total);
+/** 窗口指示器：显示范围内的行区间 */
+const windowIndicator = (start: number, visible: number, total: number) =>
+  `${start + 1}–${Math.min(start + visible, total)}/${total}`;
+/** 窄屏回退时详情行的缩进：wrap 宽度与 marginLeft 必须取同一值 */
+const detailIndent = (width: number) => (width < 24 ? 2 : 12);
 type SelectionResult = Awaited<ReturnType<Terminal['select']>>;
 interface InputEvent {
   readonly input: string;
@@ -23,12 +47,39 @@ function isExit({ input, key }: InputEvent) {
   return key.ctrl && input === 'c';
 }
 
+/** 输入法组合/提交的自由文本：不匹配任何快捷键，也非命名控制键 */
+export function isIgnoredText(input: string, key: Key) {
+  return (
+    input.length > 0 &&
+    !key.escape &&
+    !key.return &&
+    !key.tab &&
+    !key.backspace &&
+    !key.delete &&
+    !key.upArrow &&
+    !key.downArrow &&
+    !key.leftArrow &&
+    !key.rightArrow &&
+    !key.pageUp &&
+    !key.pageDown &&
+    !key.home &&
+    !key.end &&
+    !key.ctrl &&
+    !key.meta
+  );
+}
+
+/** 归一化捕获的未知异常：保留原 Error 实例，其余包裹为携带 cause 的 Error */
+function asError(error: unknown, code: string): Error {
+  return error instanceof Error ? error : new Error(code, { cause: error });
+}
+
 function HomeHeader({ size }: { readonly size: WindowSize }) {
   const platform = process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
-  const system = `${platform} (${os.arch()})`;
+  const system = platformSummary(platform, os.arch());
   return (
     <Box flexDirection="column">
-      <Text color={ACCENT}>{'═'.repeat(Math.min(62, size.columns))}</Text>
+      <Text color={ACCENT}>{'═'.repeat(Math.min(BANNER_WIDTH, size.columns))}</Text>
       {size.rows >= 28 && <Text> </Text>}
       {size.rows >= 20 && size.columns >= 30 ? (
         BRAND.logo.map((line, index) => <Text key={index} color={ACCENT} bold>{`  ${line}`}</Text>)
@@ -46,7 +97,7 @@ function HomeHeader({ size }: { readonly size: WindowSize }) {
       <Text dimColor> {BRAND.credit}</Text>
       {size.rows >= 24 ? (
         <>
-          <Text color={ACCENT}>{'─'.repeat(Math.min(62, size.columns))}</Text>
+          <Text color={ACCENT}>{'─'.repeat(Math.min(BANNER_WIDTH, size.columns))}</Text>
           <Text bold> 当前环境状态</Text>
           <Text> 1. 系统 {system}</Text>
           <Text> 2. Node {process.version}</Text>
@@ -61,7 +112,7 @@ function HomeHeader({ size }: { readonly size: WindowSize }) {
           </Text>
         </>
       )}
-      <Text color={ACCENT}>{'═'.repeat(Math.min(62, size.columns))}</Text>
+      <Text color={ACCENT}>{'═'.repeat(Math.min(BANNER_WIDTH, size.columns))}</Text>
       <Text bold>请选择：</Text>
     </Box>
   );
@@ -96,7 +147,13 @@ function Frame({ title, footer, page = 0, children }: FrameProps) {
         <HomeHeader size={size} />
       ) : (
         <>
-          <Box borderStyle="double" borderColor={ACCENT} width={Math.min(62, size.columns)} paddingX={1} flexShrink={0}>
+          <Box
+            borderStyle="double"
+            borderColor={ACCENT}
+            width={Math.min(BANNER_WIDTH, size.columns)}
+            paddingX={1}
+            flexShrink={0}
+          >
             <Text bold color={ACCENT} wrap="truncate-end">
               CCW · {name}
             </Text>
@@ -104,11 +161,7 @@ function Frame({ title, footer, page = 0, children }: FrameProps) {
           {details.slice(offset, offset + detailHeight).map((line, index) => (
             <Text key={index}>{line}</Text>
           ))}
-          {hasPages && (
-            <Text dimColor>
-              PgUp/PgDn · {offset + 1}–{offset + detailHeight}/{details.length}
-            </Text>
-          )}
+          {hasPages && <Text dimColor>PgUp/PgDn · {windowIndicator(offset, detailHeight, details.length)}</Text>}
         </>
       )}
       <Box flexDirection="column" height={height} marginTop={1} flexShrink={0}>
@@ -137,9 +190,11 @@ interface MenuProps {
   readonly change?: (event: SelectionChange) => SelectionPage;
   readonly interrupt: () => void;
   readonly done: (result: SelectionResult) => void;
+  /** 清除终端宿主画入的组合回显（输入法文本被忽略时调用） */
+  readonly invalidate?: () => void;
 }
 
-function Menu({ title, choices, focus, selection, change, interrupt, done }: MenuProps) {
+function Menu({ title, choices, focus, selection, change, interrupt, done, invalidate }: MenuProps) {
   const initialCount = selection ? selection.rows.length + 2 : choices.length;
   const live = useRef<MenuState>({
     index: Math.max(0, Math.min(focus, initialCount - 1)),
@@ -156,8 +211,9 @@ function Menu({ title, choices, focus, selection, change, interrupt, done }: Men
     const row = current?.rows[prior.index];
     const count = current ? current.rows.length + 2 : choices.length;
     const toggle = () => (change ? { ...prior, selection: change({ kind: 'toggle', index: prior.index }) } : prior);
-    if (isExit(event)) interrupt();
-    if (key.escape || isExit(event)) next = { ...prior, result: { kind: 'cancel', index: prior.index } };
+    const exit = isExit(event);
+    if (exit) interrupt();
+    if (key.escape || exit) next = { ...prior, result: { kind: 'cancel', index: prior.index } };
     else if (key.upArrow || key.downArrow)
       next = { ...prior, index: (prior.index + count + (key.upArrow ? -1 : 1)) % count };
     else if (key.pageDown || key.pageUp) next = { ...prior, page: Math.max(0, prior.page + (key.pageUp ? -1 : 1)) };
@@ -176,6 +232,11 @@ function Menu({ title, choices, focus, selection, change, interrupt, done }: Men
       next = { ...prior, result: { kind: 'refresh', index: prior.index } };
     else if (current && change && input.toLowerCase() === 'a') next = { ...prior, selection: change({ kind: 'all' }) };
     else if (row && input === ' ') next = toggle();
+    // isIgnoredText 判定为组合回显：清屏强制重绘（机制见 invalidate）
+    if (next === prior && isIgnoredText(input, key)) {
+      invalidate?.();
+      next = { ...prior };
+    }
     if (next.selection && !next.result) next = { ...next, index: Math.min(next.index, next.selection.rows.length + 1) };
     live.current = next;
     setState(next);
@@ -203,7 +264,7 @@ function Menu({ title, choices, focus, selection, change, interrupt, done }: Men
     if (state.selection)
       result.push(
         { label: state.selection.submitLabel, detail: '', index: labels.length, labelWidth: 0 },
-        { label: '返回主菜单', detail: '', index: labels.length + 1, labelWidth: 0 },
+        { label: BACK_TO_HOME, detail: '', index: labels.length + 1, labelWidth: 0 },
       );
     return result;
   }, [choices, state.selection]);
@@ -228,20 +289,20 @@ function Menu({ title, choices, focus, selection, change, interrupt, done }: Men
           0,
           rows.findIndex(row => row.index === state.index),
         );
-        const start = Math.max(0, Math.min(activeRow - Math.floor(height / 2), rows.length - height));
+        const start = windowStart(activeRow, height, rows.length);
         return rows.slice(start, start + height).map((row, position) => {
           if (row.index === null) {
-            const label = `  ── ${safeText(row.label)} `;
+            const label = `  ${GROUP_MARK}${safeText(row.label)} `;
             return (
               <Text key={`heading-${start + position}`} color={ACCENT} dimColor wrap="truncate-end">
                 {label}
-                {'─'.repeat(Math.max(0, Math.min(62, width) - stringWidth(label)))}
+                {'─'.repeat(Math.max(0, Math.min(BANNER_WIDTH, width) - stringWidth(label)))}
               </Text>
             );
           }
           const active = row.index === state.index;
           const selectedRow = state.selection?.rows[row.index];
-          const prefix = `${active ? '›' : ' '} ${selectedRow ? (selectedRow.checked ? '[x] ' : '[ ] ') : ''}`;
+          const prefix = `${active ? CURSOR_PREFIX : BLANK_PREFIX}${selectedRow ? (selectedRow.checked ? '[x] ' : '[ ] ') : ''}`;
           return (
             <Box key={row.index} flexShrink={0}>
               <Text {...(active ? { color: ACCENT } : {})} bold={active}>
@@ -304,12 +365,15 @@ function InlineForm({
   validate,
   interrupt,
   done,
+  invalidate,
 }: {
   readonly title: string;
   readonly fields: readonly FormField[];
   readonly validate: (values: Readonly<Record<string, string>>) => FormProblem;
   readonly interrupt: () => void;
   readonly done: (values: Record<string, string> | null) => void;
+  /** 清除终端宿主画入的组合回显；机制见 createTerminal.invalidate */
+  readonly invalidate?: () => void;
 }) {
   const live = useRef<{
     index: number;
@@ -320,7 +384,10 @@ function InlineForm({
     finished: boolean;
   }>({
     index: 0,
-    edits: fields.map(field => ({ text: characters(field.value), cursor: characters(field.value).length })),
+    edits: fields.map(field => {
+      const chars = characters(field.value);
+      return { text: chars, cursor: chars.length };
+    }),
     problem: null,
     details: false,
     page: 0,
@@ -394,6 +461,11 @@ function InlineForm({
         edits: prior.edits.map((edit, index) => (index === prior.index ? editText(edit, event) : edit)),
       };
     }
+    // 未处理按键（含组合回显）强制重绘，机制见 createTerminal.invalidate
+    if (next === prior && 'key' in event && isIgnoredText(event.input, event.key)) {
+      invalidate?.();
+      next = { ...prior };
+    }
     live.current = next;
     setState(next);
   };
@@ -406,12 +478,12 @@ function InlineForm({
         page={state.page}
         footer="PgUp/PgDn 翻页 · Enter/Esc 返回"
       >
-        {() => <Text color={ACCENT}>› 返回编辑</Text>}
+        {() => <Text color={ACCENT}>{CURSOR_PREFIX}返回编辑</Text>}
       </Frame>
     );
   return (
     <Frame
-      title={`${title}${state.problem ? `\n! ${state.problem.message}` : ''}`}
+      title={`${title}${state.problem ? `\n${PROBLEM_MARK}${state.problem.message}` : ''}`}
       footer={state.index < fields.length ? '输入/粘贴 · ↑↓/Tab 切换 · Esc 取消' : '↑↓ 选择 · Enter 确认 · Esc 取消'}
     >
       {(height, width) => {
@@ -421,7 +493,7 @@ function InlineForm({
           '返回',
           ...(state.problem?.detail ? ['查看详情'] : []),
         ];
-        const start = Math.max(0, Math.min(state.index - Math.floor(height / 2), labels.length - height));
+        const start = windowStart(state.index, height, labels.length);
         return labels.slice(start, start + height).map((label, offset) => {
           const index = start + offset;
           const active = index === state.index;
@@ -441,8 +513,8 @@ function InlineForm({
             }▏${after || (!value ? (field?.placeholder ?? '') : '')}`;
           }
           return (
-            <Text key={label} {...(active ? { color: ACCENT } : {})} wrap="truncate-end">
-              {active ? '› ' : '  '}
+            <Text key={fields[index]?.key ?? label} {...(active ? { color: ACCENT } : {})} wrap="truncate-end">
+              {active ? CURSOR_PREFIX : BLANK_PREFIX}
               {label.padEnd(15)}
               {safeText(display)}
             </Text>
@@ -466,9 +538,10 @@ function Waiting({
 }) {
   const { frame } = useAnimation({ interval: 120 });
   useInput((input, key) => {
-    if (key.escape || isExit({ input, key })) {
+    const exit = isExit({ input, key });
+    if (key.escape || exit) {
       cancel();
-      if (isExit({ input, key })) interrupt();
+      if (exit) interrupt();
     }
   });
   return (
@@ -518,7 +591,7 @@ function StatusRow({ row, text }: { readonly row: RunRow; readonly text?: string
 
 function DetailRow({ detail, width }: { readonly detail: RunDetail; readonly width: number }) {
   const color = toneColor(detail.tone);
-  const indent = width < 24 ? 2 : 12;
+  const indent = detailIndent(width);
   return (
     <Box marginLeft={indent}>
       {detail.symbol && (
@@ -543,7 +616,7 @@ function runLines(view: RunView, width: number): readonly RunLine[] {
   return view.rows.flatMap(row => {
     const status: RunLine[] =
       width < 24
-        ? wrapAnsi(`${row.symbol} ${row.status}  ${safeText(row.title)}`, width, { hard: true, trim: false })
+        ? wrapAnsi(statusLine({ ...row, title: safeText(row.title) }), width, { hard: true, trim: false })
             .split('\n')
             .map(text => ({ kind: 'status', row, text }))
         : [{ kind: 'status', row }];
@@ -551,7 +624,7 @@ function runLines(view: RunView, width: number): readonly RunLine[] {
       ...status,
       ...row.details.flatMap(detail => {
         const { symbol, ...appearance } = detail;
-        const indent = width < 24 ? 2 : 12;
+        const indent = detailIndent(width);
         return wrapAnsi(safeText(detail.text), Math.max(1, width - indent - (symbol ? 2 : 0)), {
           hard: true,
           trim: false,
@@ -574,6 +647,7 @@ function RunScreen({
   cancelIndex = choices.length - 1,
   interrupt,
   done,
+  invalidate,
 }: {
   readonly view: RunView;
   readonly choices?: readonly (string | MenuRow)[];
@@ -581,9 +655,11 @@ function RunScreen({
   readonly cancelIndex?: number;
   readonly interrupt: () => void;
   readonly done?: (index: number) => void;
+  readonly invalidate?: () => void;
 }) {
   const [offset, setOffset] = useState<number | null>(null);
   const [action, setAction] = useState(Math.max(0, Math.min(focus, choices.length - 1)));
+  const [, setRepaint] = useState(0);
   const finished = useRef(false);
   const viewport = useRef({ offset: 0, height: 1, total: 1 });
   useInput((input, key) => {
@@ -610,6 +686,10 @@ function RunScreen({
         ),
       );
     if (key.end) setOffset(null);
+    if (isIgnoredText(input, key)) {
+      invalidate?.();
+      setRepaint(count => count + 1);
+    }
   });
   const footer = choices.length
     ? '↑↓ 选择 · Enter 确认 · PgUp/PgDn 翻页 · Esc 返回'
@@ -625,8 +705,9 @@ function RunScreen({
           0,
           lines.findIndex(line => line.kind === 'status' && line.row.id === view.activeId),
         );
-        const automatic = view.phase === 'result' ? 0 : Math.max(0, current - Math.floor(visible / 2));
-        const start = Math.min(Math.max(0, lines.length - visible), offset ?? automatic);
+        const automatic = view.phase === 'result' ? 0 : windowStart(current, visible, lines.length);
+        const start = clampWindow(offset ?? automatic, visible, lines.length);
+        // Ink 同步渲染保证 viewport 每帧恰写一次
         viewport.current = { offset: start, height: visible, total: lines.length };
         return (
           <Box flexDirection="column">
@@ -646,16 +727,12 @@ function RunScreen({
                   <DetailRow key={`${line.id}-detail-${start + index}`} detail={line.detail} width={width} />
                 ),
               )}
-            {lines.length > visible && (
-              <Text dimColor>
-                {start + 1}–{Math.min(start + visible, lines.length)}/{lines.length}
-              </Text>
-            )}
+            {lines.length > visible && <Text dimColor>{windowIndicator(start, visible, lines.length)}</Text>}
             {choices.length > 0 && (
               <Box flexDirection="column" marginTop={1}>
                 {choices.map((choice, index) => (
                   <Text key={index} {...(index === action ? { color: ACCENT } : {})} bold={index === action}>
-                    {index === action ? '› ' : '  '}
+                    {index === action ? CURSOR_PREFIX : BLANK_PREFIX}
                     {safeText(typeof choice === 'string' ? choice : `${choice.label} ${choice.detail ?? ''}`)}
                   </Text>
                 ))}
@@ -701,6 +778,10 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
   const ready = (suspend: SuspendTerminal) => {
     suspension = suspend;
   };
+  /** 擦除当前帧并重置帧高：下一次渲染将全量重绘，覆盖终端宿主画入的输入法组合回显 */
+  const invalidate = () => {
+    instance?.clear();
+  };
   const display = (view: ReactNode) => {
     if (closed) throw new Error('terminal-closed');
     const tree = <Host ready={ready}>{view}</Host>;
@@ -720,7 +801,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
         },
         (error: unknown) => {
           closed = true;
-          rejectPending?.(error instanceof Error ? error : new Error('terminal-failed', { cause: error }));
+          rejectPending?.(asError(error, 'terminal-failed'));
         },
       );
     }
@@ -746,7 +827,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
       try {
         display(view(done));
       } catch (error) {
-        rejectPending(error instanceof Error ? error : new Error('terminal-failed', { cause: error }));
+        rejectPending(asError(error, 'terminal-failed'));
       }
     });
   };
@@ -760,6 +841,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
               choices={choices}
               focus={focus}
               interrupt={interrupt}
+              invalidate={invalidate}
               done={result => done(result.kind === 'cancel' ? cancelIndex : result.index)}
             />
           ))
@@ -771,6 +853,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
               focus={focus}
               cancelIndex={cancelIndex}
               interrupt={interrupt}
+              invalidate={invalidate}
               done={done}
             />
           ));
@@ -785,6 +868,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
           change={change}
           focus={focus}
           interrupt={interrupt}
+          invalidate={invalidate}
           done={done}
         />
       ));
@@ -797,6 +881,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
           fields={fields}
           validate={validate}
           interrupt={interrupt}
+          invalidate={invalidate}
           done={done}
         />
       ));
@@ -835,8 +920,7 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
       void Promise.resolve()
         .then(() => work(reading.signal, update))
         .then(finish, (error: unknown) => {
-          if (!reading.signal.aborted)
-            rejectPending?.(error instanceof Error ? error : new Error('inspection-failed', { cause: error }));
+          if (!reading.signal.aborted) rejectPending?.(asError(error, 'inspection-failed'));
         });
       try {
         return await result;
@@ -856,14 +940,16 @@ export function createTerminal(interrupt: () => void = () => {}): Terminal & { c
       } finally {
         isSuspended = false;
         await ownership.resume();
-        if (progressView !== undefined) display(<RunScreen view={progressView} interrupt={interrupt} />);
+        // 交互命令仅限执行屏活动期发起；恢复重放最近执行视图
+        if (progressView !== undefined)
+          display(<RunScreen view={progressView} interrupt={interrupt} invalidate={invalidate} />);
         // 快速任务可能在 readable 监听恢复前结束；重新启动读取但不消费输入
         process.stdin.read(0);
       }
     },
     show(view) {
       progressView = view;
-      if (!isSuspended) display(<RunScreen view={view} interrupt={interrupt} />);
+      if (!isSuspended) display(<RunScreen view={view} interrupt={interrupt} invalidate={invalidate} />);
     },
     async close() {
       closed = true;

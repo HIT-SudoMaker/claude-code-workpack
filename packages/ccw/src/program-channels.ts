@@ -1,11 +1,13 @@
 import path from 'node:path';
 
 import { isObject, succeeded } from './machine.js';
-import { claudeEnvironment, json, normalizePath, success } from './model.js';
+import { claudeEnvironment, json, normalizePath, success, userBinDirectory } from './model.js';
+import { OFFICECLI_REPO_SLUG } from './management-catalog.js';
 import { npmInstallArgs, npmUninstallArgs, NPM_READ_TIMEOUT_MS } from './npm-registry.js';
 import type { CommandResult } from './machine.js';
 import type { Context } from './model.js';
 import type { NpmRegistry } from './npm-registry.js';
+import { NPM_ENABLE_SCRIPTS } from './npm-registry.js';
 
 export type ProgramKind = 'claude' | 'officecli';
 type ProgramChannel = 'native' | 'npm' | 'brew' | 'winget' | 'scoop' | 'apt' | 'dnf' | 'apk' | 'manual';
@@ -38,12 +40,26 @@ export const PROGRAM_PACKAGES: Readonly<Record<ProgramKind, string>> = {
   claude: '@anthropic-ai/claude-code',
   officecli: '@officecli/officecli',
 };
+/** 包管理器包标识与定位旗标：安装/卸载/清点与输出校验共用，字面量不得散布 */
+const WINGET_CLAUDE_ID = 'Anthropic.ClaudeCode';
+const OFFICECLI_PACKAGE_ID = 'officecli';
+const WINGET_ID_FLAGS = ['--id', WINGET_CLAUDE_ID] as const;
+const WINGET_MATCH_FLAGS = ['--exact', '--disable-interactivity'] as const;
+/** npm 安装的脚本放行旗标：恒开 ignore-scripts，claude 另放行自身脚本与可选依赖 */
+export const npmScriptFlags = (kind: ProgramKind): readonly string[] =>
+  kind === 'claude'
+    ? [...NPM_ENABLE_SCRIPTS, `--allow-scripts=${PROGRAM_PACKAGES.claude}`, '--include=optional']
+    : [...NPM_ENABLE_SCRIPTS];
+/** OfficeCLI 官方主页的认可形状（仓库标识单一出处） */
+const officecliHomepage = new RegExp(
+  `^https://(?:github\\.com/${OFFICECLI_REPO_SLUG.replaceAll('.', '\\.')}/?|officecli\\.ai/?)$`,
+);
 
 export function officeBinary(ctx: Context) {
   const root =
     ctx.platform === 'win32'
       ? path.join(ctx.localAppData ?? path.join(ctx.home, 'AppData/Local'), 'OfficeCli')
-      : path.join(ctx.home, '.local/bin');
+      : userBinDirectory(ctx);
   if (!path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root)
     throw new Error('invalid-config-root');
   return path.join(root, ctx.platform === 'win32' ? 'officecli.exe' : 'officecli');
@@ -191,7 +207,7 @@ export async function identifyProgramChannel(
       appParent !== undefined &&
       samePath(ctx, appParent, path.join(scoopRoot, 'apps/officecli')) &&
       typeof manifest.homepage === 'string' &&
-      /^https:\/\/(?:github\.com\/iOfficeAI\/OfficeCLI\/?|officecli\.ai\/?)$/.test(manifest.homepage)
+      officecliHomepage.test(manifest.homepage)
     )
       channel = 'scoop';
   }
@@ -227,7 +243,7 @@ export async function identifyProgramChannel(
         ? 'claude-code@latest'
         : kind === 'claude'
           ? 'claude-code'
-          : 'officecli',
+          : OFFICECLI_PACKAGE_ID,
   };
 }
 
@@ -236,7 +252,7 @@ export function channelCanPinVersion(channel: ProgramChannel) {
 }
 
 async function scoopTarget(ctx: Context, program: Program) {
-  const result = await ctx.machine.execute('scoop', ['prefix', 'officecli']);
+  const result = await ctx.machine.execute('scoop', ['prefix', OFFICECLI_PACKAGE_ID]);
   const prefix = result.stdout.trim();
   if (!succeeded(result) || !path.isAbsolute(prefix) || /[\r\n]/.test(prefix))
     throw new Error('program-scope-unconfirmed');
@@ -352,6 +368,29 @@ export async function freezeProgramScope(ctx: Context, program: Program): Promis
   return { verify: async () => {}, matches };
 }
 
+/** npm 渠道占用前复核：版本与二进制位都未变才继续 */
+async function ensureNpmProgramUnchanged(ctx: Context, program: Program, scope: ProgramScope) {
+  if (
+    (await npmVersion(ctx, PROGRAM_PACKAGES[program.kind], scope.npmRoot)) !== program.version ||
+    !samePath(ctx, await npmBinary(ctx, program.kind, scope.npmRoot), program.binary)
+  )
+    throw new Error('program-changed');
+}
+
+/** 渠道命令分发尾：解包校验命令并先行 brew 包裹，执行与成功判据由调用方决定 */
+async function dispatchChannelCommand(
+  ctx: Context,
+  program: Program,
+  commands: Partial<Record<ProgramChannel, readonly string[]>>,
+) {
+  const command = commands[program.channel];
+  if (command === undefined) throw new Error('channel-not-supported');
+  const [executable, ...args] = command;
+  if (!executable) throw new Error('channel-not-supported');
+  if (program.channel === 'brew') await brewPackage(ctx, program, executable);
+  return { executable, args };
+}
+
 export async function maintainProgramChannel(
   ctx: Context,
   program: Program,
@@ -363,19 +402,14 @@ export async function maintainProgramChannel(
 ): Promise<void> {
   if (program.channel === 'manual') throw new Error('channel-not-supported');
   if (program.channel === 'npm') {
-    if (
-      (await npmVersion(ctx, PROGRAM_PACKAGES[program.kind], scope.npmRoot)) !== program.version ||
-      !samePath(ctx, await npmBinary(ctx, program.kind, scope.npmRoot), program.binary)
-    )
-      throw new Error('program-changed');
+    await ensureNpmProgramUnchanged(ctx, program, scope);
     const args = npmInstallArgs(
       [
         'install',
         '-g',
         ...npmScopeArgs(ctx, scope.npmRoot),
         ...(action === 'reinstall' ? ['--force'] : []),
-        '--ignore-scripts=false',
-        ...(program.kind === 'claude' ? [`--allow-scripts=${PROGRAM_PACKAGES.claude}`, '--include=optional'] : []),
+        ...npmScriptFlags(program.kind),
         `${PROGRAM_PACKAGES[program.kind]}@${targetVersion}`,
       ],
       targetRegistry ?? null,
@@ -407,13 +441,11 @@ export async function maintainProgramChannel(
       'winget',
       action === 'reinstall' ? 'install' : 'upgrade',
       ...(action === 'reinstall' ? ['--force'] : []),
-      '--id',
-      'Anthropic.ClaudeCode',
+      ...WINGET_ID_FLAGS,
       ...(targetVersion !== null ? ['--version', targetVersion] : []),
-      '--exact',
-      '--disable-interactivity',
+      ...WINGET_MATCH_FLAGS,
     ],
-    scoop: ['scoop', 'update', ...(action === 'reinstall' ? ['--force'] : []), 'officecli'],
+    scoop: ['scoop', 'update', ...(action === 'reinstall' ? ['--force'] : []), OFFICECLI_PACKAGE_ID],
     apt: [
       'apt-get',
       'install',
@@ -424,11 +456,7 @@ export async function maintainProgramChannel(
     dnf: ['dnf', action === 'reinstall' ? 'reinstall' : 'upgrade', '--assumeyes', program.packageName],
     apk: ['apk', action === 'reinstall' ? 'fix' : 'upgrade', program.packageName],
   };
-  const command = commands[program.channel];
-  if (command === undefined) throw new Error('channel-not-supported');
-  const [executable, ...args] = command;
-  if (!executable) throw new Error('channel-not-supported');
-  if (program.channel === 'brew') await brewPackage(ctx, program, executable);
+  const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
   success(await ctx.machine.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined));
   await packageCommandCompleted();
 }
@@ -439,28 +467,20 @@ export async function removeProgramChannel(
   scope: ProgramScope,
 ): Promise<CommandResult> {
   if (program.channel === 'npm') {
-    if (
-      (await npmVersion(ctx, PROGRAM_PACKAGES[program.kind], scope.npmRoot)) !== program.version ||
-      !samePath(ctx, await npmBinary(ctx, program.kind, scope.npmRoot), program.binary)
-    )
-      throw new Error('program-changed');
+    await ensureNpmProgramUnchanged(ctx, program, scope);
     return ctx.machine.npm(
       npmUninstallArgs(['uninstall', '-g', ...npmScopeArgs(ctx, scope.npmRoot), PROGRAM_PACKAGES[program.kind]]),
     );
   }
   const commands: Partial<Record<ProgramChannel, readonly string[]>> = {
     brew: [scope.manager ?? '', 'uninstall', ...(program.kind === 'claude' ? ['--cask'] : []), program.packageName],
-    winget: ['winget', 'uninstall', '--id', 'Anthropic.ClaudeCode', '--exact', '--disable-interactivity'],
-    scoop: ['scoop', 'uninstall', 'officecli'],
+    winget: ['winget', 'uninstall', ...WINGET_ID_FLAGS, ...WINGET_MATCH_FLAGS],
+    scoop: ['scoop', 'uninstall', OFFICECLI_PACKAGE_ID],
     apt: ['apt-get', 'remove', '--yes', program.packageName],
     dnf: ['dnf', 'remove', '--assumeyes', program.packageName],
     apk: ['apk', 'del', program.packageName],
   };
-  const command = commands[program.channel];
-  if (command === undefined) throw new Error('channel-not-supported');
-  const [executable, ...args] = command;
-  if (!executable) throw new Error('channel-not-supported');
-  if (program.channel === 'brew') await brewPackage(ctx, program, executable);
+  const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
   return ctx.machine.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined);
 }
 
@@ -482,20 +502,19 @@ export async function programPackageAbsent(
       : !result.stdout.split(/\r?\n/).some(line => line.trim().split(/\s+/)[0] === program.packageName);
   }
   if (program.channel === 'winget') {
-    const result = await ctx.machine.execute('winget', [
-      'list',
-      '--id',
-      'Anthropic.ClaudeCode',
-      '--exact',
-      '--disable-interactivity',
-    ]);
+    const result = await ctx.machine.execute('winget', ['list', ...WINGET_ID_FLAGS, ...WINGET_MATCH_FLAGS]);
     if (result.failed || result.code === null) return null;
     if (result.code >>> 0 === 0x8a150014) return true;
-    return result.code !== 0 ? null : !/\bAnthropic\.ClaudeCode\b/i.test(result.stdout);
+    // 点号转义：包标识按字面匹配，形近 ID 不得计为仍在
+    return result.code !== 0
+      ? null
+      : !new RegExp(`\\b${WINGET_CLAUDE_ID.replaceAll('.', '\\.')}\\b`, 'i').test(result.stdout);
   }
   if (program.channel === 'scoop') {
-    const result = await ctx.machine.execute('scoop', ['list', 'officecli']);
-    return !succeeded(result) ? null : !result.stdout.split(/\r?\n/).some(line => /^\s*officecli\s/i.test(line));
+    const result = await ctx.machine.execute('scoop', ['list', OFFICECLI_PACKAGE_ID]);
+    return !succeeded(result)
+      ? null
+      : !result.stdout.split(/\r?\n/).some(line => new RegExp(`^\\s*${OFFICECLI_PACKAGE_ID}\\s`, 'i').test(line));
   }
   if (program.channel === 'apt') {
     const result = await ctx.machine.execute('dpkg-query', ['-W', '-f=${Package} ${db:Status-Status}\n']);
