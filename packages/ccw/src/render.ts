@@ -434,7 +434,13 @@ export function failureLabel(action?: Action) {
   return FAILURE_LABELS[action];
 }
 export function startupFailure(code: string, shouldShowDetails: boolean) {
-  const brief = ['unknown-argument', 'interactive-terminal-required', 'unsupported-platform'].includes(code)
+  const brief = [
+    'unknown-argument',
+    'interactive-terminal-required',
+    'unsupported-platform',
+    'instance-already-running',
+    'instance-lock-unavailable',
+  ].includes(code)
     ? reason(code)
     : '启动失败';
   return shouldShowDetails ? `${brief}\n${describeDiagnostic({ code })}` : brief;

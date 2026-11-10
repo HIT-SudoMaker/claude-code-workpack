@@ -139,6 +139,8 @@ export const ERROR_MESSAGES: Readonly<Record<string, MessageText>> = {
     detail: '只接受一个模式：--help、--version、--inspect 或 --collect-logs；可附加一次 --details；不接受其他参数',
   },
   'interactive-terminal-required': { brief: '需要交互终端', detail: '启动界面失败：需要交互终端' },
+  'instance-already-running': { brief: 'CCW 已在运行', detail: '当前用户已有 CCW 实例，请先退出该实例' },
+  'instance-lock-unavailable': { brief: '启动资格不可用', detail: '无法取得当前用户的 CCW 启动资格，请稍后重试' },
   'unsupported-platform': { brief: '系统暂不支持', detail: '启动 CCW 失败：系统不支持' },
   EEXIST: { brief: '目标已存在', detail: '写入内容失败：同名目标存在或另一轮写入进行中' },
   EACCES: { brief: '访问失败', detail: '访问内容失败：权限不足' },
