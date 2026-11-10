@@ -3,11 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { createEffectScope } from './effect-machine.js';
 import { errorCode } from './machine.js';
 import type { Machine } from './machine.js';
-import { cancelled, kindOf } from './model.js';
+import { cancelled } from './model.js';
 import type {
   Assessment,
   Context,
-  Effect,
   ItemResult,
   JsonObject,
   OperationDefinition,
@@ -248,47 +247,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           const work = prepared.work.get(item.id);
           if (!work) continue;
           if (work.inputs) Object.assign(inputs, work.inputs);
-          if (work.operations) operations.push(...work.operations);
-          else {
-            // 仅为尚未迁移的领域保留；重启不会重建或回放闭包。
-            const id = item.id + '/legacy';
-            const handlerKey = 'legacy:' + id;
-            let operation = work;
-            handlers.set(handlerKey, {
-              async assess(_definition, previous) {
-                if (previous.status === 'confirmed') {
-                  await operation.verify?.();
-                  return { state: 'complete', evidence: {}, effects: previous.effects };
-                }
-                if (previous.receipt?.kind === 'returned' && !previous.receipt.failure)
-                  return { state: 'complete', evidence: {}, effects: previous.effects };
-                return { state: 'ready' };
-              },
-              async execute(_definition, _previous, _inputs, signal) {
-                const effects: Effect[] = [];
-                try {
-                  await operation.run?.(effect => effects.push(effect), signal);
-                } catch (error) {
-                  operation = operation.remaining?.() ?? operation;
-                  return { receipt: { kind: 'returned', failure: errorCode(error) }, effects };
-                }
-                return { receipt: { kind: 'returned', failure: null }, effects };
-              },
-            });
-            const claude = operations.filter(value => kindOf(value.itemId) === 'claude');
-            operations.push({
-              id,
-              itemId: item.id,
-              handler: handlerKey,
-              payload: {},
-              dependsOn:
-                item.action !== 'detach' && (kindOf(item.id) === 'plugin' || item.action === 'login')
-                  ? claude.map(value => value.id)
-                  : [],
-              writes: work.writes ?? [],
-              changes: work.changes,
-            });
-          }
+          operations.push(...work.operations);
         }
         const id = randomUUID();
         await save({
@@ -456,13 +415,15 @@ export function createOperationController(ctx: Context, machine: Machine, handle
             .map(operation => fact(operation));
           const done = !item.problem && facts.length > 0 && facts.every(terminal);
           const effects = facts.flatMap(value => value.effects);
-          const problem =
-            storageProblem ??
-            item.problem ??
-            (wasCancelled ? 'cancelled' : facts.find(value => value.problem)?.problem) ??
-            (!done ? 'dependency-not-ready' : undefined);
-          if (problem && !effects.some(effect => effect.code === problem))
-            effects.push({ state: wasCancelled ? 'skipped' : 'failed', code: problem });
+          const problems = new Set([
+            ...(storageProblem ? [storageProblem] : []),
+            ...(item.problem ? [item.problem] : []),
+            ...(wasCancelled ? ['cancelled'] : facts.flatMap(value => (value.problem ? [value.problem] : []))),
+          ]);
+          if (!done && !problems.size) problems.add('dependency-not-ready');
+          for (const problem of [...problems].reverse())
+            if (!effects.some(effect => effect.code === problem))
+              effects.push({ state: wasCancelled ? 'skipped' : 'failed', code: problem });
           const result: ItemResult = {
             id: item.id,
             title: item.title,
@@ -471,7 +432,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
                 ? 'done'
                 : wasCancelled
                   ? 'cancelled'
-                  : facts.some(terminal) || effects.some(effect => effect.state === 'done')
+                  : effects.some(effect => effect.state === 'done' || effect.state === 'kept')
                     ? 'partial'
                     : 'failed',
             effects,

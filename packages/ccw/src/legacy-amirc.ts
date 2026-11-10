@@ -54,7 +54,7 @@ export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> 
 export function legacyAmircHandlers(ctx: Context): Readonly<Record<string, OperationHandler>> {
   return {
     'amirc.permission-remove': {
-      async assess(definition) {
+      async assess(definition, fact) {
         const { file, rule } = definition.payload;
         if (file !== ctx.settingsFile || typeof rule !== 'string' || !OWNED_RULES.includes(rule))
           return { state: 'blocked', problem: 'target-changed' };
@@ -64,6 +64,8 @@ export function legacyAmircHandlers(ctx: Context): Readonly<Record<string, Opera
             evidence: { absent: true },
             effects: [{ state: 'done', code: 'amirc-permissions-removed' }],
           };
+        if (fact.confirmed || (fact.receipt?.kind === 'returned' && fact.receipt.failure === null))
+          return { state: 'unknown', problem: 'target-changed' };
         return { state: 'ready' };
       },
       async execute(definition) {

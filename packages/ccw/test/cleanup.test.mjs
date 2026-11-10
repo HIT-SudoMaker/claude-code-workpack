@@ -53,6 +53,7 @@ async function fixture(t, platform = process.platform) {
     onCheck: null, // 进程检查钩子：false→空枚举、true→命中条目、null→枚举未知
     onRemoveTree: null, // removeTree 完成后的钩子（时钟回拨/复核失败场景）
     failRemoveOn: null, // 第 N 次 removeTree 直接抛错（不执行删除）
+    unreadableAfterFailure: false,
     failRemoveRead: false, // 删除后回读失败：完成工作再抛出，并拉起 treeStamp 闩锁
     treeStampFails: false, // treeStamp 读取失败闩锁
     entriesFails: false, // entries 读取失败（全部目录）
@@ -69,7 +70,10 @@ async function fixture(t, platform = process.platform) {
     ...wrapped,
     async removeTree(...args) {
       state.removeTreeCalls++;
-      if (state.failRemoveOn !== null && state.removeTreeCalls === state.failRemoveOn) throw new Error('remove-failed');
+      if (state.failRemoveOn !== null && state.removeTreeCalls === state.failRemoveOn) {
+        state.treeStampFails = state.unreadableAfterFailure;
+        throw new Error('remove-failed');
+      }
       const result = await wrapped.removeTree(...args);
       if (state.onRemoveTree) await state.onRemoveTree(args[0]);
       if (state.failRemoveRead) {
@@ -198,8 +202,10 @@ test('删除结果未知：只核对且不重复删除', async t => {
   await f.write('debug/a.log');
   await f.write('debug/b.log');
   f.state.failRemoveOn = 2;
+  f.state.unreadableAfterFailure = true;
   const plan = await f.plan(['data:cache']);
   const first = await f.ccw.apply(plan.id);
+  f.state.treeStampFails = false;
   const resumed = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(resumed.id);
   assert.equal(result.state, 'partial');
@@ -210,6 +216,29 @@ test('删除结果未知：只核对且不重复删除', async t => {
   await f.ccw.abandon(result.remaining);
   assert.equal((await f.ccw.apply((await f.plan(['data:cache'])).id)).state, 'done');
   assert.equal(f.state.removeTreeCalls, 3);
+});
+
+test('删除抛错后证实原目标未变：新实例重新确认后可删除剩余文件', async t => {
+  const f = await fixture(t);
+  await f.write('debug/a.log');
+  await f.write('debug/b.log');
+  f.state.failRemoveOn = 2;
+  const first = await f.ccw.apply((await f.plan(['data:cache'])).id);
+  assert.ok(first.remaining);
+  assert.equal(f.state.removeTreeCalls, 2);
+  const restarted = (f.ccw = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  }));
+  const recovery = await restarted.recovery();
+  assert.equal(f.state.removeTreeCalls, 2);
+  const resumed = await restarted.plan({ resume: recovery.id });
+  assert.equal((await restarted.apply(resumed.id)).state, 'done');
+  assert.equal(f.state.removeTreeCalls, 3);
+  assert.equal(await f.exists('debug/b.log'), false);
 });
 
 test('清理数据：时钟回拨仍复核进程', async t => {

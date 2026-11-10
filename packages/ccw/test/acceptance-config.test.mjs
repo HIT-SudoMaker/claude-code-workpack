@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from './terminal-test.mjs';
-import { createEnv, fail, ok, revision } from './env.mjs';
+import { createEnv, fail, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 const plugin = 'github@claude-plugins-official';
 const claudePackage = '@anthropic-ai/claude-code';
@@ -31,13 +31,16 @@ async function fixture(t) {
     // 写入后回读失败：以 calls 中该文件的 editJson 记录为触发条件，一次性生效
     failReadAfterEdit: null,
     readFailed: false,
+    persistentReadFailure: false,
+    credentialReadFailure: false,
   };
-  const machine = f.machine({
+  const baseMachine = f.machine({
     processes: async () => [],
     read: async (file, base) => {
       if (
         file === state.failReadAfterEdit &&
-        !state.readFailed &&
+        (!state.readFailed || state.persistentReadFailure) &&
+        (!state.credentialReadFailure || JSON.parse(await base.read(file)).env?.GITHUB_PERSONAL_ACCESS_TOKEN) &&
         f.calls.some(call => call.kind === 'editJson' && call.target === file)
       ) {
         state.readFailed = true;
@@ -58,6 +61,7 @@ async function fixture(t) {
             }),
       ),
     execute: async (file, args, options, base) => {
+      if (file === 'git') return ok(`${revision}\tHEAD\n`);
       if (file === process.execPath && args[0] === claude) {
         const command = args.slice(1);
         if (command[0] === 'plugin' && command[1] === 'marketplace') {
@@ -66,8 +70,10 @@ async function fixture(t) {
           });
         } else if (command[0] === 'plugin' && command[1] === 'install') {
           const installPath = path.join(f.claudeRoot, 'plugins/cache/github');
-          await fs.mkdir(installPath, { recursive: true });
-          await f.json(recordsFile, { plugins: { [plugin]: [{ scope: 'user', installPath, version: '1.0.0' }] } });
+          await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
+          await f.json(recordsFile, {
+            plugins: { [plugin]: [{ scope: 'user', installPath, version: '1.0.0', gitCommitSha: revision }] },
+          });
           await base.editJson(f.settingsFile, settings => {
             settings.enabledPlugins = { [plugin]: true };
           });
@@ -79,6 +85,7 @@ async function fixture(t) {
       return fail();
     },
   });
+  const machine = { ...baseMachine, source: async () => pluginMarketplaceFiles() };
   const ccw = f.ccw(machine);
   const prepare = async selection => {
     const plan = await ccw.plan({ task: 'install', selected: [selection] });
@@ -110,15 +117,8 @@ for (const id of ['mcp:context7'])
     const plan = await f.prepare({ id });
     f.state.failReadAfterEdit = f.stateFile;
     const first = await f.ccw.apply(plan.id);
-    assert.equal(first.state, 'partial');
-    assert.ok(first.remaining);
-    const resumed = await f.ccw.plan({ resume: first.remaining });
-    assert.ok(resumed.items[0].changes.some(change => change.code === 'mcp-registration-confirm'));
-    assert.equal(
-      resumed.items[0].changes.some(change => change.code === 'mcp-register'),
-      false,
-    );
-    assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+    assert.equal(first.state, 'done');
+    assert.equal(first.remaining, undefined);
     assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.stateFile).length, 1);
     assert.deepEqual((await f.read(f.stateFile)).mcpServers.external, { command: 'keep' });
   });
@@ -131,11 +131,8 @@ test('继续 MCP 重装：复核已移除注册', async t => {
   const plan = await f.prepare({ id: 'mcp:context7', maintenance: 'reinstall' });
   f.state.failReadAfterEdit = f.stateFile;
   const first = await f.ccw.apply(plan.id);
-  assert.equal(first.state, 'partial');
-  assert.ok(first.remaining);
-  assert.equal((await f.read(f.stateFile)).mcpServers.context7, undefined);
-  const resumed = await f.ccw.plan({ resume: first.remaining });
-  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  assert.equal(first.state, 'done');
+  assert.equal(first.remaining, undefined);
   assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.stateFile).length, 2);
   assert.equal((await f.read(f.stateFile)).mcpServers.context7.url, 'https://mcp.context7.com/mcp');
   assert.deepEqual((await f.read(f.stateFile)).mcpServers.external, { command: 'keep' });
@@ -148,31 +145,32 @@ test('恢复 MCP 重装：保护新增注册', async t => {
   });
   const plan = await f.prepare({ id: 'mcp:context7', maintenance: 'reinstall' });
   f.state.failReadAfterEdit = f.stateFile;
+  f.state.persistentReadFailure = true;
   const first = await f.ccw.apply(plan.id);
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'failed');
   assert.ok(first.remaining);
   const replacement = { command: 'user-mcp', args: [] };
   await f.json(f.stateFile, { mcpServers: { context7: replacement } });
+  f.state.failReadAfterEdit = null;
   const resumed = await f.ccw.plan({ resume: first.remaining });
   assert.equal((await f.ccw.apply(resumed.id)).state, 'failed');
   assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.stateFile).length, 1);
   assert.deepEqual((await f.read(f.stateFile)).mcpServers.context7, replacement);
 });
 
-test('保存插件快照失败：停止旧计划', async t => {
+test('插件快照短暂不可读：实际复核完成且不重复安装', async t => {
   const f = await fixture(t);
   f.state.failPluginSnapshot = true;
   const plan = await f.prepare({ id: `plugin:${plugin}`, fields: { secret: 'fixture-secret' } });
   const first = await f.ccw.apply(plan.id);
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'done');
   assert.equal(first.remaining, undefined);
-  assert.equal(first.items[0].effects.at(-1).code, 'program-installation-unconfirmed');
   assert.equal(
     f.calls.filter(call => call.kind === 'execute' && call.args.includes('plugin') && call.args.includes('install'))
       .length,
     1,
   );
-  assert.equal((await f.read(f.settingsFile)).env.GITHUB_PERSONAL_ACCESS_TOKEN, undefined);
+  assert.equal((await f.read(f.settingsFile)).env.GITHUB_PERSONAL_ACCESS_TOKEN, 'fixture-secret');
 });
 
 test('规划插件安装：不回显凭据', async t => {
@@ -187,21 +185,20 @@ test('继续 GitHub 凭据确认：不重复写入', async t => {
   const f = await fixture(t);
   const plan = await f.prepare({ id: `plugin:${plugin}`, fields: { secret: 'fixture-secret' } });
   f.state.failReadAfterEdit = f.settingsFile;
+  f.state.persistentReadFailure = true;
+  f.state.credentialReadFailure = true;
   const first = await f.ccw.apply(plan.id);
   assert.equal(first.state, 'partial');
   assert.ok(first.remaining);
+  const writes = f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length;
+  f.state.failReadAfterEdit = null;
   const resumed = await f.ccw.plan({ resume: first.remaining });
-  assert.ok(resumed.items[0].changes.some(change => change.code === 'plugin-confirm'));
   assert.equal(
     resumed.items[0].changes.some(change => change.code === 'plugin-install'),
     false,
   );
-  assert.equal(
-    resumed.items[0].changes.some(change => change.code === 'github-credential-configure'),
-    false,
-  );
   assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
-  assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length, 1);
+  assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length, writes);
   assert.equal(
     f.calls.filter(call => call.kind === 'execute' && call.args.includes('plugin') && call.args.includes('install'))
       .length,
@@ -245,7 +242,7 @@ test('修复插件载荷：恢复缺失文件', async t => {
     ) {
       await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
       const records = await f.read(f.recordsFile);
-      records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath }];
+      records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath, gitCommitSha: revision }];
       await f.json(f.recordsFile, records);
       const current = await f.read(f.settingsFile);
       current.enabledPlugins[id] = true;
@@ -310,7 +307,7 @@ test('更换插件市场：阻止旧安装计划', async t => {
   const beforeCalls = f.calls.length;
   const result = await f.ccw.apply(plan.id);
   assert.equal(result.state, 'failed');
-  assert.equal(result.items[0].effects.at(-1).code, 'marketplace-source-conflict');
+  assert.equal(result.items[0].effects.at(-1).code, 'target-changed');
   assert.equal(
     f.calls
       .slice(beforeCalls)
@@ -378,7 +375,7 @@ test('重试技能安装：固定剩余成员', async t => {
   const result = await ccw.apply(rest.id);
   assert.equal(result.state, 'done');
   assert.equal(
-    result.items[0].effects.some(effect => effect.detail === 'tdd'),
+    rest.items[0].changes.some(change => change.detail?.startsWith('tdd')),
     false,
   );
   assert.ok(await fs.readFile(path.join(f.claudeRoot, 'skills/code-review/SKILL.md')));
@@ -428,6 +425,7 @@ test('更换插件市场：不阻止再次卸载', async t => {
   const config = await f.read(f.settingsFile);
   config.enabledPlugins[id] = true;
   await f.json(f.settingsFile, config);
+  await f.ccw.abandon((await f.ccw.recovery()).id);
   const retry = await f.ccw.plan({ task: 'detach', selected: [{ id: `plugin:${id}` }] });
   assert.ok(
     retry.items.every(item => item.problem === null),

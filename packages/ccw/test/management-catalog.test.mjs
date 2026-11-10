@@ -4,7 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createEnv, ok, revision } from './env.mjs';
+import { createEnv, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 import { createCcw } from '../dist/ccw.js';
 
 async function catalogProbe(t, additions) {
@@ -56,9 +56,10 @@ test('新增插件数据：沿用来源校验与用户安装', async t => {
       const marketFile = path.join(f.claudeRoot, 'plugins/known_marketplaces.json');
       if (repository !== null)
         await f.json(marketFile, { 'claude-plugins-official': { source: { repo: repository } } });
-      const machine = f.machine({
+      const baseMachine = f.machine({
         npm: async () => ok('{}'),
         execute: async (file, args) => {
+          if (file === 'git') return ok(`${revision}\tHEAD\n`);
           assert.equal(file, binary);
           if (args[1] === 'marketplace') {
             assert.deepEqual(args, ['plugin', 'marketplace', 'add', 'anthropics/claude-plugins-official']);
@@ -76,13 +77,18 @@ test('新增插件数据：沿用来源校验与用户安装', async t => {
             const installPath = path.join(f.claudeRoot, 'plugins/cache/virtual-reviewer');
             await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
             await f.json(path.join(f.claudeRoot, 'plugins/installed_plugins.json'), {
-              plugins: { 'virtual-reviewer@claude-plugins-official': [{ scope: 'user', installPath }] },
+              plugins: {
+                'virtual-reviewer@claude-plugins-official': [{ scope: 'user', installPath, gitCommitSha: revision }],
+              },
             });
-            await f.json(f.settingsFile, { enabledPlugins: { 'virtual-reviewer@claude-plugins-official': true } });
+            await baseMachine.editJson(f.settingsFile, settings => {
+              settings.enabledPlugins = { 'virtual-reviewer@claude-plugins-official': true };
+            });
           }
           return ok();
         },
       });
+      const machine = { ...baseMachine, source: async () => pluginMarketplaceFiles(['virtual-reviewer']) };
       const ccw = createCcw(ccwOptions(f, machine));
       const inspected = await ccw.inspect();
       const plan = await ccw.plan({ task: 'install', selected: [{ id }] });
@@ -99,10 +105,12 @@ test('新增插件数据：沿用来源校验与用户安装', async t => {
       assert.ok(inspected.items.some(entry => entry.id === 'plugin:github@claude-plugins-official'));
       assert.equal(plan.items[0].problem, null);
       assert.equal(plan.items[0].title, 'Virtual Reviewer');
-      assert.equal((await ccw.apply(plan.id)).state, 'done');
-      const commands = f.calls.filter(call => call.kind === 'execute').map(call => call.args);
+      const result = await ccw.apply(plan.id);
+      assert.equal(result.state, 'done', JSON.stringify(result));
+      const commands = f.calls
+        .filter(call => call.kind === 'execute' && call.args[0] === 'plugin')
+        .map(call => call.args);
       assert.deepEqual(commands, [
-        ...(repository === null ? [['plugin', 'marketplace', 'add', 'anthropics/claude-plugins-official']] : []),
         ['plugin', 'install', 'virtual-reviewer@claude-plugins-official', '--scope', 'user'],
       ]);
     });

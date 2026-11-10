@@ -7,7 +7,7 @@ import { createClaudeDomain, createSettingsDomain } from './claude-config.js';
 import { createCleanupDomain, prepareClaudeDataRemoval } from './cleanup.js';
 import { createMcpDomain } from './mcp.js';
 import { createPluginsDomain } from './plugins.js';
-import { createSkillsDomain } from './skills.js';
+import { createSkillsDomain, overlappingSkillSelections } from './skills.js';
 import { errorCode } from './machine.js';
 import { CLAUDE_DATA_ID, cancelled, context, defaultInstallAction, kindOf, restOf } from './model.js';
 import type {
@@ -260,6 +260,35 @@ export function createCcw(options: CcwOptions): Ccw {
             }),
           );
           for (const result of workers) if (result.status === 'rejected') throw result.reason;
+          for (const id of overlappingSkillSelections(preparationContext, sorted, work)) {
+            const index = items.findIndex(item => item.id === id);
+            items[index] = { ...items[index]!, changes: [], problem: 'overlapping-selection' };
+            work.delete(id);
+          }
+          const claudePrerequisites = sorted
+            .filter(selection => kindOf(selection.id) === 'claude' && selection.action !== 'uninstall')
+            .map(selection => `${selection.id}/program-ready`);
+          for (const [id, prepared] of work) {
+            const needsClaude = (operation: Prepared['operations'][number]) =>
+              (kindOf(id) === 'plugin' && sorted.find(selection => selection.id === id)?.action !== 'detach') ||
+              operation.handler === 'settings.login';
+            if (!claudePrerequisites.length || !prepared.operations.some(needsClaude)) continue;
+            const available = claudePrerequisites.every(prerequisite =>
+              [...work.values()].some(value => value.operations.some(operation => operation.id === prerequisite)),
+            );
+            const operations = prepared.operations.flatMap(operation =>
+              !needsClaude(operation)
+                ? [operation]
+                : available
+                  ? [{ ...operation, dependsOn: [...new Set([...operation.dependsOn, ...claudePrerequisites])] }]
+                  : [],
+            );
+            work.set(id, { ...prepared, operations });
+            if (!available) {
+              const index = items.findIndex(item => item.id === id);
+              items[index] = { ...items[index]!, problem: 'dependency-not-ready' };
+            }
+          }
           if (shouldRemoveData) {
             await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
               preparation.getStore()?.report('inspect');
@@ -273,6 +302,13 @@ export function createCcw(options: CcwOptions): Ccw {
                   throw new Error('dependency-not-ready');
                 return prepareClaudeDataRemoval(preparationContext, prerequisites);
               });
+              if (problem && problem !== 'dependency-not-ready') {
+                for (const selection of claudeRemovals) {
+                  work.delete(selection.id);
+                  const index = items.findIndex(item => item.id === selection.id);
+                  items[index] = { ...items[index]!, problem: items[index]!.problem ?? problem };
+                }
+              }
               items.push({
                 id: CLAUDE_DATA_ID,
                 title: knownTitle(CLAUDE_DATA_ID),

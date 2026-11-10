@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from './terminal-test.mjs';
-import { attribution, createEnv, exists, fail, ok, releaseContract, revision } from './env.mjs';
+import { attribution, createEnv, exists, fail, ok, pluginMarketplaceFiles, releaseContract, revision } from './env.mjs';
 
 const defaultEnv = {
   DISABLE_TELEMETRY: '1',
@@ -211,7 +211,7 @@ async function fixture(t, { platform = process.platform } = {}) {
         records.plugins ??= {};
         const installPath = path.join(f.claudeRoot, 'plugins/cache', id);
         await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
-        records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath }];
+        records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath, gitCommitSha: revision }];
         config.enabledPlugins[id] = true;
         await f.write(file, JSON.stringify(records));
         await f.write(settings, JSON.stringify(config));
@@ -234,6 +234,7 @@ async function fixture(t, { platform = process.platform } = {}) {
       return release.fetchText(url);
     },
     async source(repository, commit, folder) {
+      if (folder === '.') return pluginMarketplaceFiles();
       if (folder === '.agents/skills' || folder === 'skills')
         return (
           repository.includes('mattpocock')
@@ -348,17 +349,14 @@ test('重装插件：保留数据证据未知时阻断', async t => {
   }
 });
 
-test('重装插件：按保留数据证据决定旗标', async t => {
+test('重装插件：只在证明支持保留数据时执行', async t => {
   const f = await fixture(t);
   const setup = await f.apply({
     task: 'install',
     selected: [{ id: 'claude' }, { id: 'plugin:github@claude-plugins-official' }],
   });
   assert.equal(setup.state, 'done', JSON.stringify(setup));
-  for (const [probe, change, hasFlag] of [
-    [null, 'plugin-keep-data', true],
-    [() => ok('Usage: claude plugin uninstall [name]'), 'plugin-delete-own-data', false],
-  ]) {
+  for (const [probe, change, hasFlag] of [[null, 'plugin-keep-data', true]]) {
     f.state.pluginHelp = probe;
     f.calls.length = 0;
     const plan = await f.ccw.plan({

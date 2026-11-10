@@ -262,8 +262,7 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
   }
   const settings = await json(ctx.machine, ctx.settingsFile);
   const enabled = object(settings[ENABLED_PLUGINS_KEY])[name];
-  const records = userPluginRecords((await pluginRecords(ctx))[name]);
-  const beforeSnapshot = await pluginSnapshot(ctx, name);
+  const records = action === 'detach' && enabled === true ? [] : userPluginRecords((await pluginRecords(ctx))[name]);
   describe?.(pluginTitle(name, markets, records.length > 0 || enabled !== undefined));
   if (action === 'detach') {
     if (enabled !== true && (enabled !== undefined || !records.length)) throw new Error('no-connection');
@@ -286,6 +285,7 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       },
     ]);
   }
+  const beforeSnapshot = await pluginSnapshot(ctx, name);
   const source = pluginSource(name, markets ?? {});
   const declared = source === null ? declaredMarketSource(name, markets ?? {}) : null;
   if (source === null && declared === null) throw new Error('marketplace-source-conflict');
@@ -607,7 +607,8 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
             effects: definition.id.endsWith('/disable') ? [{ state: 'done', code: 'plugin-disabled' }] : [],
           };
         if (
-          fact.status === 'confirmed' ||
+          fact.confirmed ||
+          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
           patches.some(
             patch =>
               extensionDigest(at(current, patch.path)) !== patch.before &&

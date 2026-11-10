@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { knownTitle } from './titles.js';
 import { bundledSkills, SKILL_ENTRY, skillMembers, skillSuites } from './management-catalog.js';
 import { errorCode, isGitRevision, isObject } from './machine.js';
-import { json, kindOf, REPLACE_CONSENT, restOf, success } from './model.js';
+import { json, kindOf, normalizePath, REPLACE_CONSENT, restOf, success } from './model.js';
 import type { Context, Domain, Inspection, Item, Prepared, Selection } from './model.js';
 import {
   currentSkill,
@@ -18,6 +18,33 @@ import {
 import { sourcesFile } from './storage.js';
 
 const ASSET_ROOT = fileURLToPath(new URL('../assets/', import.meta.url));
+
+/** 套件会复核既有成员；同批成员更新不能使其冻结目标失效。共享来源记录不是范围冲突。 */
+export function overlappingSkillSelections(
+  ctx: Context,
+  selections: readonly Selection[],
+  work: ReadonlyMap<string, Prepared>,
+): ReadonlySet<string> {
+  const targets = (prepared: Prepared | undefined) =>
+    prepared?.operations.flatMap(operation =>
+      operation.handler.startsWith('skill.') && typeof operation.payload.directory === 'string'
+        ? [normalizePath(ctx.platform, operation.payload.directory)]
+        : [],
+    ) ?? [];
+  const suiteTargets = new Set(
+    selections
+      .filter(selection => kindOf(selection.id) === 'skill-set')
+      .flatMap(selection => targets(work.get(selection.id))),
+  );
+  return new Set(
+    selections
+      .filter(
+        selection =>
+          kindOf(selection.id) === 'skill' && targets(work.get(selection.id)).some(target => suiteTargets.has(target)),
+      )
+      .map(selection => selection.id),
+  );
+}
 
 function memberSuite(name: string) {
   const member = Object.entries(skillMembers).find(([id]) => id === name)?.[1];

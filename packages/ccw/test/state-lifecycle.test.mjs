@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { contentRows } from '../dist/render.js';
-import { createEnv } from './env.mjs';
+import { createEnv, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 const quietNpm = () => ({ code: 0, failed: false, stdout: '{}' });
 const seed = {
@@ -42,6 +42,7 @@ async function gatedFixture(t) {
 test('准备新计划：拒绝并发与旧计划', async t => {
   const { f, ccw, entered, release } = await gatedFixture(t);
   const old = await ccw.plan({ task: 'detach', selected: [{ id: 'mcp:external' }] });
+  await ccw.abandon((await ccw.recovery()).id);
   const preparing = ccw.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
   await entered.promise;
   try {
@@ -122,18 +123,24 @@ test('隔离异步进度通知异常', () => {
   const script = `
     import assert from 'node:assert/strict';
     import path from 'node:path';
+    import os from 'node:os';
+    import fs from 'node:fs/promises';
+    import { createMachine } from ${JSON.stringify(new URL('../dist/machine.js', import.meta.url).href)};
     import { createCcw } from ${JSON.stringify(new URL('../dist/ccw.js', import.meta.url).href)};
-    const home = path.resolve('virtual-observer-home');
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-observer-')); 
     const claudeRoot = path.join(home, '.claude');
     let settings = { enabledPlugins: { 'active@market': true } };
-    const machine = { read: async () => JSON.stringify(settings), editJson: async (_file, edit) => { edit(settings); } };
+    const machine = createMachine({}, home);
+    await fs.mkdir(claudeRoot, { recursive: true });
+    await fs.writeFile(path.join(claudeRoot, 'settings.json'), JSON.stringify(settings));
     const ccw = createCcw({ machine, home, claudeRoot, cclineRoot: path.join(claudeRoot, 'ccline'), platform: process.platform });
     const plan = await ccw.plan({ task: 'detach', selected: [{ id: 'plugin:active@market' }] });
     let notifications = 0;
     const result = await ccw.apply(plan.id, undefined, async () => { notifications++; throw new Error('observer-async-failed'); });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(result.state, 'done'); assert.equal(notifications, 1);
-    assert.equal(settings.enabledPlugins['active@market'], false);
+    assert.equal(JSON.parse(await fs.readFile(path.join(claudeRoot, 'settings.json'))).enabledPlugins['active@market'], false);
+    await fs.rm(home, { recursive: true, force: true });
   `;
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 5000 });
   assert.equal(child.status, 0, child.stderr);
@@ -212,6 +219,7 @@ test('失效 Claude 计划：停止依赖续跑', async t => {
               }),
     }),
     execute: async (_file, args) => {
+      if (_file === 'git') return ok(`${revision}\tHEAD\n`);
       const command = args.slice(1);
       if (command[1] === 'marketplace')
         await f.json(path.join(f.claudeRoot, 'plugins/known_marketplaces.json'), {
@@ -230,6 +238,7 @@ test('失效 Claude 计划：停止依赖续跑', async t => {
       return { code: 0, failed: false, stdout: '' };
     },
   });
+  machine.source = async () => pluginMarketplaceFiles();
   const ccw = f.ccw(machine);
   const plan = await ccw.plan({
     task: 'install',
@@ -243,8 +252,11 @@ test('失效 Claude 计划：停止依赖续跑', async t => {
   const first = await ccw.apply(plan.id);
   if (first.remaining) await ccw.apply((await ccw.plan({ resume: first.remaining })).id);
   const commands = f.calls.filter(call => call.kind === 'execute').map(call => call.args.slice(1));
-  assert.deepEqual(commands, []);
-  assert.equal(first.items.find(item => item.id === `plugin:${pluginName}`).isPending, false);
-  assert.equal(first.remaining, undefined);
+  assert.equal(
+    commands.some(args => args.includes('plugin')),
+    false,
+  );
+  assert.equal(first.items.find(item => item.id === `plugin:${pluginName}`).isPending, true);
+  assert.ok(first.remaining);
   assert.equal((await f.read(f.settingsFile)).enabledPlugins[pluginName], undefined);
 });

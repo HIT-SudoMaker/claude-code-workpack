@@ -6,6 +6,63 @@ import fs from 'node:fs/promises';
 import { createEnv } from './env.mjs';
 import { createCcw } from '../dist/ccw.js';
 
+test('旧进程遗留 JSON 锁不阻止新实例恢复已批准配置', async t => {
+  const f = await createEnv(t, { seed: { settings: { language: 'English', custom: true } } });
+  const machine = f.machine();
+  await f.ccw(machine).plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
+  await f.write(`${f.settingsFile}.ccw-lock`, '');
+  const restarted = f.ccw(machine);
+  const recovery = await restarted.recovery();
+  const plan = await restarted.plan({ resume: recovery.id });
+  assert.equal((await restarted.apply(plan.id)).state, 'done');
+  const settings = await f.read(f.settingsFile);
+  assert.equal(settings.language, '中文');
+  assert.equal(settings.custom, true);
+});
+
+for (const kind of ['settings', 'plugin', 'ccline'])
+  test(`成功回执后恢复原配置：新实例保护重建的 ${kind} 字段`, async t => {
+    const original = {
+      language: 'English',
+      enabledPlugins: { 'external@market': true },
+      statusLine: { type: 'command', command: 'ccline' },
+    };
+    const f = await createEnv(t, { seed: { settings: original } });
+    let unreadable = false;
+    const machine = f.machine({
+      read: (file, base) => {
+        if (file === f.settingsFile && unreadable) throw new Error('fixture-read-unavailable');
+        return base.read(file);
+      },
+      async editJson(file, edit) {
+        const actual = f.machine();
+        await actual.editJson(file, edit);
+        if (file === f.settingsFile) unreadable = true;
+      },
+    });
+    const first = f.ccw(machine);
+    const preview = await first.plan(
+      kind === 'settings'
+        ? { task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] }
+        : { task: 'detach', selected: [{ id: kind === 'plugin' ? 'plugin:external@market' : 'ccline' }] },
+    );
+    const interrupted = await first.apply(preview.id);
+    assert.ok(interrupted.remaining);
+    await f.json(f.settingsFile, original);
+    unreadable = false;
+    const writes = f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length;
+    const restarted = f.ccw(machine);
+    const remaining = await restarted.plan({ resume: interrupted.remaining });
+    const result = await restarted.apply(remaining.id);
+    assert.ok(
+      result.items[0].effects.some(
+        effect => effect.code === (kind === 'ccline' ? 'connection-changed' : 'target-changed'),
+      ),
+    );
+    assert.deepEqual(await f.read(f.settingsFile), original);
+    assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length, writes);
+  });
+
 test('重建实例发现冻结的设置计划，确认前不修改目标', async t => {
   const f = await createEnv(t, { seed: { settings: { language: 'English', custom: { keep: true } } } });
   const machine = f.machine();
