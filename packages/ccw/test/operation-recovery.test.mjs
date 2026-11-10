@@ -63,6 +63,50 @@ for (const kind of ['settings', 'plugin', 'ccline'])
     assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length, writes);
   });
 
+test('凭据保存回执后恢复旧值：新实例保护用户重新选择的凭据', async t => {
+  const name = 'github@claude-plugins-official';
+  const original = { enabledPlugins: { [name]: true }, env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'old-key' } };
+  const f = await createEnv(t, { seed: { settings: original } });
+  const directory = path.join(f.claudeRoot, 'plugins/cache/github');
+  await f.write(path.join(directory, '.claude-plugin/plugin.json'), '{}');
+  await f.json(path.join(f.claudeRoot, 'plugins/installed_plugins.json'), {
+    plugins: { [name]: [{ scope: 'user', installPath: directory }] },
+  });
+  await f.json(path.join(f.claudeRoot, 'plugins/known_marketplaces.json'), {
+    'claude-plugins-official': { source: { repo: 'anthropics/claude-plugins-official' } },
+  });
+  let unreadable = false;
+  const machine = f.machine({
+    read: (file, base) => {
+      if (file === f.settingsFile && unreadable) throw new Error('fixture-read-unavailable');
+      return base.read(file);
+    },
+    async editJson(file, edit) {
+      await f.machine().editJson(file, edit);
+      if (file === f.settingsFile) unreadable = true;
+    },
+  });
+  const first = f.ccw(machine);
+  const preview = await first.plan({
+    task: 'install',
+    selected: [{ id: `plugin:${name}`, fields: { secret: 'new-key' } }],
+  });
+  const interrupted = await first.apply(preview.id);
+  assert.ok(interrupted.remaining);
+  await f.json(f.settingsFile, original);
+  unreadable = false;
+  const writes = f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length;
+  const restarted = f.ccw(machine);
+  const resumed = await restarted.plan({
+    resume: interrupted.remaining,
+    inputs: { [`plugin:${name}/credential`]: { secret: 'new-key' } },
+  });
+  const result = await restarted.apply(resumed.id);
+  assert.ok(result.items[0].effects.some(effect => effect.code === 'target-changed'));
+  assert.deepEqual(await f.read(f.settingsFile), original);
+  assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length, writes);
+});
+
 test('重建实例发现冻结的设置计划，确认前不修改目标', async t => {
   const f = await createEnv(t, { seed: { settings: { language: 'English', custom: { keep: true } } } });
   const machine = f.machine();

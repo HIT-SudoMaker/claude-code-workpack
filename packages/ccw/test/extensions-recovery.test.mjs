@@ -4,6 +4,25 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { createEnv, ok, revision } from './env.mjs';
 
+test('未派发技能及其等待前置步骤：重启恢复展示待执行', async t => {
+  const f = await createEnv(t);
+  const machine = {
+    ...f.machine({ execute: async () => ok(`${revision}\tHEAD\n`) }),
+    source: async () => [{ path: 'SKILL.md', data: Buffer.from('frozen skill') }],
+  };
+  await f.ccw(machine).plan({ task: 'install', selected: [{ id: 'skill:ssre2-design' }] });
+  const recovery = await f.ccw(machine).recovery();
+  assert.equal(recovery.items[0].state, 'pending');
+  assert.equal(recovery.items[0].problem, undefined);
+  assert.equal(
+    await fs.stat(path.join(f.claudeRoot, 'skills/ssre2-design')).then(
+      () => true,
+      () => false,
+    ),
+    false,
+  );
+});
+
 test('skill deployment survives a fresh instance without fetching source or deploying twice', async t => {
   const f = await createEnv(t);
   const abort = new AbortController();

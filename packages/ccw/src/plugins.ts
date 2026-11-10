@@ -758,7 +758,11 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
             evidence: { matched: true },
             effects: [{ state: 'done', code: 'github-credential-saved' }],
           };
-        if (fact.status === 'confirmed' || current !== definition.payload.before)
+        if (
+          fact.confirmed ||
+          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
+          current !== definition.payload.before
+        )
           return { state: 'unknown', problem: 'target-changed' };
         return { state: 'ready' };
       },

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
 import { createMachine } from '../dist/machine.js';
-import { createEnv, fail, ok } from './env.mjs';
+import { createEnv, fail, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 async function fixture(t, { before = {}, platform = 'win32', inheritedKeys = [], hasProgram = false } = {}) {
   const f = await createEnv(t, { layout: 'root', seed: { settings: before } });
@@ -762,7 +762,7 @@ test('保存 Claude 配置失败：保留就绪程序', async t => {
   const binary = path.join(npmRoot, '@anthropic-ai/claude-code', 'cli.js');
   const packages = new Map();
   const base = createMachine({}, f.root);
-  const machine = f.machine({
+  const programMachine = f.machine({
     npm: async args => {
       const last = args.at(-1);
       if (args[0] === 'root') return ok(npmRoot);
@@ -785,6 +785,7 @@ test('保存 Claude 配置失败：保留就绪程序', async t => {
       throw new Error(`Unexpected npm command ${args[0]}`);
     },
     execute: async (executable, originalArgs) => {
+      if (executable === 'git') return ok(`${revision}\tHEAD\n`);
       const args = [...originalArgs];
       if (args[0]?.endsWith('cli.js')) args.shift();
       if (args[0] === '--version') return ok(`${packages.get('@anthropic-ai/claude-code')} (Claude Code)`);
@@ -807,7 +808,7 @@ test('保存 Claude 配置失败：保留就绪程序', async t => {
         records.plugins ??= {};
         const installPath = path.join(f.claudeRoot, 'plugins/cache', id);
         await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
-        records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath }];
+        records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath, gitCommitSha: revision }];
         await f.write(file, JSON.stringify(records));
         config.enabledPlugins[id] = true;
         await f.write(f.settingsFile, JSON.stringify(config));
@@ -816,10 +817,13 @@ test('保存 Claude 配置失败：保留就绪程序', async t => {
       throw new Error(`Unexpected command: ${executable} ${args.join(' ')}`);
     },
     editJson: async (file, edit) => {
-      if (f.state.failEditJson) throw new Error('settings-write-failed');
-      return base.editJson(file, edit);
+      return base.editJson(file, document => {
+        edit(document);
+        if (f.state.failEditJson && document.env?.DISABLE_TELEMETRY === '1') throw new Error('settings-write-failed');
+      });
     },
   });
+  const machine = { ...programMachine, source: async () => pluginMarketplaceFiles() };
   const ccw = createCcw({
     machine,
     home: f.home,
