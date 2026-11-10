@@ -129,7 +129,9 @@ async function fixture(t, platform = 'win32') {
     },
     async fetchText(url, options) {
       if (url === 'https://claude.ai/install.cmd') state.scriptFetches += 1;
-      return state.fetchScript ? '@echo off\r\n' : wrapped.fetchText(url, options);
+      return url === 'https://claude.ai/install.cmd' || state.fetchScript
+        ? '@echo off\r\n'
+        : wrapped.fetchText(url, options);
     },
     async initialize(file, text) {
       const result = await wrapped.initialize(file, text);

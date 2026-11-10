@@ -31,6 +31,7 @@ export function createEffectMachine(machine: Machine, allowed: () => boolean): M
       return work(...args);
     };
   return {
+    npmIdentity: guarded(() => machine.npmIdentity()),
     read: guarded(file => machine.read(file)),
     fingerprint: guarded((file, signal) => machine.fingerprint(file, signal)),
     initialize: guarded((file, text) => machine.initialize(file, text)),

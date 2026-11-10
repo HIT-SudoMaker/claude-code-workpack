@@ -1,11 +1,11 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import { knownTitle } from './titles.js';
 import { OFFICECLI_REPO_SLUG, officeIntegration } from './management-catalog.js';
 import { errorCode, isObject, succeeded } from './machine.js';
 import type { CommandOptions } from './machine.js';
-import { cancelled, claudeEnvironment, claudeRunning, success, userBinary } from './model.js';
+import { claudeEnvironment, claudeRunning, userBinary } from './model.js';
 import { isExactVersion, NPM_OFFICIAL, resolveNpmView } from './npm-registry.js';
 import type { Context, Item, Prepared, Selection } from './model.js';
 import type { NpmRegistry, NpmResolution } from './npm-registry.js';
@@ -13,20 +13,19 @@ import {
   channelCanPinVersion,
   containsPath,
   freezeProgramScope,
+  freezeNpmScope,
   identifyProgramChannel,
-  maintainProgramChannel,
   npmBinary,
   npmGlobalRoot,
   npmVersion,
   officeBinary,
   PROGRAM_PACKAGES,
-  programPackageAbsent,
-  removeProgramChannel,
   samePath,
 } from './program-channels.js';
 import type { Program, ProgramKind } from './program-channels.js';
-import { createOfficeNativeProtocol } from './office-native-protocol.js';
-import { createClaudeInstallProtocol } from './claude-install-protocol.js';
+import { programOperation, programPrepared } from './program-operations.js';
+export { programHandlers } from './program-operations.js';
+import { installScratch } from './storage.js';
 
 export async function programs(
   ctx: Context,
@@ -170,8 +169,10 @@ export async function prepareProgram(
     readonly targetRegistry?: NpmRegistry;
   }
 > {
-  if (selection.action === 'uninstall') return prepareProgramRemoval(ctx, kind, program, !selection.removeData);
-  if (kind === 'claude' && program === undefined && selection.action === 'install') return prepareClaudeInstall(ctx);
+  if (selection.action === 'uninstall')
+    return prepareProgramRemoval(ctx, kind, selection, program, !selection.removeData);
+  if (kind === 'claude' && program === undefined && selection.action === 'install')
+    return prepareClaudeInstall(ctx, selection.id);
   if (kind === 'officecli' && (program === undefined || program.channel === 'native'))
     return prepareOfficeNative(ctx, selection, program);
   const action = selection.action;
@@ -205,85 +206,46 @@ export async function prepareProgram(
       throw new Error('newer-version-preserved');
   }
   const scope = await freezeProgramScope(ctx, program);
-  let isComplete = false;
-  let isCommandCompleted = false;
-  let commandStamp: string | null | undefined;
-  let verifiedBinary: string | undefined;
-  let verifiedStamp: string | null = null;
-  const operation: Prepared & { readonly targetVersion: string | null; readonly targetRegistry?: NpmRegistry } = {
+  if (action !== 'login' && targetVersion === null) throw new Error('pinned-version-channel-unsupported');
+  const payload = {
+    program,
+    scope: scope.data,
+    before: stamp,
+    action,
     targetVersion,
-    ...(targetRegistry !== undefined ? { targetRegistry } : {}),
-    get changes() {
-      return [
-        {
-          code: isCommandCompleted ? 'program-installation-confirm' : PROGRAM_ACTION_CHANGE[action],
-          detail: `${program.binary} · ${channel}${targetVersion ? ` · ${targetVersion}` : ''}`,
-        },
-        { code: 'keep-user-data' },
-      ];
-    },
-    async run(report, signal) {
-      cancelled(signal);
-      if (isCommandCompleted) {
-        if (commandStamp === undefined) throw new Error('program-installation-unconfirmed');
-        if ((await ctx.machine.treeStamp(program.binary)) !== commandStamp) throw new Error('program-changed');
-      } else {
-        if ((await ctx.machine.treeStamp(program.binary)) !== stamp) throw new Error('program-changed');
-        await scope.verify();
-      }
-      if (action === 'login') {
-        success(
-          await executeClaude(ctx, program.binary, ['auth', 'login'], { isInteractive: true }, 'effect'),
-          'login-failed',
-        );
-        const status: unknown = JSON.parse(
-          success(await executeClaude(ctx, program.binary, ['auth', 'status', '--json'])),
-        );
-        if (!isObject(status) || status.loggedIn !== true) throw new Error('login-unconfirmed');
-        isComplete = true;
-        report({ state: 'done', code: 'logged-in' });
-        return;
-      }
-      if (!isCommandCompleted)
-        await maintainProgramChannel(ctx, program, scope, action, targetVersion, targetRegistry, async () => {
-          isCommandCompleted = true;
-          report({ state: 'done', code: 'package-command-completed' });
-          try {
-            commandStamp = await ctx.machine.treeStamp(program.binary);
-          } catch (error) {
-            throw new Error('program-installation-unconfirmed', { cause: error });
-          }
-        });
-      if (channel === 'npm' || channel === 'brew') await scope.verify();
-      const found = await programs(ctx, kind);
-      let selected: Program | undefined;
-      for (const value of found.values.values())
-        if (await scope.matches(value)) {
-          selected = value;
-          break;
-        }
-      if (selected === undefined || (await ctx.machine.treeStamp(selected.binary)) === null)
-        throw new Error('program-not-ready');
-      if (channel === 'npm' && selected.version !== targetVersion) throw new Error('program-not-ready');
-      if (kind === 'claude' && (await claudeVersion(ctx, selected.binary)) !== targetVersion)
-        throw new Error('program-not-ready');
-      verifiedBinary = selected.binary;
-      verifiedStamp = await ctx.machine.treeStamp(selected.binary);
-      isComplete = true;
-      report({ state: 'done', code: 'program-ready' });
-      cancelled(signal);
-    },
-    remaining: () => (isComplete ? undefined : operation),
-    async verify() {
-      if (isCommandCompleted && commandStamp === undefined) throw new Error('program-installation-unconfirmed');
-      if (verifiedBinary && (await ctx.machine.treeStamp(verifiedBinary)) !== verifiedStamp)
-        throw new Error('program-changed');
-    },
+    registry: targetRegistry ?? null,
   };
-  return operation;
+  const command = programOperation(
+    selection.id,
+    action === 'login' ? 'login' : 'program-command',
+    'program.maintain',
+    payload,
+    [
+      {
+        code: PROGRAM_ACTION_CHANGE[action],
+        detail: program.binary + ' · ' + channel + (targetVersion ? ' · ' + targetVersion : ''),
+      },
+      { code: 'keep-user-data' },
+    ],
+    [],
+    [program.binary],
+  );
+  const ready = programOperation(
+    selection.id,
+    'program-ready',
+    'program.ready',
+    { binary: program.binary, kind, version: targetVersion, scope: scope.data, program, command: command.id },
+    [],
+    [command.id],
+  );
+  return {
+    ...programPrepared(action === 'login' ? [command] : [command, ready]),
+    targetVersion,
+    ...(targetRegistry ? { targetRegistry } : {}),
+  };
 }
 
-async function claudeVersion(ctx: Context, binary: string) {
+export async function claudeVersion(ctx: Context, binary: string) {
   const output = await executeClaude(ctx, binary, ['--version'], { timeoutMs: 10_000 });
   const version = /\b(\d+\.\d+\.\d+)\b/.exec(output.stdout)?.[1];
   return !output.failed && output.code === 0 ? (version ?? null) : null;
@@ -309,35 +271,54 @@ async function stableClaudeVersion(ctx: Context): Promise<NpmResolution<string>>
   }
 }
 
-async function installedClaude(ctx: Context, channel: 'npm' | 'native', expected: string) {
-  const found = await programs(ctx, 'claude');
-  if (found.problems.length) throw new Error('installation-state-unconfirmed');
-  const program = [...found.values.values()].find(value => value.channel === channel);
-  return program !== undefined &&
-    (await ctx.machine.treeStamp(program.binary)) !== null &&
-    (await claudeVersion(ctx, program.binary)) === expected
-    ? program
-    : undefined;
-}
-
-/** 固定 stable 版本与来源，安装进度由 Claude 私有协议持有。 */
+/** Freeze npm and the optional official CMD alternative before approval. */
 async function prepareClaudeInstall(
   ctx: Context,
-): Promise<Prepared & { readonly targetVersion: string | null; readonly targetRegistry: NpmRegistry }> {
+  itemId: string,
+): Promise<Prepared & { readonly targetVersion: string; readonly targetRegistry: NpmRegistry }> {
   const release = await stableClaudeVersion(ctx);
-  const operation = await createClaudeInstallProtocol(
-    ctx,
-    {
+  let npm = null;
+  try {
+    npm = (await freezeNpmScope(ctx)).data;
+  } catch (error) {
+    if (errorCode(error) !== 'npm-not-found') throw error;
+  }
+  const script = ctx.platform === 'win32' ? await ctx.machine.fetchText('https://claude.ai/install.cmd') : null;
+  if (script !== null && (/^\s*</.test(script) || !script.trim())) throw new Error('installer-unavailable');
+  const target = {
+    version: release.value,
+    registry: release.registry,
+    npm,
+    native: userBinary(ctx, 'claude'),
+    script,
+    directory: script === null ? null : installScratch(ctx, 'claude-' + randomUUID()),
+    npmOperation: itemId + '/npm-install',
+    cleanupOperation: itemId + '/npm-cleanup',
+    stageOperation: itemId + '/cmd-stage',
+    cmdOperation: itemId + '/cmd-install',
+    scriptCleanupOperation: itemId + '/cmd-cleanup',
+  };
+  const operations = [
+    programOperation(itemId, 'npm-install', 'claude.install-npm', target, [
+      { code: ctx.platform === 'win32' ? 'program-install-cmd' : 'program-install', detail: 'npm · ' + release.value },
+      { code: 'keep-user-data' },
+    ]),
+  ];
+  if (ctx.platform === 'win32')
+    operations.push(
+      programOperation(itemId, 'npm-cleanup', 'claude.cleanup-npm', target),
+      programOperation(itemId, 'cmd-stage', 'claude.stage-cmd', target),
+      programOperation(itemId, 'cmd-install', 'claude.install-cmd', target),
+      programOperation(itemId, 'cmd-cleanup', 'claude.cleanup-script', target),
+    );
+  operations.push(
+    programOperation(itemId, 'program-ready', 'program.ready', {
+      kind: 'claude',
       version: release.value,
-      registry: release.registry,
-    },
-    {
-      inspect: () => programs(ctx, 'claude'),
-      installed: channel => installedClaude(ctx, channel, release.value),
-    },
+      alternatives: [target.npmOperation, ...(ctx.platform === 'win32' ? [target.cmdOperation] : [])],
+    }),
   );
-  // Object.assign 保留协议的 changes getter；spread 会把续办视图冻结成准备时的值。
-  return Object.assign(operation, { targetVersion: release.value, targetRegistry: release.registry });
+  return { ...programPrepared(operations), targetVersion: release.value, targetRegistry: release.registry };
 }
 
 function officeAsset(ctx: Context) {
@@ -372,7 +353,7 @@ async function officeUpdates(ctx: Context, binary: string) {
     files.map(async file => {
       if (entries.some(entry => entry.name === path.basename(file) && entry.kind === 'directory'))
         throw new Error('program-update-conflict');
-      return { file, stamp: await ctx.machine.treeStamp(file), isDone: false };
+      return { file, stamp: await ctx.machine.treeStamp(file) };
     }),
   );
 }
@@ -452,23 +433,55 @@ async function prepareOfficeNative(
     : await fetchReleaseFile(assetName, (url, options) => ctx.machine.fetchBytes(url, options), 30_000);
   if (bytes !== null && createHash('sha256').update(bytes).digest('hex') !== digest)
     throw new Error('release-checksum-mismatch');
-  const operation = createOfficeNativeProtocol(
-    ctx,
+  const removals = updates.map((target, index) =>
+    programOperation(
+      selection.id,
+      'update-artifact-' + index,
+      'program.remove-file',
+      { file: target.file, before: target.stamp },
+      target.stamp === null ? [] : [{ code: 'program-copy-remove', detail: target.file }],
+      [],
+      [target.file],
+    ),
+  );
+  const deploy = programOperation(
+    selection.id,
+    'program-deploy',
+    'program.deploy',
     {
       binary,
       before,
       digest,
       version: targetVersion,
-      deployment: bytes === null ? { kind: 'reuse' } : { kind: 'replace', bytes },
-      updates,
-      change: {
-        code: shouldKeepBinary ? 'program-kept' : PROGRAM_ACTION_CHANGE[action],
-        detail: `OfficeCLI · native · ${targetVersion} · ${binary}`,
-      },
+      bytes: bytes === null ? null : Buffer.from(bytes).toString('base64'),
+      source: baseUrl + assetName,
     },
-    () => officeVersion(ctx, binary),
+    [
+      {
+        code: shouldKeepBinary ? 'program-kept' : PROGRAM_ACTION_CHANGE[action],
+        detail: 'OfficeCLI · native · ' + targetVersion + ' · ' + binary,
+      },
+    ],
+    removals.map(operation => operation.id),
+    [binary],
   );
-  return Object.assign(operation, { targetVersion, targetBinary: binary });
+  const ready = programOperation(
+    selection.id,
+    'program-ready',
+    'program.ready',
+    { binary, digest, version: targetVersion, kind: 'officecli' },
+    [],
+    [deploy.id],
+  );
+  const userPath = programOperation(
+    selection.id,
+    'program-path',
+    'program.path',
+    { directory: path.dirname(binary) },
+    [{ code: 'program-user-path', detail: path.dirname(binary) }, { code: 'keep-user-data' }],
+    [ready.id],
+  );
+  return { ...programPrepared([...removals, deploy, ready, userPath]), targetVersion, targetBinary: binary };
 }
 
 /** Claude 变更前的进程复核：枚举失败保留未知，不臆断未运行 */
@@ -480,6 +493,7 @@ async function ensureClaudeNotRunning(ctx: Context) {
 async function prepareProgramRemoval(
   ctx: Context,
   kind: ProgramKind,
+  selection: Selection,
   program?: Program,
   shouldPreserveData = true,
 ): Promise<Prepared & { readonly targetVersion: null }> {
@@ -499,112 +513,53 @@ async function prepareProgramRemoval(
     program.channel === 'native'
       ? [program.binary, ...(kind === 'claude' ? [path.join(ctx.home, '.local/share/claude')] : [])]
       : [];
-  const removals = [
-    ...(await Promise.all(
-      nativeFiles.map(async file => ({ file, stamp: await ctx.machine.treeStamp(file), isDone: false })),
-    )),
-    ...(program.channel === 'native' && kind === 'officecli' ? await officeUpdates(ctx, program.binary) : []),
-  ];
-  let isComplete = false;
-  let hasAttemptedCommand = false;
-  let isCommandFailed = false;
-  let isBinaryRemoved = false;
-  const verifyRemoved = async () => {
-    if (program.channel === 'npm') {
-      await scope.verify();
-      if ((await npmVersion(ctx, PROGRAM_PACKAGES[kind], scope.npmRoot)) !== null)
-        throw new Error('program-still-installed');
-    }
-    if ((await ctx.machine.treeStamp(program.binary)) !== null) throw new Error('program-still-installed');
-    for (const target of removals)
-      if ((await ctx.machine.treeStamp(target.file)) !== null) throw new Error('program-still-installed');
-  };
-  const operation: Prepared & { readonly targetVersion: null } = {
-    targetVersion: null,
-    get changes() {
-      const pending = removals.filter(value => !value.isDone && value.stamp !== null);
-      return [
-        ...(removals.length
-          ? pending.length
-            ? pending.map(value => ({
-                code: value.file === program.binary ? 'program-uninstall' : 'program-copy-remove',
-                detail: value.file,
-              }))
-            : [{ code: 'program-removal-confirm' }]
-          : hasAttemptedCommand
-            ? [{ code: 'program-removal-confirm' }]
-            : [{ code: 'program-uninstall', detail: `${program.channel} · ${program.binary}` }]),
-        ...(shouldPreserveData ? [{ code: 'keep-user-data' }] : []),
-      ];
-    },
-    async run(report, signal) {
-      cancelled(signal);
-      if (kind === 'claude') await ensureClaudeNotRunning(ctx);
-      if (removals.length) {
-        for (const target of removals) {
-          if (target.isDone) {
-            if ((await ctx.machine.treeStamp(target.file)) !== null) throw new Error('program-changed');
-            continue;
-          }
-          cancelled(signal);
-          if ((await ctx.machine.treeStamp(target.file)) !== target.stamp) throw new Error('program-changed');
-          if (target.stamp !== null) await ctx.effects.removeTree(target.file, target.stamp);
-          target.isDone = true;
-          report({ state: target.stamp === null ? 'kept' : 'done', code: 'program-copy-removed', detail: target.file });
-          cancelled(signal);
-        }
-      } else {
-        const isConfirming = hasAttemptedCommand;
-        if (!hasAttemptedCommand) {
-          if ((await ctx.machine.treeStamp(program.binary)) !== before) throw new Error('program-changed');
-          await scope.verify();
-          const result = await removeProgramChannel(ctx, program, scope);
-          hasAttemptedCommand = true;
-          isCommandFailed = !succeeded(result);
-          if (!isCommandFailed) report({ state: 'kept', code: 'program-uninstall-command-completed' });
-        }
-        const current = await ctx.machine.treeStamp(program.binary);
-        if (current === null && before !== null && !isBinaryRemoved) {
-          isBinaryRemoved = true;
-          report({ state: 'done', code: 'program-copy-removed', detail: program.binary });
-        }
-        try {
-          await verifyRemoved();
-        } catch (error) {
-          const code = errorCode(error);
-          if (code === 'program-still-installed' && current === before) hasAttemptedCommand = false;
-          throw new Error(
-            code === 'program-still-installed'
-              ? isCommandFailed
-                ? 'program-uninstall-failed'
-                : code
-              : 'program-removal-unconfirmed',
-            { cause: error },
-          );
-        }
-        if (isCommandFailed && program.channel !== 'npm') {
-          if (!isConfirming || (await programPackageAbsent(ctx, program, scope)) !== true)
-            throw new Error('program-removal-unconfirmed');
-        }
-      }
-      await verifyRemoved();
-      isComplete = true;
-      report({ state: 'done', code: 'program-removed', detail: program.binary });
-      if (shouldPreserveData) report({ state: 'kept', code: 'keep-user-data' });
-      try {
-        const found = await programs(ctx, kind);
-        for (const value of found.values.values())
-          report({ state: 'kept', code: 'program-other-copies-kept', detail: value.binary });
-        for (const code of found.problems) report({ state: 'kept', code: 'program-inspection-warning', detail: code });
-      } catch (error) {
-        report({ state: 'kept', code: 'program-inspection-warning', detail: errorCode(error) });
-      }
-      cancelled(signal);
-    },
-    remaining: () => (isComplete ? undefined : operation),
-    verify: verifyRemoved,
-  };
-  return operation;
+  const operations = [];
+  for (const [index, file] of nativeFiles.entries())
+    operations.push(
+      programOperation(
+        selection.id,
+        'program-remove-' + index,
+        'program.remove-file',
+        { file, before: await ctx.machine.treeStamp(file), claude: kind === 'claude' },
+        [{ code: file === program.binary ? 'program-uninstall' : 'program-copy-remove', detail: file }],
+        [],
+        [file],
+      ),
+    );
+  if (program.channel === 'native' && kind === 'officecli')
+    for (const [index, target] of (await officeUpdates(ctx, program.binary)).entries())
+      operations.push(
+        programOperation(
+          selection.id,
+          'program-artifact-remove-' + index,
+          'program.remove-file',
+          { file: target.file, before: target.stamp },
+          target.stamp === null ? [] : [{ code: 'program-copy-remove', detail: target.file }],
+          [],
+          [target.file],
+        ),
+      );
+  if (!nativeFiles.length)
+    operations.push(
+      programOperation(
+        selection.id,
+        'program-package-remove',
+        'program.remove-package',
+        { program, scope: scope.data, before, action: 'uninstall', targetVersion: null, registry: null },
+        [{ code: 'program-uninstall', detail: program.channel + ' · ' + program.binary }],
+        [],
+        [program.binary],
+      ),
+    );
+  const ready = programOperation(
+    selection.id,
+    'program-removed',
+    'program.ready',
+    { kind, binary: program.binary, version: null, removed: true, removals: operations.map(operation => operation.id) },
+    shouldPreserveData ? [{ code: 'keep-user-data' }] : [],
+    operations.map(operation => operation.id),
+  );
+  return { ...programPrepared([...operations, ready]), targetVersion: null };
 }
 
 /** 三段语义化版本比较：正值为左更新；ccline 的降级门共用 */
