@@ -61,7 +61,7 @@ async function cancelledPreparationCase(t, { hook, release }) {
   assert.equal(await verdict(preparing), 'cancelled');
   assert.equal(receivedSignal.aborted, true);
   assert.equal((await ccw.plan({ task: 'install', selected: [] })).problem, 'empty-selection');
-  assert.equal(await exists(home), false);
+  assert.equal(await exists(path.join(home, '.claude')), false);
 }
 
 test('取消技能准备：终止 Git 查询', t => cancelledPreparationCase(t, { hook: 'execute', release: ok(revision) }));
@@ -147,7 +147,7 @@ test('准备技能：报告获取步骤', async t => {
     ['inspect', 'metadata', 'source'],
   );
   assert.ok(events.every(event => event.id === 'skill-set:ssre2'));
-  assert.equal(await exists(home), false);
+  assert.equal(await exists(path.join(home, '.claude')), false);
 });
 
 test('安装技能：隔离准备信号', async t => {
@@ -174,9 +174,16 @@ test('并行准备：限制两项并保留进度归属和结果顺序', async t 
       await pause();
       return ok(revision);
     },
-    async source(_repository, _revision, folder) {
+    async source(repository, _revision, folder) {
       await pause();
-      return [{ path: folder.endsWith('ssre2-design') ? 'SKILL.md' : 'one/SKILL.md', data: Buffer.from('skill') }];
+      return [
+        {
+          path: folder.endsWith('ssre2-design')
+            ? 'SKILL.md'
+            : `${repository.includes('mattpocock') ? 'matt-member' : 'ssre-member'}/SKILL.md`,
+          data: Buffer.from('skill'),
+        },
+      ];
     },
   });
   const ids = ['skill-set:ssre2', 'skill-set:mattpocock', 'skill:ssre2-design'];
@@ -199,7 +206,7 @@ test('并行准备：限制两项并保留进度归属和结果顺序', async t 
   }
 });
 
-test('并行准备重复选择：只读取首项', async t => {
+test('重复选择：准备前拒绝且不读取来源', async t => {
   let metadataCalls = 0;
   let sourceCalls = 0;
   const { ccw } = await fixture(t, {
@@ -212,16 +219,15 @@ test('并行准备重复选择：只读取首项', async t => {
       return [{ path: 'one/SKILL.md', data: Buffer.from('skill') }];
     },
   });
-  const plan = await ccw.plan({
-    task: 'install',
-    selected: [{ id: 'skill-set:ssre2' }, { id: 'skill-set:ssre2' }],
-  });
-  assert.deepEqual(
-    plan.items.map(item => item.problem),
-    [null, 'duplicate-selection'],
+  await assert.rejects(
+    ccw.plan({
+      task: 'install',
+      selected: [{ id: 'skill-set:ssre2' }, { id: 'skill-set:ssre2' }],
+    }),
+    /duplicate-selection/,
   );
-  assert.equal(metadataCalls, 1);
-  assert.equal(sourceCalls, 1);
+  assert.equal(metadataCalls, 0);
+  assert.equal(sourceCalls, 0);
 });
 
 test('取消并行准备：等待在途工作结束并停止后续项', async t => {

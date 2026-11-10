@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
-import { createEnv } from './env.mjs';
+import { createEnv, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 /** 身份与标题反例：名称命中不等于身份确认；计划标题由核心独立生成 */
 async function fixture(t) {
@@ -16,6 +16,7 @@ async function fixture(t) {
   };
   const wrapped = f.machine({
     npm: async () => ({ code: 0, failed: false, stdout: '{}' }),
+    execute: async file => (file === 'git' ? ok(`${revision}\tHEAD\n`) : ok()),
     locate: async name => state.locate?.(name) ?? [],
     read: async (file, base) => {
       const body = state.interceptRead?.(file);
@@ -24,6 +25,7 @@ async function fixture(t) {
   });
   const machine = {
     ...wrapped,
+    source: async () => pluginMarketplaceFiles(),
     treeStamp: (file, signal) => (file === state.stampVanished ? null : wrapped.treeStamp(file, signal)),
   };
   const ccw = f.ccw(machine);
@@ -73,6 +75,7 @@ test('计划标题由核心生成：调用方不传标题', async t => {
   });
   const detach = await f.ccw.plan({ task: 'uninstall', selected: [{ id: 'mcp:context7' }] });
   assert.equal(detach.items[0].title, 'context7', '与检查页同一证据结论');
+  await f.ccw.abandon((await f.ccw.recovery()).id);
   const offered = await f.ccw.plan({ task: 'install', selected: [{ id: 'mcp:context7' }] });
   assert.equal(offered.items[0].title, 'context7', '已存在未知注册时安装仍按证据命名');
   assert.equal(offered.items[0].problem, null);
@@ -84,6 +87,7 @@ test('计划标题由核心生成：未注册方案与技能成员', async t => 
   assert.equal(install.items.find(item => item.id === 'mcp:context7')?.title, 'Context7');
   assert.equal(install.items.find(item => item.id === 'skill-set:ssre2')?.title, 'HIT-SudoMaker/SSRE2');
   await f.write(path.join(f.claudeRoot, 'skills/ssre2-design/SKILL.md'), '---\nname: ssre2-design\n---\n');
+  await f.ccw.abandon((await f.ccw.recovery()).id);
   const detach = await f.ccw.plan({ task: 'uninstall', selected: [{ id: 'skill:ssre2-design' }] });
   assert.equal(detach.items[0].title, 'ssre2-design', '成员用实际成员名');
 });

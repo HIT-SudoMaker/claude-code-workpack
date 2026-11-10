@@ -541,7 +541,11 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
               },
             ],
           };
-        if (fact.status === 'confirmed' || extensionDigest(current) !== p.before)
+        if (
+          fact.confirmed ||
+          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
+          extensionDigest(current) !== p.before
+        )
           return { state: 'unknown', problem: 'target-changed' };
         return { state: 'ready', dispatch: { before: extensionString(p.before) } };
       },

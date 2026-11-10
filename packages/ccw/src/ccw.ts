@@ -265,6 +265,30 @@ export function createCcw(options: CcwOptions): Ccw {
             items[index] = { ...items[index]!, changes: [], problem: 'overlapping-selection' };
             work.delete(id);
           }
+          const claudePrerequisites = sorted
+            .filter(selection => kindOf(selection.id) === 'claude' && selection.action !== 'uninstall')
+            .map(selection => `${selection.id}/program-ready`);
+          for (const [id, prepared] of work) {
+            const needsClaude = (operation: Prepared['operations'][number]) =>
+              (kindOf(id) === 'plugin' && sorted.find(selection => selection.id === id)?.action !== 'detach') ||
+              operation.handler === 'settings.login';
+            if (!claudePrerequisites.length || !prepared.operations.some(needsClaude)) continue;
+            const available = claudePrerequisites.every(prerequisite =>
+              [...work.values()].some(value => value.operations.some(operation => operation.id === prerequisite)),
+            );
+            const operations = prepared.operations.flatMap(operation =>
+              !needsClaude(operation)
+                ? [operation]
+                : available
+                  ? [{ ...operation, dependsOn: [...new Set([...operation.dependsOn, ...claudePrerequisites])] }]
+                  : [],
+            );
+            work.set(id, { ...prepared, operations });
+            if (!available) {
+              const index = items.findIndex(item => item.id === id);
+              items[index] = { ...items[index]!, problem: 'dependency-not-ready' };
+            }
+          }
           if (shouldRemoveData) {
             await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
               preparation.getStore()?.report('inspect');
