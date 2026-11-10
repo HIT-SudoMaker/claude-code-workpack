@@ -488,15 +488,33 @@ function relativeFile(root: string, relative: string) {
   return result;
 }
 
+/** POSIX 还需提交目录项；Windows 不支持用普通目录句柄执行 fsync。 */
+async function syncParentDirectory(file: string) {
+  if (process.platform === 'win32') return;
+  const directory = await fs.open(path.dirname(file), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 async function replaceFile(file: string, data: Uint8Array, expected: string | null, shouldMarkExecutable = false) {
   await prepareParent(file);
   const stat = await fileStat(file);
   if ((await fingerprint(file)) !== expected) throw new Error('target-changed');
   const staged = `${file}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(staged, data, { flag: 'wx', mode: shouldMarkExecutable ? 0o755 : (stat?.mode ?? 0o600) });
+    const output = await fs.open(staged, 'wx', shouldMarkExecutable ? 0o755 : (stat?.mode ?? 0o600));
+    try {
+      await output.writeFile(data);
+      await output.sync();
+    } finally {
+      await output.close();
+    }
     if ((await fingerprint(file)) !== expected) throw new Error('target-changed');
     await fs.rename(staged, file);
+    await syncParentDirectory(file);
     if ((await fingerprint(file)) !== createHash('sha256').update(data).digest('hex'))
       throw new Error('target-changed');
   } finally {
@@ -781,6 +799,7 @@ export function createMachine(
       if (current === null) return;
       if (current !== expected) throw new Error('binary-changed');
       await fs.unlink(file);
+      await syncParentDirectory(file);
     },
     async npm(args, options) {
       try {
