@@ -555,7 +555,14 @@ async function prepareProgramRemoval(
     selection.id,
     'program-removed',
     'program.ready',
-    { kind, binary: program.binary, version: null, removed: true, removals: operations.map(operation => operation.id) },
+    {
+      kind,
+      binary: program.binary,
+      version: null,
+      removed: true,
+      preserveData: shouldPreserveData,
+      removals: operations.map(operation => operation.id),
+    },
     shouldPreserveData ? [{ code: 'keep-user-data' }] : [],
     operations.map(operation => operation.id),
   );
