@@ -1,10 +1,10 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-
 import { parse } from 'smol-toml';
 
 import { knownTitle } from './titles.js';
+import { applyFrozenJson, assessFrozenJson } from './frozen-json.js';
 import { ENABLED_PLUGINS_KEY } from './claude-config.js';
 import { errorCode, isObject, READ_COMMAND_TIMEOUT_MS, succeeded } from './machine.js';
 import { cancelled, commandReceipt, json } from './model.js';
@@ -305,47 +305,54 @@ export function createCcline(options: Context): Domain {
         const current = await fieldsAt();
         if (!p.shouldConnect && p.successor && fact.confirmed && facts[p.successor]?.attemptId)
           return { state: 'complete', evidence: { superseded: true } };
-        const matched =
-          p.selected.every(
-            field =>
-              isDeepStrictEqual(current[field], p.after[field]) ||
-              (!p.shouldConnect && fact.confirmed && !isCcline(current[field])),
-          ) &&
-          (!p.shouldConnect || isDeepStrictEqual(current.cclineHome ?? null, p.homeAfter));
-        if (matched)
-          return {
-            state: 'complete',
-            evidence: { matched: true },
-            effects: [
-              {
-                state: p.selected.length ? 'done' : 'kept',
-                code: p.shouldConnect ? 'connected' : p.selected.length ? 'disconnected' : 'no-connection',
-              },
+        const fields = p.selected.map(field => ({
+          path: [field],
+          before: { oneOf: [p.before[field]] },
+          after: {
+            oneOf: [
+              p.after[field],
+              ...(!p.shouldConnect && fact.confirmed && !isCcline(current[field]) ? [current[field]] : []),
             ],
-          };
-        if (
-          fact.confirmed ||
-          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
-          !p.selected.every(field => isDeepStrictEqual(current[field], p.before[field])) ||
-          (p.shouldConnect && !isDeepStrictEqual(current.cclineHome ?? null, p.homeBefore))
-        )
-          return { state: 'unknown', problem: 'connection-changed' };
-        return { state: 'ready' };
+          },
+        }));
+        if (p.shouldConnect)
+          fields.push({ path: ['cclineHome'], before: { oneOf: [p.homeBefore] }, after: { oneOf: [p.homeAfter] } });
+        const assessment = assessFrozenJson(
+          { ...current, cclineHome: current.cclineHome ?? null },
+          fields,
+          fact,
+          'connection-changed',
+        );
+        return assessment.state === 'complete'
+          ? {
+              ...assessment,
+              effects: [
+                {
+                  state: p.selected.length ? 'done' : 'kept',
+                  code: p.shouldConnect ? 'connected' : p.selected.length ? 'disconnected' : 'no-connection',
+                },
+              ],
+            }
+          : assessment;
       },
       async execute(definition) {
         const p = connectionPayload(definition);
         await effects.editJson(settingsFile, settings => {
-          for (const field of p.selected) {
-            if (!isDeepStrictEqual(settings[field], p.before[field])) throw new Error('connection-changed');
-            if (p.shouldConnect) settings[field] = p.after[field];
-            else delete settings[field];
-          }
           if (p.shouldConnect) {
             const env = settings.env === undefined ? {} : settings.env;
             if (!isObject(env)) throw new Error('invalid-settings');
             if (!isDeepStrictEqual(env.CCLINE_HOME ?? null, p.homeBefore)) throw new Error('connection-changed');
             if (p.configureHome) settings.env = { ...env, CCLINE_HOME: p.homeAfter };
           }
+          applyFrozenJson(
+            settings,
+            p.selected.map(field => ({
+              path: [field],
+              before: { oneOf: [p.before[field]] },
+              value: p.after[field],
+            })),
+            'connection-changed',
+          );
         });
         return { receipt: { kind: 'returned', failure: null } };
       },

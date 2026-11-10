@@ -321,27 +321,3 @@ export function cancelled(signal?: AbortSignal) {
 export function unchanged(value: unknown, expected: unknown) {
   if (!isDeepStrictEqual(value, expected)) throw new Error('target-changed');
 }
-
-/** 合并冻结字段；提交后通知，再回读确认 */
-export async function editFields(
-  ctx: Context,
-  file: string,
-  before: Record<string, unknown>,
-  changes: Record<string, unknown>,
-  parent?: string,
-  onWritten?: () => void,
-) {
-  await ctx.effects.editJson(file, document => {
-    const target = parent === undefined ? document : object(document[parent]);
-    for (const [key, value] of Object.entries(changes)) {
-      unchanged(target[key], before[key]);
-      if (value === undefined) delete target[key];
-      else target[key] = value;
-    }
-    if (parent !== undefined) document[parent] = target;
-  });
-  onWritten?.();
-  const after = await json(ctx.machine, file);
-  const values = parent === undefined ? after : object(after[parent]);
-  for (const [key, value] of Object.entries(changes)) unchanged(values[key], value);
-}

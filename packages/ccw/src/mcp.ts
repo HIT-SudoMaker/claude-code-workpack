@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { knownTitle } from './titles.js';
+import { applyFrozenJson, assessFrozenJson, jsonField } from './frozen-json.js';
 import { mcpSpecs, officeIntegration } from './management-catalog.js';
 import { errorCode, isObject } from './machine.js';
 import {
@@ -528,9 +529,20 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
             evidence: { superseded: true },
             effects: [{ state: 'done', code: 'registration-removed', detail: extensionString(p.name) }],
           };
-        if (target === p.after)
+        const assessment = assessFrozenJson(
+          { [MCP_SERVERS_KEY]: { [extensionString(p.name)]: current } },
+          [
+            {
+              path: [MCP_SERVERS_KEY, extensionString(p.name)],
+              before: extensionString(p.before),
+              after: extensionString(p.after),
+            },
+          ],
+          fact,
+        );
+        if (assessment.state === 'complete')
           return {
-            state: 'complete',
+            ...assessment,
             evidence: { matched: true, target },
             effects: [
               {
@@ -540,24 +552,17 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
               },
             ],
           };
-        if (
-          fact.confirmed ||
-          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
-          extensionDigest(current) !== p.before
-        )
-          return { state: 'unknown', problem: 'target-changed' };
-        return { state: 'ready', dispatch: { before: extensionString(p.before) } };
+        return assessment.state === 'ready'
+          ? { ...assessment, dispatch: { before: extensionString(p.before) } }
+          : assessment;
       },
       async execute(definition, _fact, inputs) {
         const p = definition.payload;
         await ctx.effects.editJson(ctx.stateFile, document => {
-          const registrations: Record<string, unknown> = isObject(document[MCP_SERVERS_KEY])
-            ? document[MCP_SERVERS_KEY]
-            : {};
-          unchanged(extensionDigest(registrations[extensionString(p.name)]), p.before);
-          if (p.target === null) delete registrations[extensionString(p.name)];
-          else {
-            const target = { ...extensionObject(p.target) };
+          const field = [MCP_SERVERS_KEY, extensionString(p.name)];
+          let target;
+          if (p.target !== null) {
+            target = { ...extensionObject(p.target) };
             if (p.credentialMode === 'input') {
               if (!inputs.secret) throw new Error('credential-required');
               target.headers = { Authorization: `Bearer ${inputs.secret}` };
@@ -569,15 +574,14 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
                 throw new Error('credential-required');
               }
             } else if (p.credentialMode === 'preserve') {
-              const existing = registrations[extensionString(p.name)];
+              const existing = jsonField(document, field);
               const headers = isObject(existing) ? existing.headers : undefined;
               unchanged(extensionDigest(headers), p.headers);
               target.headers = extensionObject(headers);
             }
             unchanged(extensionDigest(target), p.after);
-            registrations[extensionString(p.name)] = target;
           }
-          document[MCP_SERVERS_KEY] = registrations;
+          applyFrozenJson(document, [{ path: field, before: extensionString(p.before), value: target }]);
         });
         const receipt = { kind: 'returned' as const, failure: null };
         try {

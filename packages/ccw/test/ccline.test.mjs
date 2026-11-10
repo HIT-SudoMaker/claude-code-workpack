@@ -121,6 +121,17 @@ test('检查 CCometixLine：报告外观异常', async t => {
   assert.equal(plan.items[0].problem, item.problem);
 });
 
+test('冻结接入允许等价字段重排，保留嵌套自定义值', async t => {
+  const statusLine = { type: 'command', command: 'custom-status', custom: { z: 2, a: 1 } };
+  const f = await fixture(t, { installed: true, settings: { statusLine }, style: fixtureStyle });
+  const preview = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
+  assert.equal(preview.items[0].problem, null);
+  await f.json(f.file, { statusLine: { custom: { a: 1, z: 2 }, command: 'custom-status', type: 'command' } });
+  assert.equal((await f.ccw.apply(preview.id)).state, 'done');
+  assert.deepEqual((await f.readSettings()).statusLine, { ...statusLine, command: 'ccline', padding: 0 });
+  assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.file).length, 1);
+});
+
 test('重建操作实例：保留安装事实并只续办接入', async t => {
   const f = await fixture(t);
   f.faults.editJson.set(f.file, new Error('connection-write-failed'));

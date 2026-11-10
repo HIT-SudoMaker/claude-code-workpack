@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { isObject, treeFilesStamp } from './machine.js';
 import type { TreeFile } from './machine.js';
 import { SKILL_ENTRY } from './management-catalog.js';
@@ -14,10 +14,9 @@ import type {
   Prepared,
 } from './model.js';
 import { disabledDirectory, replacedDirectory, sourcesFile } from './storage.js';
+import { jsonFingerprint as extensionDigest } from './frozen-json.js';
+export { jsonFingerprint as extensionDigest } from './frozen-json.js';
 
-/** Fingerprints include absence without persisting the underlying document. */
-export const extensionDigest = (value: unknown): string =>
-  createHash('sha256').update(JSON.stringify({ value })).digest('hex');
 export function extensionString(value: unknown): string {
   if (typeof value !== 'string') throw new Error('operation-record-invalid');
   return value;
