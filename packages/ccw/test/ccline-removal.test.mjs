@@ -148,6 +148,31 @@ test('卸载手工 CCometixLine：跳过 npm', async t => {
   assert.equal(npmOf(f, 'uninstall').length, 0);
 });
 
+test('重建操作实例：卸载只继续尚未删除的二进制', async t => {
+  const f = await fixture(t);
+  const abort = new AbortController();
+  const first = await f.apply(abort.signal, event => {
+    if (event.kind === 'effect' && event.effect.code === 'package-removed') abort.abort();
+  });
+  assert.equal(first.state, 'cancelled');
+  assert.equal(await exists(f.binary), true);
+  const restarted = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  });
+  const resumed = await restarted.plan({ resume: first.remaining });
+  assert.ok(
+    !resumed.items[0].changes.some(change => change.code === 'program-uninstall' && change.detail.includes('npm')),
+  );
+  assert.equal((await restarted.apply(resumed.id)).state, 'done');
+  assert.equal(npmOf(f, 'uninstall').length, 1);
+  assert.equal(await exists(f.binary), false);
+  assert.equal(await fs.readFile(path.join(f.cclineRoot, 'models.toml'), 'utf8'), 'user models');
+});
+
 test('继续 CCometixLine 卸载：复核已解除入口', async t => {
   const f = await fixture(t, { packageInstalled: false });
   f.state.failSettingsRead = true;
@@ -250,7 +275,7 @@ test('卸载 home CCometixLine：保留未知 npm 包', async t => {
   assert.ok(
     result.items[0].effects.some(effect => effect.code === 'program-removal-unconfirmed' && effect.state === 'failed'),
   );
-  assert.equal(result.remaining, undefined);
+  assert.ok(result.remaining);
   assert.equal(npmOf(f, 'uninstall').length, 0);
 });
 
@@ -315,7 +340,7 @@ test('取消卸载 CCometixLine：保留剩余副本', async t => {
   };
   const first = await f.apply(controller.signal);
   assert.equal(first.state, 'cancelled');
-  assert.ok(first.items[0].effects.some(effect => effect.code === 'package-removed'));
+  assert.equal(f.state.version, null);
   assert.equal(await fs.readFile(f.binary, 'utf8'), 'known binary');
   const next = await f.ccw.plan({ resume: first.remaining });
   assert.equal(
@@ -368,7 +393,7 @@ test('重建 CCometixLine 入口：阻止继续卸载', async t => {
   await f.json(f.settingsFile, { statusLine: { type: 'command', command: 'ccline', padding: 9 } });
   const next = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(next.id);
-  assert.equal(result.state, 'failed');
+  assert.equal(result.state, 'partial');
   assert.ok(result.items[0].effects.some(effect => effect.code === 'connection-changed'));
   assert.equal(npmOf(f, 'uninstall').length, 0);
   assert.equal(f.state.version, '2.0.1');

@@ -166,8 +166,8 @@ export function createCcw(options: CcwOptions): Ccw {
           emit({ id, title, stage });
         },
       });
-      return controller.plan(submitted, async () => {
-        try {
+      return preparation.run({ ...(signal ? { signal } : {}), report() {} }, () =>
+        controller.plan(submitted, async () => {
           if ('resume' in submitted) throw new Error('plan-unavailable');
           const snapshot = submitted;
           if (new Set(snapshot.selected.map(pick => pick.id)).size !== snapshot.selected.length)
@@ -264,13 +264,10 @@ export function createCcw(options: CcwOptions): Ccw {
             await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
               preparation.getStore()?.report('inspect');
               const { changes, problem } = await attach(CLAUDE_DATA_ID, () =>
-                prepareClaudeDataRemoval(preparationContext, async () => {
-                  for (const selection of claudeRemovals) {
-                    const program = work.get(selection.id);
-                    if (!program?.verify) throw new Error('dependency-not-ready');
-                    await program.verify();
-                  }
-                }),
+                prepareClaudeDataRemoval(
+                  preparationContext,
+                  claudeRemovals.map(selection => `${selection.id}/program-removed`),
+                ),
               );
               items.push({
                 id: CLAUDE_DATA_ID,
@@ -284,13 +281,12 @@ export function createCcw(options: CcwOptions): Ccw {
           const plan: Plan = { id: randomUUID(), items, problem: items.length === 0 ? 'empty-selection' : null };
           cancelled(signal);
           return { plan, work };
-        } finally {
-          preparation.disable();
-        }
-      });
+        }),
+      );
     },
     recovery: () => controller.recovery(),
     abandon: id => controller.abandon(id),
-    apply: (id, signal, progress) => controller.apply(id, signal, progress),
+    apply: (id, signal, progress) =>
+      preparation.run({ ...(signal ? { signal } : {}), report() {} }, () => controller.apply(id, signal, progress)),
   };
 }

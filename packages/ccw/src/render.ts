@@ -273,6 +273,7 @@ export const TEXT: Readonly<Record<string, MessageText>> = {
   'program-not-installed': { brief: '程序未安装', detail: '程序未安装' },
   'program-removal-confirm': { brief: '确认程序卸载', detail: '确认程序卸载' },
   'program-installation-confirm': { brief: '确认程序安装', detail: '确认程序安装' },
+  'operation-result-check': { brief: '核对已派发操作', detail: '核对已派发操作的实际结果' },
   'program-uninstall-command-completed': { brief: '卸载命令完成', detail: '执行卸载命令；确认程序状态' },
   'unrecognized-program-kept': { brief: '程序已保留', detail: '保留身份未知的程序文件' },
   'office-skill-connected': { brief: '技能已接入', detail: 'OfficeCLI Skill 已添加' },
