@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { knownTitle } from './titles.js';
-import { mcpSpecs } from './management-catalog.js';
+import { mcpSpecs, officeIntegration } from './management-catalog.js';
 import { errorCode, isObject } from './machine.js';
 import { MCP_SERVERS_KEY, readMcpServers, restOf, success, unchanged, userBinary, userBinDirectory } from './model.js';
 import { isExactVersion } from './npm-registry.js';
@@ -219,7 +219,7 @@ export async function prepareMcp(
     credentialMode = selection.fields?.secret ? 'input' : value.headers !== undefined ? 'preserve' : 'none';
   } else if (options.registration) {
     target = options.registration();
-    if (target.headers !== undefined || target.env !== undefined)
+    if (target.headers !== undefined || target.env !== undefined && (name !== 'officecli' || extensionDigest(target.env) !== extensionDigest(officeIntegration.mcp.env)))
       throw new Error('registration-credential-unsupported');
   } else {
     const release: unknown = JSON.parse(await ctx.machine.fetchText(mcpSpecs.serena.release.metadataUrl));
