@@ -35,6 +35,7 @@ export interface CommandOptions {
 }
 type ReadOptions = Pick<CommandOptions, 'timeoutMs' | 'signal'>;
 export interface Machine {
+  npmIdentity(): Promise<{ readonly entry: string; readonly binary: string; readonly stamp: string }>;
   read(file: string): Promise<string | null>;
   fingerprint(file: string, signal?: AbortSignal): Promise<string | null>;
   initialize(file: string, text: string): Promise<boolean>;
@@ -72,6 +73,7 @@ export interface Machine {
 /** 观察与来源暂存能力；不含任何受管目标写入方法。命令仍需经过可信查询门。 */
 export type ReadMachine = Pick<
   Machine,
+  | 'npmIdentity'
   | 'read'
   | 'fingerprint'
   | 'npm'
@@ -800,6 +802,12 @@ export function createMachine(
       if (current !== expected) throw new Error('binary-changed');
       await fs.unlink(file);
       await syncParentDirectory(file);
+    },
+    async npmIdentity() {
+      const tool = await resolveNpm();
+      if ((await fs.realpath(tool.entry)) !== tool.binary || (await fingerprint(tool.binary)) !== tool.stamp)
+        throw new Error('npm-changed');
+      return { ...tool };
     },
     async npm(args, options) {
       try {

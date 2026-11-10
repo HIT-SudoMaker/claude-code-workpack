@@ -22,7 +22,8 @@ export interface Program {
   readonly npmRoot?: string;
 }
 
-interface ProgramScope {
+export interface ProgramScope {
+  readonly data: FrozenProgramScope;
   readonly verify: () => Promise<void>;
   readonly matches: (program: Program) => Promise<boolean>;
   readonly manager?: string;
@@ -30,6 +31,7 @@ interface ProgramScope {
 }
 
 export interface NpmScope {
+  readonly data: FrozenNpmScope;
   readonly npmRoot: string;
   readonly args: readonly string[];
   readonly verify: () => Promise<void>;
@@ -93,17 +95,54 @@ export async function npmGlobalRoot(ctx: Context, expected?: string) {
   return root;
 }
 
-/** 冻结 npm 全局根；变更命令沿用显式前缀，继续前复核当前上下文 */
+export interface FrozenNpmScope {
+  readonly npmRoot: string;
+  readonly canonical: string;
+  readonly args: readonly string[];
+  readonly identity: { readonly entry: string; readonly binary: string; readonly stamp: string };
+}
+export interface FrozenProgramScope {
+  readonly channel: Program['channel'];
+  readonly binary: string;
+  readonly npm?: FrozenNpmScope;
+  readonly manager?: string;
+  readonly executable?: string;
+  readonly managerStamp?: string;
+  readonly root?: string;
+  readonly packageRoot?: string;
+  readonly scoop?: string;
+}
+export async function verifyNpmScope(ctx: Context, scope: FrozenNpmScope) {
+  const identity = await ctx.machine.npmIdentity();
+  if (
+    identity.entry !== scope.identity.entry ||
+    identity.binary !== scope.identity.binary ||
+    identity.stamp !== scope.identity.stamp
+  )
+    throw new Error('program-scope-unconfirmed');
+  for (const root of [await npmGlobalRoot(ctx), await npmGlobalRoot(ctx, scope.npmRoot)])
+    if (!(await matchesNpmScope(ctx, scope, root))) throw new Error('program-scope-unconfirmed');
+}
+export async function matchesNpmScope(ctx: Context, scope: FrozenNpmScope, root: string) {
+  return samePath(ctx, (await ctx.machine.realpath(root)) ?? root, scope.canonical);
+}
+/** Frozen values are durable; compatibility methods do not own progress. */
 export async function freezeNpmScope(ctx: Context, root?: string): Promise<NpmScope> {
   const npmRoot = root ?? (await npmGlobalRoot(ctx));
-  const canonical = (await ctx.machine.realpath(npmRoot)) ?? npmRoot;
-  const matches = async (current: string) => samePath(ctx, (await ctx.machine.realpath(current)) ?? current, canonical);
-  const verify = async () => {
-    if (!(await matches(await npmGlobalRoot(ctx))) || !(await matches(await npmGlobalRoot(ctx, npmRoot))))
-      throw new Error('program-scope-unconfirmed');
+  const data: FrozenNpmScope = {
+    npmRoot,
+    canonical: (await ctx.machine.realpath(npmRoot)) ?? npmRoot,
+    args: npmScopeArgs(ctx, npmRoot),
+    identity: await ctx.machine.npmIdentity(),
   };
-  await verify();
-  return { npmRoot, args: npmScopeArgs(ctx, npmRoot), verify, matches };
+  await verifyNpmScope(ctx, data);
+  return {
+    data,
+    npmRoot,
+    args: data.args,
+    verify: () => verifyNpmScope(ctx, data),
+    matches: root => matchesNpmScope(ctx, data, root),
+  };
 }
 
 export async function npmVersion(
@@ -294,78 +333,80 @@ async function brewPackage(ctx: Context, program: Program, manager: string) {
     throw new Error('program-scope-unconfirmed');
 }
 
-/** 冻结管理器与安装根；后续观察只能匹配同一包的副本 */
+/** Freeze manager identity and scope once; recovery only verifies those values. */
 export async function freezeProgramScope(ctx: Context, program: Program): Promise<ProgramScope> {
-  const matches = (candidate: Program) =>
-    Promise.resolve(candidate.channel === program.channel && samePath(ctx, candidate.binary, program.binary));
+  let data: FrozenProgramScope = { channel: program.channel, binary: program.binary };
   if (program.channel === 'npm') {
-    const scope = await freezeNpmScope(ctx, program.npmRoot);
-    if (!samePath(ctx, await npmBinary(ctx, program.kind, scope.npmRoot), program.binary))
+    const npm = (await freezeNpmScope(ctx, program.npmRoot)).data;
+    if (!samePath(ctx, await npmBinary(ctx, program.kind, npm.npmRoot), program.binary))
       throw new Error('program-scope-unconfirmed');
-    return {
-      npmRoot: scope.npmRoot,
-      verify: scope.verify,
-      matches: async candidate =>
-        candidate.channel === 'npm' && candidate.npmRoot !== undefined && (await scope.matches(candidate.npmRoot)),
-    };
-  }
-  if (program.channel === 'brew') {
+    data = { ...data, npm };
+  } else if (program.channel === 'brew') {
     const canonical = await ctx.machine.realpath(program.binary);
     const collection = program.kind === 'claude' ? 'Caskroom' : 'Cellar';
-    const marker = `${path.sep}${collection}${path.sep}${program.packageName}${path.sep}`;
+    const marker = path.sep + collection + path.sep + program.packageName + path.sep;
     const index = canonical?.indexOf(marker) ?? -1;
     if (canonical === null || index < 0) throw new Error('program-scope-unconfirmed');
     const root = canonical.slice(0, index);
-    const packageRoot = path.join(root, collection, program.packageName);
     const manager = path.join(root, 'bin/brew');
     const executable = await ctx.machine.realpath(manager);
-    const stamp = executable === null ? null : await ctx.machine.treeStamp(executable);
-    if (executable === null || stamp === null) throw new Error('program-scope-unconfirmed');
-    const verify = async () => {
-      const current = await ctx.machine.realpath(manager);
-      if (current === null || !samePath(ctx, current, executable) || (await ctx.machine.treeStamp(current)) !== stamp)
-        throw new Error('program-scope-unconfirmed');
-      const result = await ctx.machine.execute(manager, [collection === 'Cellar' ? '--cellar' : '--caskroom'], {
-        env: BREW_ENV,
-      });
-      const location = result.stdout.trim();
-      if (
-        !succeeded(result) ||
-        !path.isAbsolute(location) ||
-        /[\r\n]/.test(location) ||
-        !samePath(ctx, (await ctx.machine.realpath(location)) ?? location, path.join(root, collection))
-      )
-        throw new Error('program-scope-unconfirmed');
-    };
-    await verify();
-    await brewPackage(ctx, program, manager);
-    return {
+    const managerStamp = executable === null ? null : await ctx.machine.treeStamp(executable);
+    if (executable === null || managerStamp === null) throw new Error('program-scope-unconfirmed');
+    data = {
+      ...data,
+      root,
       manager,
-      verify,
-      matches: async candidate => {
-        const current = await ctx.machine.realpath(candidate.binary);
-        return (
-          candidate.channel === 'brew' &&
-          candidate.packageName === program.packageName &&
-          current !== null &&
-          containsPath(ctx, packageRoot, current)
-        );
-      },
+      executable,
+      managerStamp,
+      packageRoot: path.join(root, collection, program.packageName),
     };
+    await brewPackage(ctx, program, manager);
+  } else if (program.channel === 'scoop') data = { ...data, scoop: await scoopTarget(ctx, program) };
+  await verifyProgramScope(ctx, data, program);
+  return programScope(ctx, data, program);
+}
+export function programScope(ctx: Context, data: FrozenProgramScope, program: Program): ProgramScope {
+  return {
+    data,
+    ...(data.npm ? { npmRoot: data.npm.npmRoot } : {}),
+    ...(data.manager ? { manager: data.manager } : {}),
+    verify: () => verifyProgramScope(ctx, data, program),
+    matches: candidate => matchesProgramScope(ctx, data, candidate),
+  };
+}
+export async function verifyProgramScope(ctx: Context, scope: FrozenProgramScope, program: Program) {
+  if (scope.npm) return verifyNpmScope(ctx, scope.npm);
+  if (scope.channel === 'brew') {
+    const current = await ctx.machine.realpath(scope.manager!);
+    if (
+      current !== scope.executable ||
+      current === null ||
+      (await ctx.machine.treeStamp(current)) !== scope.managerStamp
+    )
+      throw new Error('program-scope-unconfirmed');
+    const collection = program.kind === 'claude' ? 'Caskroom' : 'Cellar';
+    const result = await ctx.machine.execute(scope.manager!, [collection === 'Cellar' ? '--cellar' : '--caskroom'], {
+      env: BREW_ENV,
+    });
+    const location = result.stdout.trim();
+    if (
+      !succeeded(result) ||
+      !path.isAbsolute(location) ||
+      /[\r\n]/.test(location) ||
+      !samePath(ctx, (await ctx.machine.realpath(location)) ?? location, path.join(scope.root!, collection))
+    )
+      throw new Error('program-scope-unconfirmed');
   }
-  if (program.channel === 'scoop') {
-    const expected = await scoopTarget(ctx, program);
-    return {
-      verify: async () => {
-        if (!samePath(ctx, await scoopTarget(ctx, program), expected)) throw new Error('program-scope-unconfirmed');
-      },
-      matches: async candidate => {
-        const current = await ctx.machine.realpath(candidate.binary);
-        return candidate.channel === 'scoop' && current !== null && containsPath(ctx, path.dirname(expected), current);
-      },
-    };
-  }
-  return { verify: async () => {}, matches };
+  if (scope.scoop && !samePath(ctx, await scoopTarget(ctx, program), scope.scoop))
+    throw new Error('program-scope-unconfirmed');
+}
+export async function matchesProgramScope(ctx: Context, scope: FrozenProgramScope, candidate: Program) {
+  if (candidate.channel !== scope.channel) return false;
+  if (scope.npm) return candidate.npmRoot !== undefined && matchesNpmScope(ctx, scope.npm, candidate.npmRoot);
+  const current = await ctx.machine.realpath(candidate.binary);
+  if (scope.packageRoot) return current !== null && containsPath(ctx, scope.packageRoot, current);
+  if (scope.scoop) return current !== null && containsPath(ctx, path.dirname(scope.scoop), current);
+  return samePath(ctx, candidate.binary, scope.binary);
 }
 
 /** npm 渠道占用前复核：版本与二进制位都未变才继续 */
@@ -375,6 +416,12 @@ async function ensureNpmProgramUnchanged(ctx: Context, program: Program, scope: 
     !samePath(ctx, await npmBinary(ctx, program.kind, scope.npmRoot), program.binary)
   )
     throw new Error('program-changed');
+}
+
+export async function verifyProgramBeforeCommand(ctx: Context, program: Program, scope: ProgramScope) {
+  await scope.verify();
+  if (program.channel === 'npm') await ensureNpmProgramUnchanged(ctx, program, scope);
+  if (program.channel === 'brew') await brewPackage(ctx, program, scope.manager ?? '');
 }
 
 /** 渠道命令分发尾：解包校验命令并先行 brew 包裹，执行与成功判据由调用方决定 */
@@ -398,8 +445,7 @@ export async function maintainProgramChannel(
   action: 'install' | 'update' | 'reinstall',
   targetVersion: string | null,
   targetRegistry: NpmRegistry | undefined,
-  packageCommandCompleted: () => Promise<void>,
-): Promise<void> {
+): Promise<CommandResult> {
   if (program.channel === 'manual') throw new Error('channel-not-supported');
   if (program.channel === 'npm') {
     await ensureNpmProgramUnchanged(ctx, program, scope);
@@ -414,21 +460,15 @@ export async function maintainProgramChannel(
       ],
       targetRegistry ?? null,
     );
-    success(await ctx.effects.npm(args));
-    await packageCommandCompleted();
-    return;
+    return ctx.effects.npm(args);
   }
   if (program.channel === 'native') {
     if (program.kind !== 'claude' || targetVersion === null) throw new Error('channel-not-supported');
-    success(
-      await ctx.effects.execute(
-        program.binary,
-        ['install', targetVersion, ...(action === 'reinstall' ? ['--force'] : [])],
-        { env: claudeEnvironment(ctx), cwd: ctx.home },
-      ),
+    return ctx.effects.execute(
+      program.binary,
+      ['install', targetVersion, ...(action === 'reinstall' ? ['--force'] : [])],
+      { env: claudeEnvironment(ctx), cwd: ctx.home },
     );
-    await packageCommandCompleted();
-    return;
   }
   const commands: Partial<Record<ProgramChannel, readonly string[]>> = {
     brew: [
@@ -457,8 +497,7 @@ export async function maintainProgramChannel(
     apk: ['apk', action === 'reinstall' ? 'fix' : 'upgrade', program.packageName],
   };
   const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
-  success(await ctx.effects.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined));
-  await packageCommandCompleted();
+  return ctx.effects.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined);
 }
 
 export async function removeProgramChannel(

@@ -145,6 +145,7 @@ export function createReadMachine(
     }
   };
   return {
+    npmIdentity: () => read(() => machine.npmIdentity()),
     read: shared(file => read(() => machine.read(file))),
     entries: shared(directory => read(() => machine.entries(directory))),
     realpath: shared(file => read(() => machine.realpath(file))),
