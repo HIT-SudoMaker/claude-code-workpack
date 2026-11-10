@@ -17,7 +17,7 @@ export const installScratch = (ctx: Context, name: string) =>
 /** apply 后尽力落盘最近执行摘要：写入失败静默吞掉，不抛给调用方、不影响执行结果 */
 export async function writeLastRun(ctx: Context, plan: Plan, result: RunResult, remaining: string | undefined) {
   try {
-    await ctx.machine.editJson(lastRunFile(ctx), values => {
+    await ctx.effects.editJson(lastRunFile(ctx), values => {
       values.schema = 1;
       values.planId = plan.id;
       values.finishedAt = new Date().toISOString();

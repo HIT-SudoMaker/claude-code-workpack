@@ -142,7 +142,7 @@ export async function collectLogs(ccw: Ccw, options: CcwOptions): Promise<Collec
   const text = redactText(foldText(ctx, report));
   let file = path.join(directory, `${base}.md`);
   let attempt = 0;
-  while (!(await ctx.machine.initialize(file, text))) {
+  while (!(await ctx.effects.initialize(file, text))) {
     if (++attempt >= 100) throw new Error('report-name-conflict');
     file = path.join(directory, `${base}-${attempt}.md`);
   }

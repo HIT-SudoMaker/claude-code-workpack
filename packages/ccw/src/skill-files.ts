@@ -57,7 +57,7 @@ async function saveSkillSource(
 ) {
   const file = sourcesFile(ctx);
   try {
-    await ctx.machine.editJson(file, values => {
+    await ctx.effects.editJson(file, values => {
       unchanged(values[target.directory], target.sourceRecord);
       values[target.directory] = { repository: source.repository, revision: source.revision, stamp: source.stamp };
     });
@@ -85,7 +85,7 @@ export function prepareSkillFiles(ctx: Context, target: SkillTarget, source: Ski
     async run(report, signal) {
       cancelled(signal);
       if (!isDeployed) {
-        await ctx.machine.replaceTree(directory, source.files, before, destination);
+        await ctx.effects.replaceTree(directory, source.files, before, destination);
         isDeployed = true;
         report({ state: 'done', code: 'skill-installed', detail: name });
       }
@@ -111,7 +111,7 @@ export function disableSkillEntry(ctx: Context, directory: string, before: strin
       { code: 'keep-link-target' },
     ],
     async run(report) {
-      await ctx.machine.removeTree(directory, before, destination);
+      await ctx.effects.removeTree(directory, before, destination);
       report({ state: 'done', code: 'entry-disabled', detail: destination });
       // 解除后清除该路径的过期来源记录（防误归属旧套件）；失败只降级提示
       let metadata: Record<string, unknown> | null;
@@ -124,7 +124,7 @@ export function disableSkillEntry(ctx: Context, directory: string, before: strin
       }
       if (metadata !== null && Object.hasOwn(metadata, directory))
         try {
-          await ctx.machine.editJson(records, values => {
+          await ctx.effects.editJson(records, values => {
             delete values[directory];
           });
         } catch {

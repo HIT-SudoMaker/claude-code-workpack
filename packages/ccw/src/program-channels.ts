@@ -414,14 +414,14 @@ export async function maintainProgramChannel(
       ],
       targetRegistry ?? null,
     );
-    success(await ctx.machine.npm(args));
+    success(await ctx.effects.npm(args));
     await packageCommandCompleted();
     return;
   }
   if (program.channel === 'native') {
     if (program.kind !== 'claude' || targetVersion === null) throw new Error('channel-not-supported');
     success(
-      await ctx.machine.execute(
+      await ctx.effects.execute(
         program.binary,
         ['install', targetVersion, ...(action === 'reinstall' ? ['--force'] : [])],
         { env: claudeEnvironment(ctx), cwd: ctx.home },
@@ -457,7 +457,7 @@ export async function maintainProgramChannel(
     apk: ['apk', action === 'reinstall' ? 'fix' : 'upgrade', program.packageName],
   };
   const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
-  success(await ctx.machine.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined));
+  success(await ctx.effects.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined));
   await packageCommandCompleted();
 }
 
@@ -468,7 +468,7 @@ export async function removeProgramChannel(
 ): Promise<CommandResult> {
   if (program.channel === 'npm') {
     await ensureNpmProgramUnchanged(ctx, program, scope);
-    return ctx.machine.npm(
+    return ctx.effects.npm(
       npmUninstallArgs(['uninstall', '-g', ...npmScopeArgs(ctx, scope.npmRoot), PROGRAM_PACKAGES[program.kind]]),
     );
   }
@@ -481,7 +481,7 @@ export async function removeProgramChannel(
     apk: ['apk', 'del', program.packageName],
   };
   const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
-  return ctx.machine.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined);
+  return ctx.effects.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined);
 }
 
 export async function programPackageAbsent(

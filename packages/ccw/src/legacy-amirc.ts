@@ -47,7 +47,7 @@ export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> 
       cancelled(signal);
       const current = allowedTools(await json(ctx.machine, ctx.settingsFile));
       if (selected.length && !isWritten && (!hasAttemptedWrite || current.some(rule => OWNED_RULES.includes(rule)))) {
-        await ctx.machine.editJson(ctx.settingsFile, settings => {
+        await ctx.effects.editJson(ctx.settingsFile, settings => {
           const allow = allowedTools(settings);
           unchanged(
             OWNED_RULES.filter(rule => allow.includes(rule)),

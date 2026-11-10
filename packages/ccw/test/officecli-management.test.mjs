@@ -565,25 +565,81 @@ async function releaseFixture(t) {
   });
   Object.assign(f.state, { sourceFailure: false, failReplaceTree: null, fail: '' });
   const release = releaseContract({ tag: 'v1.0.123', asset, digest: officeDigest, revision: officeRevision });
+  const mirror = 'https://d.officecli.ai/releases/download/v1.0.123/';
   f.machine.fetchText = async url => {
     f.calls.push({ kind: 'fetch', target: url });
+    if (f.state.failManifest && url === release.release + 'SHA256SUMS')
+      throw new Error(f.state.manifestError ?? 'source-timeout');
+    if (url === mirror + 'SHA256SUMS') return release.fetchText(release.release + 'SHA256SUMS');
     return release.fetchText(url);
   };
   f.machine.fetchBytes = async url => {
     f.calls.push({ kind: 'bytes', target: url });
-    assert.equal(url, release.release + asset);
+    if (f.state.failDownload && url === release.release + asset) throw new Error('source-timeout');
+    assert.ok(url === release.release + asset || url === mirror + asset);
+    if (f.state.badMirror && url === mirror + asset) return Buffer.from('corrupted mirror response');
     return officePayload;
   };
   const replaceFile = f.machine.replaceFile;
   f.machine.replaceFile = async (file, data, expected, executable) => {
     f.calls.push({ kind: 'replaceFile', target: file });
     if (f.state.fail === 'office-native-replace' && file === f.native) throw new Error('office-native-replace-failed');
-    return replaceFile(file, data, expected, executable);
+    await replaceFile(file, data, expected, executable);
+    f.state.abortAfterReplace?.abort();
+    if (f.state.failReadAfterReplace && file === f.native) {
+      f.state.failReadAfterReplace = false;
+      f.state.pendingFingerprintFailure = true;
+    }
+    if (f.state.failAfterReplace && file === f.native) {
+      f.state.failAfterReplace = false;
+      throw new Error('office-native-replace-receipt-lost');
+    }
+  };
+  const fingerprint = f.machine.fingerprint;
+  f.machine.fingerprint = async (file, signal) => {
+    if (f.state.pendingFingerprintFailure && file === f.native) {
+      f.state.pendingFingerprintFailure = false;
+      throw new Error('office-native-confirmation-unavailable');
+    }
+    if (f.state.driftMcpAtAssessment && file === f.native) {
+      const state = JSON.parse(await fs.readFile(f.stateFile, 'utf8').catch(() => '{}'));
+      if (state.mcpServers?.officecli) {
+        f.state.driftMcpAtAssessment = false;
+        state.mcpServers.officecli.command = 'foreign-user-program';
+        await f.json(f.stateFile, state);
+      }
+    }
+    return fingerprint(file, signal);
+  };
+  const removeTree = f.machine.removeTree;
+  f.machine.removeTree = async (file, expected, preserveAt) => {
+    f.calls.push({ kind: 'removeTree', target: file });
+    await removeTree(file, expected, preserveAt);
+    f.state.abortAfterRemove?.abort();
+    if (f.state.failAfterRemove === file) {
+      f.state.failAfterRemove = null;
+      throw new Error('office-native-remove-receipt-lost');
+    }
+  };
+  const pathRecord = path.join(f.home, 'sandbox-path.txt');
+  f.machine.ensureUserPath = async directory => {
+    f.calls.push({ kind: 'ensureUserPath', target: directory });
+    await f.write(pathRecord, directory);
+    f.state.abortAfterPath?.abort();
+    if (f.state.failAfterPath) {
+      f.state.failAfterPath = false;
+      throw new Error('office-native-path-receipt-lost');
+    }
   };
   const replaceTree = f.machine.replaceTree;
   f.machine.replaceTree = async (...args) => {
     if (f.state.failReplaceTree) throw new Error('fixture-write-failed');
-    return replaceTree(...args);
+    await replaceTree(...args);
+    if (f.state.driftNativeAfterSkill && args[0] === f.skill) {
+      const content = f.state.driftNativeAfterSkill;
+      f.state.driftNativeAfterSkill = null;
+      await f.write(f.native, content);
+    }
   };
   const source = f.machine.source;
   f.machine.source = async (...args) => {
@@ -593,6 +649,7 @@ async function releaseFixture(t) {
   // createReadMachine 在构造时展开 machine；replaceFile/replaceTree 故障包装必须先于 ccw 构造就位
   return {
     ...f,
+    pathRecord,
     ccw: createCcw({
       machine: f.machine,
       home: f.home,
@@ -602,6 +659,285 @@ async function releaseFixture(t) {
     }),
   };
 }
+
+test('OfficeCLI 写入已落地但返回丢失：续办先确认，不重复部署或下载', async t => {
+  const f = await releaseFixture(t);
+  f.state.failAfterReplace = true;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  const first = await f.ccw.apply(plan.id);
+  assert.notEqual(first.state, 'done');
+  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  const replacements = f.calls.filter(call => call.kind === 'replaceFile').length;
+  const downloads = f.calls.filter(call => call.kind === 'bytes').length;
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  assert.ok(resumed.items[0].changes.some(change => change.code === 'program-installation-confirm'));
+  const result = await f.ccw.apply(resumed.id);
+  assert.equal(result.state, 'done', JSON.stringify(result));
+  assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, replacements);
+  assert.equal(f.calls.filter(call => call.kind === 'bytes').length, downloads);
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  assert.ok(await exists(path.join(f.skill, 'SKILL.md')));
+});
+
+test('OfficeCLI 写入后的回读暂时失败：续办确认原文件，不重复部署', async t => {
+  const f = await releaseFixture(t);
+  f.state.failReadAfterReplace = true;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  const first = await f.ccw.apply(plan.id);
+  assert.notEqual(first.state, 'done');
+  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  const deployments = f.calls.filter(call => call.kind === 'replaceFile').length;
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+});
+
+test('OfficeCLI 清理已落地但返回丢失：续办复核缺失，不重复删除', async t => {
+  const f = await releaseFixture(t);
+  const leftover = f.native + '.update.partial';
+  await f.write(leftover, 'partial updater payload');
+  f.state.failAfterRemove = leftover;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  const first = await f.ccw.apply(plan.id);
+  assert.notEqual(first.state, 'done');
+  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(await exists(leftover), false);
+  const removals = f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length;
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  assert.equal(f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length, removals);
+  assert.equal(await exists(leftover), false);
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+});
+
+test('OfficeCLI 清理返回丢失后残留被重建：续办保护新内容', async t => {
+  const f = await releaseFixture(t);
+  const leftover = f.native + '.update.partial';
+  await f.write(leftover, 'original partial updater payload');
+  f.state.failAfterRemove = leftover;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  const first = await f.ccw.apply(plan.id);
+  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(await exists(leftover), false);
+  await f.write(leftover, 'new unrelated updater payload');
+  const removals = f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length;
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  const result = await f.ccw.apply(resumed.id);
+  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.equal(await fs.readFile(leftover, 'utf8'), 'new unrelated updater payload');
+  assert.equal(f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length, removals);
+  assert.equal(await exists(f.native), false);
+});
+
+for (const changeBinary of [false, true])
+  test(`OfficeCLI 路径写入后返回丢失：${changeBinary ? '续办拒绝程序变化' : '幂等重试路径但不重部署'}`, async t => {
+    const f = await releaseFixture(t);
+    f.state.failAfterPath = true;
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+    const first = await f.ccw.apply(plan.id);
+    assert.ok(first.remaining, JSON.stringify(first));
+    assert.equal(await fs.readFile(f.pathRecord, 'utf8'), path.dirname(f.native));
+    if (changeBinary) await f.write(f.native, 'user replaced program');
+    const deployments = f.calls.filter(call => call.kind === 'replaceFile').length;
+    const pathWrites = f.calls.filter(call => call.kind === 'ensureUserPath').length;
+    const resumed = await f.ccw.plan({ resume: first.remaining });
+    const result = await f.ccw.apply(resumed.id);
+    assert.equal(result.state, changeBinary ? 'failed' : 'done', JSON.stringify(result));
+    assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
+    assert.equal(
+      await fs.readFile(f.native, 'utf8'),
+      changeBinary ? 'user replaced program' : officePayload.toString(),
+    );
+    if (changeBinary) assert.equal(f.calls.filter(call => call.kind === 'ensureUserPath').length, pathWrites);
+  });
+
+test('OfficeCLI 接入失败后程序被替换：续办不得覆盖或继续接入', async t => {
+  const f = await releaseFixture(t);
+  f.state.failReplaceTree = true;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  const first = await f.ccw.apply(plan.id);
+  assert.equal(first.state, 'partial', JSON.stringify(first));
+  assert.ok(first.remaining);
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  f.state.failReplaceTree = false;
+  await f.write(f.native, 'user supplied replacement');
+  const deployments = f.calls.filter(call => call.kind === 'replaceFile').length;
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  const result = await f.ccw.apply(resumed.id);
+  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.equal(await fs.readFile(f.native, 'utf8'), 'user supplied replacement');
+  assert.equal(await exists(path.join(f.skill, 'SKILL.md')), false);
+  assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
+});
+
+test('OfficeCLI 接入时程序漂移：首次执行最终复核拒绝完成并保留外部程序', async t => {
+  const f = await releaseFixture(t);
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  f.state.driftNativeAfterSkill = 'externally replaced during skill integration';
+  const result = await f.ccw.apply(plan.id);
+  assert.notEqual(result.state, 'done', JSON.stringify(result));
+  assert.equal(result.items[0].effects.at(-1).code, 'program-changed');
+  assert.equal(await fs.readFile(f.native, 'utf8'), 'externally replaced during skill integration');
+  assert.equal(f.calls.filter(call => call.kind === 'replaceFile' && call.target === f.native).length, 1);
+  assert.ok(await exists(path.join(f.skill, 'SKILL.md')));
+});
+
+for (const connection of ['mcp', 'both'])
+  test(`OfficeCLI ${connection} 注册在完成复核前漂移：保留外部配置并拒绝完成`, async t => {
+    const f = await releaseFixture(t);
+    f.state.driftMcpAtAssessment = true;
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli', fields: { connection } }] });
+    assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+    const result = await f.ccw.apply(plan.id);
+    assert.notEqual(result.state, 'done', JSON.stringify(result));
+    assert.equal(result.items[0].effects.at(-1).code, 'target-changed');
+    assert.equal((await f.read(f.stateFile)).mcpServers.officecli.command, 'foreign-user-program');
+    assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, 1);
+  });
+
+for (const abortAt of ['abortAfterRemove', 'abortAfterReplace', 'abortAfterPath'])
+  test(`OfficeCLI ${abortAt}：效果后取消，续办不重复已确认的文件操作`, async t => {
+    const f = await releaseFixture(t);
+    const leftover = f.native + '.update';
+    await f.write(leftover, 'leftover update');
+    const abort = new AbortController();
+    f.state[abortAt] = abort;
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+    assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+    const first = await f.ccw.apply(plan.id, abort.signal);
+    assert.equal(first.state, 'cancelled', JSON.stringify(first));
+    assert.ok(first.remaining);
+    const downloads = f.calls.filter(call => call.kind === 'bytes').length;
+    const resumed = await f.ccw.plan({ resume: first.remaining });
+    const result = await f.ccw.apply(resumed.id);
+    assert.equal(result.state, 'done', JSON.stringify(result));
+    assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+    assert.equal(f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length, 1);
+    assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, 1);
+    assert.equal(f.calls.filter(call => call.kind === 'bytes').length, downloads);
+  });
+
+test('OfficeCLI 同字节重装返回丢失：保留未决尝试并使用冻结资源续办', async t => {
+  const f = await releaseFixture(t);
+  await f.write(f.native, officePayload);
+  const document = path.join(f.home, 'documents', 'keep.docx');
+  await f.write(document, 'protected document');
+  f.state.failAfterReplace = true;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli', maintenance: 'reinstall' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  const first = await f.ccw.apply(plan.id);
+  assert.notEqual(first.state, 'done');
+  assert.ok(first.remaining);
+  const downloads = f.calls.filter(call => call.kind === 'bytes').length;
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  assert.equal(await fs.readFile(document, 'utf8'), 'protected document');
+  assert.equal(f.calls.filter(call => call.kind === 'bytes').length, downloads);
+});
+
+test('OfficeCLI MCP 注册失败后已装技能被编辑：续办保留本地技能并阻止注册', async t => {
+  const f = await releaseFixture(t);
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli', fields: { connection: 'both' } }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  f.faults.editJson.set(f.stateFile, new Error('office-mcp-save-unavailable'));
+  const first = await f.ccw.apply(plan.id);
+  assert.equal(first.state, 'partial', JSON.stringify(first));
+  assert.ok(first.remaining);
+  assert.ok(await exists(path.join(f.skill, 'SKILL.md')));
+  await f.write(path.join(f.skill, 'SKILL.md'), 'user edited installed skill');
+  f.faults.editJson.delete(f.stateFile);
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  const result = await f.ccw.apply(resumed.id);
+  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.equal(await fs.readFile(path.join(f.skill, 'SKILL.md'), 'utf8'), 'user edited installed skill');
+  const state = JSON.parse(await fs.readFile(f.stateFile, 'utf8').catch(() => '{}'));
+  assert.equal(state.mcpServers?.officecli, undefined);
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+});
+
+test('更新已是发布原件的 OfficeCLI：不重复下载或替换程序', async t => {
+  const f = await releaseFixture(t);
+  await f.write(f.native, officePayload);
+  await f.write(f.native + '.update.partial', 'interrupted self-update');
+  f.state.failDownload = true;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli', maintenance: 'update' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  assert.equal((await f.ccw.apply(plan.id)).state, 'done');
+  assert.equal(
+    f.calls.some(call => call.kind === 'bytes' || call.kind === 'replaceFile'),
+    false,
+  );
+  assert.equal(await exists(f.native + '.update.partial'), false);
+  assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+});
+
+for (const [maintenance, content] of [
+  ['update', 'locally altered program'],
+  ['reinstall', officePayload],
+])
+  test(`OfficeCLI ${maintenance}：修改过的程序或显式重装仍下载替换`, async t => {
+    const f = await releaseFixture(t);
+    await f.write(f.native, content);
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli', maintenance }] });
+    assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+    assert.equal((await f.ccw.apply(plan.id)).state, 'done');
+    assert.ok(f.calls.some(call => call.kind === 'bytes'));
+    assert.ok(f.calls.some(call => call.kind === 'replaceFile'));
+    assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  });
+
+test('复用 OfficeCLI 发布原件：准备后文件变化时阻止执行', async t => {
+  const f = await releaseFixture(t);
+  await f.write(f.native, officePayload);
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli', maintenance: 'update' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  await f.write(f.native, 'changed after preparation');
+  const result = await f.ccw.apply(plan.id);
+  assert.equal(result.state, 'failed');
+  assert.equal(result.items[0].effects.at(-1).code, 'program-changed');
+  assert.equal(await fs.readFile(f.native, 'utf8'), 'changed after preparation');
+});
+
+for (const failure of ['failManifest', 'failDownload'])
+  test(`OfficeCLI ${failure}：GitHub 超时后使用固定版本的官方镜像`, async t => {
+    const f = await releaseFixture(t);
+    f.state[failure] = true;
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+    assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+    assert.equal((await f.ccw.apply(plan.id)).state, 'done');
+    assert.ok(f.calls.some(call => call.target.startsWith('https://d.officecli.ai/releases/download/v1.0.123/')));
+    assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
+  });
+
+test('OfficeCLI 官方镜像：摘要不匹配时阻止安装', async t => {
+  const f = await releaseFixture(t);
+  f.state.failDownload = true;
+  f.state.badMirror = true;
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  assert.equal(plan.items[0].problem, 'release-checksum-mismatch');
+  assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
+  assert.equal(await exists(f.native), false);
+});
+
+test('取消 OfficeCLI 资源获取：不再请求镜像', async t => {
+  const f = await releaseFixture(t);
+  f.state.failManifest = true;
+  f.state.manifestError = 'cancelled';
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
+  assert.equal(plan.items[0].problem, 'cancelled');
+  assert.equal(
+    f.calls.some(call => call.target.startsWith('https://d.officecli.ai/')),
+    false,
+  );
+  assert.equal(await exists(f.native), false);
+});
 
 test('准备 OfficeCLI 资源失败：不安装程序', async t => {
   const f = await releaseFixture(t);

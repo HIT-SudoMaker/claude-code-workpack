@@ -104,6 +104,7 @@ export const OFFICECLI_REPO_SLUG = 'iOfficeAI/OfficeCLI';
 
 export const officeIntegration = {
   suppressSelfUpdate: officeSuppressSelfUpdate,
+  releaseMirror: 'https://d.officecli.ai',
   skill: { repository: `https://github.com/${OFFICECLI_REPO_SLUG}`, folder: 'skills/officecli' },
   mcp: {
     args: ['mcp'],

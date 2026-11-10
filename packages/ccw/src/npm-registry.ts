@@ -35,7 +35,7 @@ function registries(preferred: NpmRegistry = null) {
 
 /** 查询当前 npm 配置，并在失败或返回无效值时尝试国内镜像 */
 export async function resolveNpmView<T>(
-  machine: Machine,
+  machine: Pick<Machine, 'npm'>,
   packageSpec: string,
   field: string,
   parse: (value: unknown) => T | null,

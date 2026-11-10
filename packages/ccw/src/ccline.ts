@@ -39,7 +39,7 @@ const CCLINE_BINARY_VERSION = /^(?:ccline|ccometixline) (2\.\d+\.\d+)\s*$/i;
 
 /** 准备 CCometixLine 变更；计划消费与执行互斥由调用方 CCW 统一管理 */
 export function createCcline(options: Context) {
-  const { machine } = options;
+  const { machine, effects } = options;
   /** ccline 固定落点：不受 CCLINE_HOME 影响 */
   const defaultCclineDirectory = path.join(options.home, '.claude', 'ccline');
   const binaryFile = path.join(defaultCclineDirectory, options.platform === 'win32' ? 'ccline.exe' : 'ccline');
@@ -163,7 +163,7 @@ export function createCcline(options: Context) {
       async run(written: (hasChanged: boolean) => void) {
         if (!isWritten) {
           if (selected.length)
-            await machine.editJson(settingsFile, settings => {
+            await effects.editJson(settingsFile, settings => {
               if (shouldConnect) {
                 const environment = settings.env === undefined ? {} : settings.env;
                 if (!isObject(environment)) throw new Error('invalid-settings');
@@ -318,7 +318,7 @@ export function createCcline(options: Context) {
           )
             throw new Error('program-changed');
           hasAttemptedPackageRemoval = true;
-          const result = await machine.npm(
+          const result = await effects.npm(
             npmUninstallArgs(['uninstall', '-g', ...(npmScope?.args ?? []), '--ignore-scripts', PACKAGE]),
           );
           let after: string | null;
@@ -342,7 +342,7 @@ export function createCcline(options: Context) {
           if (observed.binary === null) throw new Error('program-changed');
           hasAttemptedBinaryRemoval = true;
           try {
-            await machine.remove(binaryFile, observed.binary);
+            await effects.remove(binaryFile, observed.binary);
           } catch (error) {
             if ((await machine.fingerprint(binaryFile)) !== null) throw error;
           }
@@ -548,7 +548,7 @@ export function createCcline(options: Context) {
               ],
               releaseRegistry,
             );
-            const installed = await machine.npm(args);
+            const installed = await effects.npm(args);
             if (!succeeded(installed)) throw new Error('npm-install-failed');
             isCommandCompleted = true;
             report({ state: 'done', code: 'package-command-completed' });
@@ -606,7 +606,7 @@ export function createCcline(options: Context) {
               const asset = await machine.read(ASSET);
               if (asset === null) throw new Error('asset-missing');
               validateAppearance(asset);
-              if (!(await machine.initialize(styleFile, asset))) throw new Error('appearance-changed');
+              if (!(await effects.initialize(styleFile, asset))) throw new Error('appearance-changed');
               isAppearanceWritten = true;
               appearanceText = asset;
               report({ state: 'done', code: 'appearance-copied' });

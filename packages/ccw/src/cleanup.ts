@@ -243,7 +243,7 @@ async function prepareCleanup(ctx: Context, category: string): Promise<Prepared>
           continue;
         }
         try {
-          await ctx.machine.removeTree(file.file, file.stamp);
+          await ctx.effects.removeTree(file.file, file.stamp);
         } catch (error) {
           if ((await ctx.machine.treeStamp(file.file, signal)) !== null) throw error;
         }
@@ -256,7 +256,7 @@ async function prepareCleanup(ctx: Context, category: string): Promise<Prepared>
         if (performance.now() - checkedAtMs >= PROCESS_RECHECK_INTERVAL_MS) await checkProcess();
         const directory = directories[directoryIndex];
         if (!directory) break;
-        await ctx.machine.removeEmptyDirectory(directory);
+        await ctx.effects.removeEmptyDirectory(directory);
         directoryIndex++;
       }
       cancelled(signal);
@@ -380,8 +380,8 @@ export async function prepareClaudeDataRemoval(ctx: Context, verifyPrograms: () 
           target.hasAttemptedRemoval = true;
           await checkProcess(signal);
           try {
-            if (target.kind === 'file') await ctx.machine.remove(target.file, current);
-            else await ctx.machine.removeTree(target.file, current);
+            if (target.kind === 'file') await ctx.effects.remove(target.file, current);
+            else await ctx.effects.removeTree(target.file, current);
           } catch (error) {
             if ((await ctx.machine.treeStamp(target.file, signal)) !== null) throw error;
           }

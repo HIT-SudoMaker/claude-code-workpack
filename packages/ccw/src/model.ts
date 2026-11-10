@@ -2,7 +2,7 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { isObject, succeeded } from './machine.js';
-import type { CommandResult, Machine } from './machine.js';
+import type { CommandResult, Machine, ReadMachine } from './machine.js';
 
 export type Action =
   'install' | 'connect' | 'update' | 'reinstall' | 'configure' | 'login' | 'detach' | 'uninstall' | 'clean';
@@ -101,7 +101,9 @@ export interface CcwOptions {
   readonly libc?: 'glibc' | 'musl';
   readonly scoopRoot?: string;
 }
-export interface Context extends CcwOptions {
+export interface Context extends Omit<CcwOptions, 'machine'> {
+  readonly machine: ReadMachine;
+  readonly effects: Machine;
   readonly settingsFile: string;
   readonly stateFile: string;
   readonly storage: string;
@@ -171,6 +173,7 @@ export function context(options: CcwOptions): Context {
       throw new Error('invalid-config-root');
   return {
     ...options,
+    effects: options.machine,
     settingsFile: path.join(options.claudeRoot, 'settings.json'),
     stateFile:
       options.claudeState ??
@@ -206,7 +209,10 @@ export function claudeProcessActive(name: string, command: string): boolean {
 }
 
 /** Claude 运行判定：枚举失败保持未知（null），不臆断未运行 */
-export async function claudeRunning(machine: Machine, signal?: AbortSignal): Promise<boolean | null> {
+export async function claudeRunning(
+  machine: { processes: ReadMachine['processes'] },
+  signal?: AbortSignal,
+): Promise<boolean | null> {
   const found = await machine.processes(signal);
   if (found === null) return null;
   return found.some(entry => claudeProcessActive(entry.name, entry.command));
@@ -236,7 +242,7 @@ export function normalizePath(platform: Context['platform'], file: string) {
 }
 
 /** 读取 JSON 对象；文件缺失回退空对象，解析失败或非对象抛 invalid-settings */
-export async function json(machine: Machine, file: string): Promise<Record<string, unknown>> {
+export async function json(machine: { read: ReadMachine['read'] }, file: string): Promise<Record<string, unknown>> {
   const text = await machine.read(file);
   let value: unknown;
   try {
@@ -313,7 +319,7 @@ export function removeFields(
         !isWritten &&
         (!hasAttemptedWrite || !absent(await read()))
       ) {
-        await ctx.machine.editJson(file, document => {
+        await ctx.effects.editJson(file, document => {
           const values = parent === undefined ? document : object(document[parent]);
           for (const [key, value] of Object.entries(before)) unchanged(values[key], value);
           for (const key of Object.keys(before)) delete values[key];
@@ -341,7 +347,7 @@ export async function editFields(
   parent?: string,
   onWritten?: () => void,
 ) {
-  await ctx.machine.editJson(file, document => {
+  await ctx.effects.editJson(file, document => {
     const target = parent === undefined ? document : object(document[parent]);
     for (const [key, value] of Object.entries(changes)) {
       unchanged(target[key], before[key]);

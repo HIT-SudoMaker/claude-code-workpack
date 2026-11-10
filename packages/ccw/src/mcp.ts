@@ -248,13 +248,13 @@ export async function prepareMcp(
     if (uv === undefined && (await ctx.machine.treeStamp(localUv)) !== null) uv = localUv;
     if (uv !== undefined) return uv;
     const file = installScratch(ctx, `uv-${randomUUID()}.${ctx.platform === 'win32' ? 'ps1' : 'sh'}`);
-    await ctx.machine.initialize(
+    await ctx.effects.initialize(
       file,
       await ctx.machine.fetchText(`https://astral.sh/uv/install.${ctx.platform === 'win32' ? 'ps1' : 'sh'}`),
     );
     try {
       success(
-        await ctx.machine.execute(
+        await ctx.effects.execute(
           ctx.platform === 'win32' ? 'powershell.exe' : 'sh',
           ctx.platform === 'win32' ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file] : [file],
           { env: { UV_NO_MODIFY_PATH: '1', UV_INSTALL_DIR: userBinDirectory(ctx) } },
@@ -262,7 +262,7 @@ export async function prepareMcp(
       );
     } finally {
       const stamp = await ctx.machine.treeStamp(file);
-      if (stamp !== null) await ctx.machine.removeTree(file, stamp);
+      if (stamp !== null) await ctx.effects.removeTree(file, stamp);
     }
     report({ state: 'done', code: 'uv-installed' });
     return localUv;
@@ -282,11 +282,11 @@ export async function prepareMcp(
             line =>
               line.trim().split(/\s+/).slice(0, 2).join(' ') === `${mcpSpecs.serena.release.package} v${targetVersion}`,
           );
-      const currentTools = await ctx.machine.execute(uv, ['tool', 'list']);
+      const currentTools = await ctx.effects.execute(uv, ['tool', 'list']);
       const isAlreadyInstalled = !currentTools.failed && currentTools.code === 0 && serenaIn(currentTools.stdout);
       if (!isAlreadyInstalled || action === 'reinstall')
         success(
-          await ctx.machine.execute(uv, [
+          await ctx.effects.execute(uv, [
             'tool',
             'install',
             '--python',
@@ -297,9 +297,9 @@ export async function prepareMcp(
           ]),
           'serena-install-failed',
         );
-      const installed = success(await ctx.machine.execute(uv, ['tool', 'list']));
+      const installed = success(await ctx.effects.execute(uv, ['tool', 'list']));
       if (!serenaIn(installed)) throw new Error('binary-version-mismatch');
-      const bin = success(await ctx.machine.execute(uv, ['tool', 'dir', '--bin'])).trim();
+      const bin = success(await ctx.effects.execute(uv, ['tool', 'dir', '--bin'])).trim();
       if (!path.isAbsolute(bin) || /[\r\n]/.test(bin)) throw new Error('invalid-tool-directory');
       registration.command = path.join(bin, ctx.platform === 'win32' ? 'serena.exe' : 'serena');
       if ((await ctx.machine.treeStamp(String(registration.command))) === null) throw new Error('program-not-ready');
@@ -309,7 +309,7 @@ export async function prepareMcp(
     }
     cancelled(signal);
     if (action !== 'update' && !isInitialized) {
-      success(await ctx.machine.execute(String(registration.command), ['init']), 'serena-initialization-failed');
+      success(await ctx.effects.execute(String(registration.command), ['init']), 'serena-initialization-failed');
       isInitialized = true;
       report({ state: 'done', code: 'serena-initialized' });
     }

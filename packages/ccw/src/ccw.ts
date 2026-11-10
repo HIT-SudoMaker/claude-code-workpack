@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import { knownTitle, programCopySuffix } from './titles.js';
 import { createCcline } from './ccline.js';
-import { createClaudeDomain, createSettingsDomain } from './claude-config.js';
+import { ClaudeProgramVerificationError, createClaudeDomain, createSettingsDomain } from './claude-config.js';
 import { createCleanupDomain, prepareClaudeDataRemoval } from './cleanup.js';
 import { createMcpDomain } from './mcp.js';
 import { createPluginsDomain } from './plugins.js';
@@ -30,6 +30,7 @@ import type {
 } from './model.js';
 import { createOfficecli, OFFICECLI_ENTRY_IDS } from './officecli.js';
 import { createReadMachine } from './read-machine.js';
+import { createEffectMachine, createEffectScope } from './effect-machine.js';
 import { writeLastRun } from './storage.js';
 
 export type { Action, Inspection, Item, Pick, Plan, Request } from './model.js';
@@ -162,11 +163,14 @@ async function detachBatch(
 /** 统一管理当前用户的内容；检查不消费计划，执行逐项报告已发生的效果 */
 export function createCcw(options: CcwOptions): Ccw {
   const ctx = context(options);
+  let lifecycle: PlanState = { phase: 'idle' };
+  const effectScope = createEffectScope(options.machine, () => lifecycle.phase === 'applying');
+  const effects = effectScope.machine;
   const preparation = new AsyncLocalStorage<{
     signal?: AbortSignal;
     report: (stage: PreparationProgress['stage']) => void;
   }>();
-  const preparationContext = { ...ctx, machine: createReadMachine(ctx.machine, () => preparation.getStore()) };
+  const preparationContext = { ...ctx, effects, machine: createReadMachine(ctx.machine, () => preparation.getStore()) };
   /** 登记 prepare 域：随 preparationContext 一次建成；inspect 域每次内联新建以吃当次读取预算 */
   const prepareDomains = new Map<string, Domain>();
   for (const [keys, , factory] of CONTENT_DOMAINS) {
@@ -174,7 +178,6 @@ export function createCcw(options: CcwOptions): Ccw {
     for (const key of keys) prepareDomains.set(key, domain);
   }
   prepareDomains.set('data', createCleanupDomain(preparationContext));
-  let lifecycle: PlanState = { phase: 'idle' };
   let remaining: { id: string; items: PlanItem[]; work: Map<string, Prepared> } | undefined;
 
   async function inspect(scope: 'contents' | 'data' = 'contents', signal?: AbortSignal): Promise<Inspection> {
@@ -182,6 +185,7 @@ export function createCcw(options: CcwOptions): Ccw {
     const deadlineMs = performance.now() + 5_000;
     const reading = {
       ...ctx,
+      effects: createEffectMachine(options.machine, () => false),
       machine: createReadMachine(ctx.machine, () => ({ deadlineMs, ...(signal ? { signal } : {}) }), {
         shouldShareReads: true,
       }),
@@ -376,98 +380,109 @@ export function createCcw(options: CcwOptions): Ccw {
         lifecycle = { phase: 'idle' };
         return planFailure(current.plan.items);
       }
-      const guard = progressGuard(progress);
-      const notify = (event: Progress) => guard(structuredClone(event));
-      try {
-        let hasClaudeFailure = false;
-        let isClaudePlanInvalidated = false;
-        const unfinished = new Map<string, Prepared>();
-        const unfinishedItems: PlanItem[] = [];
-        const runItem = async (item: PlanItem): Promise<ItemResult> => {
-          const effects: Effect[] = [];
-          const report = (effect: Effect) => {
-            effects.push(effect);
-            notify({ kind: 'effect', id: item.id, effect });
+      return effectScope.run(async () => {
+        const guard = progressGuard(progress);
+        const notify = (event: Progress) => guard(structuredClone(event));
+        try {
+          let hasClaudeFailure = false;
+          let isClaudePlanInvalidated = false;
+          const unfinished = new Map<string, Prepared>();
+          const unfinishedItems: PlanItem[] = [];
+          const runItem = async (item: PlanItem): Promise<ItemResult> => {
+            const effects: Effect[] = [];
+            const report = (effect: Effect) => {
+              effects.push(effect);
+              notify({ kind: 'effect', id: item.id, effect });
+            };
+            let state: ItemResult['state'] = 'done';
+            let isPlanInvalidated = false;
+            notify({ kind: 'started', id: item.id });
+            try {
+              cancelled(signal);
+              if (
+                hasClaudeFailure &&
+                item.action !== 'detach' &&
+                (kindOf(item.id) === 'plugin' || item.action === 'login' || item.id === CLAUDE_DATA_ID)
+              )
+                throw new Error('dependency-not-ready');
+              const operation = current.work.get(item.id);
+              if (operation === undefined) throw new Error('plan-unavailable');
+              await operation.run(report, signal);
+            } catch (error) {
+              const code = errorCode(error);
+              isPlanInvalidated =
+                INVALID_PROGRAM_PLAN_REASONS.has(code) || (code === 'dependency-not-ready' && isClaudePlanInvalidated);
+              if (
+                !effects.some(
+                  effect => effect.code === code && (effect.state === 'failed' || effect.state === 'skipped'),
+                )
+              )
+                report({ state: code === 'cancelled' || code === 'dependency-not-ready' ? 'skipped' : 'failed', code });
+              state =
+                code === 'cancelled'
+                  ? 'cancelled'
+                  : effects.some(effect => effect.state === 'done')
+                    ? 'partial'
+                    : 'failed';
+              if (
+                kindOf(item.id) === 'claude' &&
+                (isPlanInvalidated ||
+                  error instanceof ClaudeProgramVerificationError ||
+                  !effects.some(effect => effect.code === 'program-ready'))
+              ) {
+                hasClaudeFailure = true;
+                isClaudePlanInvalidated ||= isPlanInvalidated;
+              }
+            }
+            let isPending = false;
+            if (state !== 'done' && !isPlanInvalidated) {
+              const operation = current.work.get(item.id);
+              const rest = operation?.remaining ? operation.remaining() : operation;
+              if (rest) {
+                isPending = true;
+                unfinished.set(item.id, rest);
+                unfinishedItems.push({ ...item, changes: rest.changes });
+              }
+            }
+            const result = { id: item.id, title: item.title, state, effects, isPending };
+            notify({ kind: 'finished', id: item.id, result });
+            return result;
           };
-          let state: ItemResult['state'] = 'done';
-          let isPlanInvalidated = false;
-          notify({ kind: 'started', id: item.id });
-          try {
-            cancelled(signal);
-            if (
-              hasClaudeFailure &&
-              item.action !== 'detach' &&
-              (kindOf(item.id) === 'plugin' || item.action === 'login' || item.id === CLAUDE_DATA_ID)
+          const results: ItemResult[] = [];
+          if (
+            current.plan.items.every(
+              item => item.action === 'detach' && current.work.get(item.id)?.writes !== undefined,
             )
-              throw new Error('dependency-not-ready');
-            const operation = current.work.get(item.id);
-            if (operation === undefined) throw new Error('plan-unavailable');
-            await operation.run(report, signal);
-          } catch (error) {
-            const code = errorCode(error);
-            isPlanInvalidated =
-              INVALID_PROGRAM_PLAN_REASONS.has(code) || (code === 'dependency-not-ready' && isClaudePlanInvalidated);
-            if (
-              !effects.some(effect => effect.code === code && (effect.state === 'failed' || effect.state === 'skipped'))
-            )
-              report({ state: code === 'cancelled' || code === 'dependency-not-ready' ? 'skipped' : 'failed', code });
-            state =
-              code === 'cancelled'
-                ? 'cancelled'
-                : effects.some(effect => effect.state === 'done')
+          )
+            results.push(...(await detachBatch(ctx, current.plan.items, current.work, runItem)));
+          else for (const item of current.plan.items) results.push(await runItem(item));
+          const token = unfinished.size ? randomUUID() : undefined;
+          if (token)
+            remaining = {
+              id: token,
+              items: current.plan.items
+                .filter(item => unfinished.has(item.id))
+                .map(item => unfinishedItems.find(value => value.id === item.id) ?? item),
+              work: unfinished,
+            };
+          const result: RunResult = {
+            state: results.some(item => item.state === 'cancelled')
+              ? 'cancelled'
+              : results.every(item => item.state === 'done') && current.plan.problem === null
+                ? 'done'
+                : results.some(item => item.state === 'done' || item.state === 'partial')
                   ? 'partial'
-                  : 'failed';
-            if (kindOf(item.id) === 'claude' && !effects.some(effect => effect.code === 'program-ready')) {
-              hasClaudeFailure = true;
-              isClaudePlanInvalidated ||= isPlanInvalidated;
-            }
-          }
-          let isPending = false;
-          if (state !== 'done' && !isPlanInvalidated) {
-            const operation = current.work.get(item.id);
-            const rest = operation?.remaining ? operation.remaining() : operation;
-            if (rest) {
-              isPending = true;
-              unfinished.set(item.id, rest);
-              unfinishedItems.push({ ...item, changes: rest.changes });
-            }
-          }
-          const result = { id: item.id, title: item.title, state, effects, isPending };
-          notify({ kind: 'finished', id: item.id, result });
-          return result;
-        };
-        const results: ItemResult[] = [];
-        if (
-          current.plan.items.every(item => item.action === 'detach' && current.work.get(item.id)?.writes !== undefined)
-        )
-          results.push(...(await detachBatch(ctx, current.plan.items, current.work, runItem)));
-        else for (const item of current.plan.items) results.push(await runItem(item));
-        const token = unfinished.size ? randomUUID() : undefined;
-        if (token)
-          remaining = {
-            id: token,
-            items: current.plan.items
-              .filter(item => unfinished.has(item.id))
-              .map(item => unfinishedItems.find(value => value.id === item.id) ?? item),
-            work: unfinished,
+                  : 'failed',
+            items: results,
+            ...(token ? { remaining: token } : {}),
           };
-        const result: RunResult = {
-          state: results.some(item => item.state === 'cancelled')
-            ? 'cancelled'
-            : results.every(item => item.state === 'done') && current.plan.problem === null
-              ? 'done'
-              : results.some(item => item.state === 'done' || item.state === 'partial')
-                ? 'partial'
-                : 'failed',
-          items: results,
-          ...(token ? { remaining: token } : {}),
-        };
-        // 最近执行落盘供诊断收集读取，尽力而为
-        await writeLastRun(ctx, current.plan, result, token);
-        return result;
-      } finally {
-        lifecycle = { phase: 'idle' };
-      }
+          // 最近执行落盘供诊断收集读取，尽力而为
+          await writeLastRun(ctx, current.plan, result, token);
+          return result;
+        } finally {
+          lifecycle = { phase: 'idle' };
+        }
+      });
     },
   };
 }

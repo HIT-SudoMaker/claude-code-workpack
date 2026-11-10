@@ -320,7 +320,7 @@ export function createOfficecli(ctx: Context) {
             changes: [{ code: 'program-kept' }],
             async run(report: Parameters<Prepared['run']>[0]) {
               unchanged(await ctx.machine.treeStamp(program.binary), stamp);
-              if (program.channel === 'native') await ctx.machine.ensureUserPath(path.dirname(program.binary));
+              if (program.channel === 'native') await ctx.effects.ensureUserPath(path.dirname(program.binary));
               report({ state: 'kept' as const, code: 'program-kept' });
             },
             async verify() {
@@ -337,7 +337,17 @@ export function createOfficecli(ctx: Context) {
       });
       const before =
         selection.action === 'reinstall' && entries.length ? await detach(entries, selection.action) : undefined;
-      return sequence([...(before ? [before] : []), operation, connection]);
+      // 接入步骤也可能跨越外部修改；完成需复核整个所选合同，续办只重做该确认。
+      const assess = async () => {
+        await operation.verify?.();
+        await connection.verify?.();
+      };
+      return sequence([
+        ...(before ? [before] : []),
+        operation,
+        connection,
+        { changes: [], run: assess, verify: assess },
+      ]);
     },
   };
 }
@@ -434,16 +444,28 @@ async function prepareOfficeConnection(
   const { skillStamp: before, sourceRecord: record, mcpCommand: command } = observed;
   const hasMcp = command !== undefined && (!path.isAbsolute(command) || samePath(ctx, command, target.binary));
   const integration = selection.fields?.connection;
-  const mcp = (action: Selection['action'], hasDetached = false) =>
-    prepareMcp(
+  const mcp = async (action: 'connect', hasDetached = false): Promise<Prepared> => {
+    const registration = officeMcpRegistration(target.binary);
+    const operation = await prepareMcp(
       ctx,
       'officecli',
       { ...selection, action },
       {
         hasDetached,
-        registration: () => officeMcpRegistration(target.binary),
+        registration: () => registration,
       },
     );
+    return {
+      ...operation,
+      get changes() {
+        return operation.changes;
+      },
+      async verify() {
+        await operation.verify?.();
+        unchanged((await readMcpServers(ctx)).officecli, registration);
+      },
+    };
+  };
 
   if (selection.action === 'install') {
     if (before !== null && observed.skillEvidence !== 'none') {

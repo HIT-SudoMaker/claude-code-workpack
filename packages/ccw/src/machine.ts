@@ -69,6 +69,23 @@ export interface Machine {
   processes(signal?: AbortSignal): Promise<readonly ProcessEntry[] | null>;
 }
 
+/** 观察与来源暂存能力；不含任何受管目标写入方法。命令仍需经过可信查询门。 */
+export type ReadMachine = Pick<
+  Machine,
+  | 'read'
+  | 'fingerprint'
+  | 'npm'
+  | 'entries'
+  | 'treeStamp'
+  | 'execute'
+  | 'locate'
+  | 'realpath'
+  | 'fetchText'
+  | 'fetchBytes'
+  | 'source'
+  | 'processes'
+>;
+
 /** 限制读阶段命令与远端读取的毫秒时限；read-machine 的检查预算与各域短探测同源取值 */
 export const READ_COMMAND_TIMEOUT_MS = 5_000;
 export const GIT_COMMAND_TIMEOUT_MS = 15_000;

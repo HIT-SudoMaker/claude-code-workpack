@@ -30,6 +30,8 @@ export const ERROR_MESSAGES: Readonly<Record<string, MessageText>> = {
   'base-url-required': { brief: '请填写地址', detail: '保存配置失败：缺少 Base URL' },
   'plan-unavailable': { brief: '计划已失效', detail: '执行操作失败：计划已失效' },
   'operation-in-progress': { brief: '已有操作进行', detail: '执行操作失败：另一批操作进行中' },
+  'read-command-not-allowed': { brief: '观察命令受限', detail: '读取阶段拒绝执行未登记的观察命令' },
+  'effect-not-authorized': { brief: '操作资格已失效', detail: '当前没有有效执行资格，请重新准备操作' },
   'empty-selection': { brief: '请先选择内容', detail: '执行操作失败：未选择变更' },
   'duplicate-selection': { brief: '选择存在冲突', detail: '选择内容失败：同一内容有多个动作' },
   'npm-inspection-failed': { brief: '安装记录读取失败', detail: '读取 npm 安装记录失败' },

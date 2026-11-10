@@ -215,6 +215,8 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
     uninstall: new Map(),
     clean: new Map(),
   };
+  // 操作意图独立于勾选：取消只撤销执行，重新勾选仍沿用检查页选择的更新动作。
+  const maintenanceActions = new Map<string, NonNullable<Pick['maintenance']>>();
   const problems = new Map<string, string>();
   let task: Task = 'inspect';
   let pending: { task: Task; remaining?: string; plan?: Plan; removeData?: boolean } | undefined;
@@ -312,6 +314,10 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
         task = route.task;
         reconcile();
         const target = route.item;
+        if (task === 'install') {
+          if (route.maintenance) maintenanceActions.set(target.id, route.maintenance);
+          else maintenanceActions.delete(target.id);
+        }
         const priorFields = selected().get(target.id)?.fields;
         const selection =
           target.kind === 'settings' && task === 'install'
@@ -327,16 +333,19 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
                   : {}),
                 ...(task === 'uninstall' && !target.actions.includes('uninstall') ? DETACH_REMOVAL : {}),
               };
-        if (selection && (target.kind === 'settings' || route.maintenance !== undefined || !selected().has(target.id)))
+        if (
+          selection &&
+          (target.kind === 'settings' ||
+            route.maintenance !== selected().get(target.id)?.maintenance ||
+            !selected().has(target.id))
+        )
           select(target.id, selection);
         continue;
       }
       const taskAction = task;
-      // 已选更新的成员在安装页保留一行：可见、可取消；未选时仍由套件入口代表
+      // 更新入口保留到操作完成：取消、刷新后仍可重新勾选。
       const items = ordered.filter(
-        item =>
-          availableActions(item, task).length > 0 ||
-          (task === 'install' && selected().get(item.id)?.maintenance !== undefined),
+        item => availableActions(item, task).length > 0 || (task === 'install' && maintenanceActions.has(item.id)),
       );
       const remaining = pending?.task === task ? pending : undefined;
       const missing = new Set([...selected().keys()].filter(id => !remaining && !items.some(item => item.id === id)));
@@ -431,7 +440,7 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
                       entry.editor === undefined &&
                       !missing.has(entry.item.id) &&
                       // 更新勾选是显式意图，全选不得静默降级为普通安装
-                      selected().get(entry.item.id)?.maintenance === undefined,
+                      (task !== 'install' || !maintenanceActions.has(entry.item.id)),
                   )
                 : entries.filter((_entry, index) => index === event.index);
             const shouldSelect = event.kind === 'all' && targets.some(entry => !entrySelected(entry, selected()));
@@ -444,8 +453,10 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
                   selected().set(entry.item.id, { ...prior, id: entry.item.id, fields });
                 else selected().delete(entry.item.id);
               } else if (!prior && entry.editor === undefined && !missing.has(entry.item.id)) {
+                const maintenance = task === 'install' ? maintenanceActions.get(entry.item.id) : undefined;
                 selected().set(entry.item.id, {
                   id: entry.item.id,
+                  ...(maintenance ? { maintenance } : {}),
                   ...(task === 'uninstall' && !entry.item.actions.includes('uninstall') ? DETACH_REMOVAL : {}),
                 });
               }
@@ -627,7 +638,10 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
       for (const item of result.items) {
         if (item.state !== 'done' && item.isPending !== false) continue;
         if (item.id === CLAUDE_DATA_ID) removeClaudeData = false;
-        else selected().delete(item.id);
+        else {
+          selected().delete(item.id);
+          if (task === 'install') maintenanceActions.delete(item.id);
+        }
       }
       const dataRemaining =
         removeClaudeData && result.items.some(item => item.id === CLAUDE_DATA_ID && item.isPending === true);

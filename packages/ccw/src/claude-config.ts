@@ -1,8 +1,47 @@
 import { knownTitle } from './titles.js';
-import { isObject } from './machine.js';
+import { errorCode, isObject } from './machine.js';
 import { apiConfigurationProblem, cancelled, json, object, sequence, success, unchanged } from './model.js';
 import type { Context, Domain, Effect, Inspection, Item, Prepared, Selection } from './model.js';
 import { claudeCommand, prepareProgram, programs } from './programs.js';
+
+/** 程序步骤失败：保留原错误的续办语义，同时撤回本次依赖执行资格。 */
+export class ClaudeProgramVerificationError extends Error {
+  constructor(cause: unknown) {
+    super(errorCode(cause), { cause });
+  }
+}
+
+/** 程序步骤单独拥有失败标签；默认设置失败不撤回已经确认的程序资格。 */
+function verifiedClaudeProgram(initial: Prepared): Prepared {
+  let current = initial;
+  const operation: Prepared = {
+    ...(initial.writes === undefined ? {} : { writes: initial.writes }),
+    get changes() {
+      return current.changes;
+    },
+    async run(report, signal) {
+      try {
+        await current.run(report, signal);
+      } catch (error) {
+        throw new ClaudeProgramVerificationError(error);
+      }
+    },
+    remaining() {
+      const rest = current.remaining ? current.remaining() : current;
+      if (rest === undefined) return undefined;
+      current = rest;
+      return operation;
+    },
+    async verify() {
+      try {
+        await current.verify?.();
+      } catch (error) {
+        throw new ClaudeProgramVerificationError(error);
+      }
+    },
+  };
+  return operation;
+}
 
 /** 创建 Claude 程序域渠道：裸 id 与 claude: 余段 id 都归本域 */
 export function createClaudeDomain(ctx: Context): Domain {
@@ -77,8 +116,13 @@ async function prepareClaudeProgram(ctx: Context, selection: Selection): Promise
       : await prepareProgram(ctx, kind, selection, program);
   if ((action !== 'install' && action !== 'reinstall') || (action === 'install' && program && !program.isMissing))
     return operation;
+  const programStep = verifiedClaudeProgram(operation);
   const defaults = await prepareSettings(ctx, { id: 'settings', action: 'configure' });
-  return sequence([operation, defaults]);
+  const assess = async () => {
+    await programStep.verify?.();
+    await defaults.verify?.();
+  };
+  return sequence([programStep, defaults, { changes: [], run: assess, verify: assess }]);
 }
 
 interface OrderedField {
@@ -328,7 +372,7 @@ async function prepareSettings(ctx: Context, selection: Selection): Promise<Prep
     async run(report, signal) {
       if (isSaved) await verify();
       else {
-        await ctx.machine.editJson(ctx.settingsFile, current => {
+        await ctx.effects.editJson(ctx.settingsFile, current => {
           const currentEnv = object(current.env);
           if (shouldControlHelper) for (const key of helperKeys) unchanged(current[key], settings[key]);
           for (const [key, value] of Object.entries(changes)) {
