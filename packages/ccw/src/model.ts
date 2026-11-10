@@ -136,6 +136,8 @@ export type OperationPhase = 'preparing' | 'awaiting-confirmation' | 'executing'
 export type OperationStatus = 'pending' | 'issued' | 'confirmed' | 'failed' | 'checking' | 'unneeded';
 export interface OperationFact {
   readonly status: OperationStatus;
+  /** 首次确认是历史事实；后续目标漂移不能将其重新变成可派发。 */
+  readonly confirmed?: true;
   readonly attemptId?: string;
   readonly dispatch?: JsonObject;
   readonly receipt?:
@@ -181,6 +183,7 @@ export interface OperationRecord {
 export interface Recovery {
   readonly id: string;
   readonly phase: OperationPhase;
+  readonly intent: JsonObject;
   readonly items: readonly {
     readonly id: string;
     readonly title: string;
