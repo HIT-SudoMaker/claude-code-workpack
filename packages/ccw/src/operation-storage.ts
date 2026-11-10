@@ -211,31 +211,160 @@ interface Envelope {
   readonly checksum: string;
   readonly record: OperationRecord;
 }
+interface PayloadResource {
+  readonly encoding: 'resource';
+  readonly checksum: string;
+  readonly characters: number;
+  readonly chunks: readonly string[];
+}
+type StoredPayload = { readonly encoding: 'inline'; readonly value: JsonObject } | PayloadResource;
+type StoredRecord = Omit<OperationRecord, 'operations'> & {
+  readonly operations: readonly (Omit<OperationDefinition, 'payload'> & { readonly payload: StoredPayload })[];
+};
+interface ResourceEnvelope {
+  readonly schema: 2;
+  readonly checksum: string;
+  readonly record: StoredRecord;
+}
+const PAYLOAD_INLINE_BYTES = 128 * 1024;
+const RESOURCE_CHARS = 256 * 1024;
+const RECORD_BYTES = 2 * 1024 * 1024;
+const hashText = (value: string) => createHash('sha256').update(value).digest('hex');
+const hash = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const resourceFile = (ctx: StorageContext, digest: string) =>
+  path.join(ctx.storage, 'operation-resources', digest + '.part');
 
 function envelope(value: unknown): Envelope {
   if (
     !isObject(value) ||
     !keys(value, ['schema', 'checksum', 'record']) ||
     value.schema !== 1 ||
-    typeof value.checksum !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(value.checksum) ||
+    !hash(value.checksum) ||
     !isRecord(value.record) ||
     checksum(value.record) !== value.checksum
   )
     throw invalid();
   return { schema: 1, checksum: value.checksum, record: value.record };
 }
-
-function decode(text: string): Envelope {
+function isStoredPayload(value: unknown): value is StoredPayload {
+  return (
+    isObject(value) &&
+    ((value.encoding === 'inline' && keys(value, ['encoding', 'value']) && isJsonObject(value.value)) ||
+      (value.encoding === 'resource' &&
+        keys(value, ['encoding', 'checksum', 'characters', 'chunks']) &&
+        hash(value.checksum) &&
+        typeof value.characters === 'number' &&
+        Number.isSafeInteger(value.characters) &&
+        value.characters > 0 &&
+        value.characters <= 512 * 1024 * 1024 &&
+        Array.isArray(value.chunks) &&
+        value.chunks.length > 0 &&
+        value.chunks.length <= 4096 &&
+        value.chunks.every(hash)))
+  );
+}
+function isStoredRecord(value: unknown): value is StoredRecord {
+  if (!isObject(value) || !Array.isArray(value.operations)) return false;
+  const operations: unknown[] = [];
+  for (const operation of value.operations) {
+    if (!isObject(operation) || !isStoredPayload(operation.payload)) return false;
+    operations.push({ ...operation, payload: {} });
+  }
+  return isRecord({ ...value, operations });
+}
+function decode(text: string): Envelope | ResourceEnvelope {
   try {
     const value: unknown = JSON.parse(text);
+    if (isObject(value) && value.schema === 2) {
+      if (
+        !keys(value, ['schema', 'checksum', 'record']) ||
+        !hash(value.checksum) ||
+        !isStoredRecord(value.record) ||
+        checksum(value.record) !== value.checksum
+      )
+        throw invalid();
+      return { schema: 2, checksum: value.checksum, record: value.record };
+    }
     return envelope(value);
   } catch (error) {
     throw invalid(error);
   }
 }
+async function hydrate(
+  machine: Machine,
+  ctx: StorageContext,
+  stored: Envelope | ResourceEnvelope,
+): Promise<OperationRecord> {
+  if (stored.schema === 1) return stored.record;
+  const operations: OperationDefinition[] = [];
+  for (const operation of stored.record.operations) {
+    let payload: JsonObject;
+    if (operation.payload.encoding === 'inline') payload = operation.payload.value;
+    else {
+      const pieces: string[] = [];
+      let characters = 0;
+      for (const digest of operation.payload.chunks) {
+        const piece = await machine.read(resourceFile(ctx, digest));
+        if (piece === null || piece.length > RESOURCE_CHARS || hashText(piece) !== digest)
+          throw invalid('resource-changed');
+        characters += piece.length;
+        if (characters > operation.payload.characters) throw invalid('resource-size-changed');
+        pieces.push(piece);
+      }
+      const text = pieces.join('');
+      if (characters !== operation.payload.characters || hashText(text) !== operation.payload.checksum)
+        throw invalid('resource-changed');
+      const value: unknown = JSON.parse(text);
+      if (!isJsonObject(value)) throw invalid();
+      payload = value;
+    }
+    operations.push({ ...operation, payload });
+  }
+  const record = { ...stored.record, operations };
+  if (!isRecord(record)) throw invalid();
+  return record;
+}
+async function storePayload(machine: Machine, ctx: StorageContext, text: string): Promise<PayloadResource> {
+  const chunks: string[] = [];
+  for (let offset = 0; offset < text.length;) {
+    let end = Math.min(offset + RESOURCE_CHARS, text.length);
+    // Keep each UTF-16 surrogate pair in one UTF-8 chunk.
+    const last = text.charCodeAt(end - 1);
+    if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
+    const piece = text.slice(offset, end);
+    const digest = hashText(piece);
+    const file = resourceFile(ctx, digest);
+    const before = await machine.read(file);
+    if (before === null) await machine.replaceFile(file, Buffer.from(piece), null);
+    else if (before !== piece) throw invalid('resource-changed');
+    if ((await machine.read(file)) !== piece) throw unavailable('resource-read-back-mismatch');
+    chunks.push(digest);
+    offset = end;
+  }
+  return { encoding: 'resource', checksum: hashText(text), characters: text.length, chunks };
+}
+async function encode(
+  machine: Machine,
+  ctx: StorageContext,
+  record: OperationRecord,
+): Promise<Envelope | ResourceEnvelope> {
+  const values = record.operations.map(operation => JSON.stringify(operation.payload));
+  if (values.every(value => Buffer.byteLength(value) <= PAYLOAD_INLINE_BYTES))
+    return envelope({ schema: 1, checksum: checksum(record), record });
+  const operations: StoredRecord['operations'][number][] = [];
+  for (const [index, operation] of record.operations.entries()) {
+    const text = values[index]!;
+    const payload: StoredPayload =
+      Buffer.byteLength(text) > PAYLOAD_INLINE_BYTES
+        ? await storePayload(machine, ctx, text)
+        : { encoding: 'inline', value: operation.payload };
+    operations.push({ ...operation, payload });
+  }
+  const stored: StoredRecord = { ...record, operations };
+  return { schema: 2, checksum: checksum(stored), record: stored };
+}
 
-/** 无记录与无法读取严格区分；损坏内容不会当成新任务。 */
+/** No record and unreadable record remain distinct; missing resources never become a new task. */
 export async function readOperation(machine: Machine, ctx: StorageContext): Promise<OperationRecord | undefined> {
   let text: string | null;
   try {
@@ -243,13 +372,18 @@ export async function readOperation(machine: Machine, ctx: StorageContext): Prom
   } catch (error) {
     throw unavailable(error);
   }
-  return text === null ? undefined : decode(text).record;
+  if (text === null) return undefined;
+  try {
+    return await hydrate(machine, ctx, decode(text));
+  } catch (error) {
+    throw invalid(error);
+  }
 }
 
-/** 提交后回读完整校验；调用方只在此 Promise 成功后获得派发资格。 */
+/** Verify immutable resources before committing the one current-task envelope. */
 export async function writeOperation(machine: Machine, ctx: StorageContext, record: OperationRecord): Promise<void> {
   if (!isRecord(record)) throw invalid();
-  const frozen = envelope({ schema: 1, checksum: checksum(record), record: structuredClone(record) });
+  record = structuredClone(record);
   const file = operationFile(ctx);
   let before: string | null;
   try {
@@ -257,18 +391,22 @@ export async function writeOperation(machine: Machine, ctx: StorageContext, reco
   } catch (error) {
     throw unavailable(error);
   }
-  if (before !== null) decode(before);
+  if (before !== null) await hydrate(machine, ctx, decode(before));
   try {
-    const expected = before === null ? null : createHash('sha256').update(before).digest('hex');
-    await machine.replaceFile(file, Buffer.from(`${JSON.stringify(frozen, null, 2)}\n`), expected);
+    const frozen = await encode(machine, ctx, record);
+    const text = JSON.stringify(frozen) + '\n';
+    if (Buffer.byteLength(text) > RECORD_BYTES) throw unavailable('record-too-large');
+    await machine.replaceFile(file, Buffer.from(text), before === null ? null : hashText(before));
     const saved = await machine.read(file);
     if (saved === null || checksum(decode(saved)) !== checksum(frozen)) throw unavailable('read-back-mismatch');
+    if (checksum(await hydrate(machine, ctx, decode(saved))) !== checksum(record))
+      throw unavailable('read-back-mismatch');
   } catch (error) {
     throw unavailable(error);
   }
 }
 
-/** 放弃仅删除控制记录，不接触已成功的目标内容。 */
+/** Abandon clears only control data; immutable resources carry no progress and may remain. */
 export async function clearOperation(machine: Machine, ctx: StorageContext): Promise<void> {
   const file = operationFile(ctx);
   let before: string | null;
@@ -280,8 +418,7 @@ export async function clearOperation(machine: Machine, ctx: StorageContext): Pro
   if (before === null) return;
   decode(before);
   try {
-    const stamp = createHash('sha256').update(before).digest('hex');
-    await machine.remove(file, stamp);
+    await machine.remove(file, hashText(before));
     if ((await machine.read(file)) !== null) throw unavailable('record-remains');
   } catch (error) {
     throw unavailable(error);

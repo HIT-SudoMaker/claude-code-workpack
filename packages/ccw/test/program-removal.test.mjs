@@ -165,9 +165,11 @@ async function fixture(t, platform = process.platform, extra = {}) {
       f.calls.push({ kind: 'binary', target: url });
       return state.checksumBad ? Buffer.from('bad release bytes') : bytes;
     },
+    userPathContains: async () => state.pathConfigured === true,
     async ensureUserPath(directory) {
       f.calls.push({ kind: 'path', target: directory });
       if (state.pathFails) throw new Error('user-path-write-failed');
+      state.pathConfigured = true;
     },
     async source(repository, commit, _folder, options) {
       if (state.sourceGate !== null) return state.sourceGate(options);

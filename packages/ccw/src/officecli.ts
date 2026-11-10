@@ -6,12 +6,13 @@ import { currentSkill, prepareSkillFiles, skillFilesStamp } from './skill-files.
 import { prepareSkill } from './skills.js';
 import { prepareMcp } from './mcp.js';
 import { errorCode, isGitRevision, isObject } from './machine.js';
-import { cancelled, json, readMcpServers, REPLACE_CONSENT, sequence, unchanged } from './model.js';
-import type { Action, Change, Context, Inspection, Item, Prepared, Selection } from './model.js';
+import { json, readMcpServers, REPLACE_CONSENT, unchanged } from './model.js';
+import type { Change, Context, Inspection, Item, Prepared, Selection, OperationHandler } from './model.js';
 import { isExactVersion, resolveNpmView } from './npm-registry.js';
 import type { NpmRegistry } from './npm-registry.js';
 import { officeBinary, samePath } from './program-channels.js';
 import { officeVersion, prepareProgram, programs } from './programs.js';
+import { composeProgramOperations, programOperation, programPrepared } from './program-operations.js';
 import { sourcesFile } from './storage.js';
 
 /** OfficeCLI 接入入口的 id 集合：域内入口类型与计划层的重叠门判共用 */
@@ -131,41 +132,63 @@ export function createOfficecli(ctx: Context) {
     return observed.entries.filter(entry => entry.owner === id);
   }
 
-  async function detach(entries: readonly OfficeEntry[], action: Action): Promise<Prepared> {
+  async function detach(entries: readonly OfficeEntry[], itemId: string): Promise<Prepared> {
     if (entries.length === 0) throw new Error('no-connection');
-    const operations: Prepared[] = [];
+    const operations = [];
     for (const entry of entries) {
-      const operation =
+      const prepared =
         entry.id === 'skill:officecli'
           ? await prepareSkill(ctx, 'officecli', 'skills', { id: entry.id, action: 'detach' })
           : await prepareMcp(ctx, 'officecli', { id: entry.id, action: 'detach' });
-      let isComplete = false;
-      const verify = async () => {
-        if (!isComplete || action === 'reinstall') return;
-        if (entry.id === 'skill:officecli') unchanged(await ctx.machine.treeStamp(directory), null);
-        else unchanged((await readMcpServers(ctx)).officecli, undefined);
-      };
-      const step: Prepared = {
-        ...(operation.writes ? { writes: operation.writes } : {}),
-        changes: operation.changes,
-        async run(report, signal) {
-          cancelled(signal);
-          if (isComplete) {
-            await verify();
-            return;
-          }
-          await operation.run?.(report, signal);
-          isComplete = true;
-        },
-        remaining: () => (isComplete ? undefined : step),
-        verify,
-      };
-      operations.push(step);
+      operations.push(...composeProgramOperations(prepared, itemId, 'detach-' + entry.id).operations!);
     }
-    return sequence(operations);
+    return programPrepared(operations);
   }
 
   return {
+    handlers: {
+      'office.detached': {
+        async assess(definition) {
+          if (typeof definition.payload.binary !== 'string' || typeof definition.payload.identity !== 'string')
+            return { state: 'blocked', problem: 'operation-record-invalid' };
+          const binary = definition.payload.binary;
+          const identity = definition.payload.identity;
+          const unmatched = Array.isArray(definition.payload.unmatched) ? definition.payload.unmatched : [];
+          const current = await observe();
+          if (current.isConnectionsUnknown) return { state: 'unknown', problem: 'installation-state-unconfirmed' };
+          const entries = current.entries.filter(
+            entry =>
+              !unmatched.includes(entry.id) &&
+              (entry.owner === identity ||
+                (entry.owner === null &&
+                  (entry.id === 'skill:officecli' ||
+                    (current.mcpCommand !== undefined && !path.isAbsolute(current.mcpCommand)))) ||
+                (entry.id === 'mcp:officecli' &&
+                  current.mcpCommand !== undefined &&
+                  path.isAbsolute(current.mcpCommand) &&
+                  samePath(ctx, current.mcpCommand, binary))),
+          );
+          return entries.length
+            ? { state: 'blocked', problem: 'target-changed' }
+            : { state: 'complete', evidence: { detached: true } };
+        },
+        execute() {
+          return Promise.resolve({ receipt: { kind: 'returned', failure: null } });
+        },
+      } satisfies OperationHandler,
+      'office.keep': {
+        assess(definition) {
+          return Promise.resolve({
+            state: 'complete',
+            evidence: {},
+            effects: definition.changes.map(change => ({ ...change, state: 'kept' as const })),
+          });
+        },
+        execute() {
+          return Promise.resolve({ receipt: { kind: 'returned', failure: null } });
+        },
+      } satisfies OperationHandler,
+    },
     async inspect(): Promise<Inspection> {
       const observed = await observe();
       const items: Item[] = observed.found.items.map(item => {
@@ -224,18 +247,12 @@ export function createOfficecli(ctx: Context) {
       )
         throw new Error('installation-state-unconfirmed');
       const entries = related(observed, identity ?? null);
-      if (selection.action === 'detach') return detach(entries, selection.action);
+      if (selection.action === 'detach') return detach(entries, selection.id);
       if (selection.action === 'uninstall') {
         if (!program)
-          return sequence([
-            await detach(entries, selection.action),
-            {
-              changes: [{ code: 'program-not-installed' }],
-              run(report) {
-                report({ state: 'kept', code: 'program-not-installed' });
-                return Promise.resolve();
-              },
-            },
+          return programPrepared([
+            ...(await detach(entries, selection.id)).operations!,
+            programOperation(selection.id, 'program-absent', 'office.keep', {}, [{ code: 'program-not-installed' }]),
           ]);
         const removal = await prepareProgram(ctx, 'officecli', selection, program);
         const belongs = (value: Observation, entry: OfficeEntry) =>
@@ -260,39 +277,37 @@ export function createOfficecli(ctx: Context) {
             ? ['officecli']
             : []),
         ];
-        const preserved: Prepared = {
-          changes: unmatched.map(detail => ({ code: 'unmatched-integration-kept', detail })),
-          run(report) {
-            for (const detail of unmatched) report({ state: 'kept', code: 'unmatched-integration-kept', detail });
-            return Promise.resolve();
+        const detached = expected.length ? await detach(expected, selection.id) : programPrepared([]);
+        const guard = programOperation(
+          selection.id,
+          'integrations-detached',
+          'office.detached',
+          {
+            binary: program.binary,
+            identity,
+            unmatched: observed.entries.filter(entry => entry.owner === undefined).map(entry => entry.id),
           },
-        };
-        const guard = (hasDetached: boolean): Prepared => {
-          const verify = async () => {
-            const current = await observe(observed.found);
-            if (current.isConnectionsUnknown) throw new Error('installation-state-unconfirmed');
-            const actual = scope(current);
-            unchanged(
-              actual.map(entry => entry.id),
-              hasDetached ? [] : expected.map(entry => entry.id),
-            );
-            if (!hasDetached)
-              for (const entry of expected)
-                unchanged(
-                  entry.id === 'skill:officecli' ? current.skillStamp : current.registration,
-                  entry.id === 'skill:officecli' ? observed.skillStamp : observed.registration,
-                );
-          };
-          return { changes: [], run: verify, ...(hasDetached ? { verify } : {}) };
-        };
-        return sequence([
-          guard(false),
-          ...(expected.length ? [await detach(expected, selection.action)] : []),
-          guard(true),
-          removal,
-          preserved,
+          [],
+          detached.operations!.map(value => value.id),
+        );
+        const removalOperations = removal.operations!.map(operation => ({
+          ...operation,
+          dependsOn: [...operation.dependsOn, guard.id],
+        }));
+        return programPrepared([
+          ...detached.operations!,
+          guard,
+          ...removalOperations,
+          programOperation(
+            selection.id,
+            'preserved-integrations',
+            'office.keep',
+            {},
+            unmatched.map(detail => ({ code: 'unmatched-integration-kept', detail })),
+          ),
         ]);
       }
+
       if (!['install', 'connect', 'update', 'reinstall'].includes(selection.action))
         throw new Error('action-unavailable');
       const integration = selection.fields?.connection;
@@ -314,18 +329,30 @@ export function createOfficecli(ctx: Context) {
       if (shouldKeepProgram) unchanged(await ctx.machine.treeStamp(program.binary), stamp);
       const operation = shouldKeepProgram
         ? {
+            ...programPrepared([
+              programOperation(
+                selection.id,
+                'program-ready',
+                'program.ready',
+                { kind: 'officecli', binary: program.binary, before: stamp, version, keep: true },
+                [{ code: 'program-kept' }],
+              ),
+              ...(program.channel === 'native'
+                ? [
+                    programOperation(
+                      selection.id,
+                      'program-path',
+                      'program.path',
+                      { directory: path.dirname(program.binary) },
+                      [],
+                      [selection.id + '/program-ready'],
+                    ),
+                  ]
+                : []),
+            ]),
             targetVersion: version,
             targetBinary: program.binary,
             ...(program.channel === 'npm' ? { targetRegistry: null } : {}),
-            changes: [{ code: 'program-kept' }],
-            async run(report: Parameters<NonNullable<Prepared['run']>>[0]) {
-              unchanged(await ctx.machine.treeStamp(program.binary), stamp);
-              if (program.channel === 'native') await ctx.effects.ensureUserPath(path.dirname(program.binary));
-              report({ state: 'kept' as const, code: 'program-kept' });
-            },
-            async verify() {
-              unchanged(await ctx.machine.treeStamp(program.binary), stamp);
-            },
           }
         : await prepareProgram(ctx, 'officecli', selection, program);
       const binary = operation.targetBinary ?? program?.binary ?? officeBinary(ctx);
@@ -336,18 +363,31 @@ export function createOfficecli(ctx: Context) {
         ...(operation.targetRegistry !== undefined ? { registry: operation.targetRegistry } : {}),
       });
       const before =
-        selection.action === 'reinstall' && entries.length ? await detach(entries, selection.action) : undefined;
-      // 接入步骤也可能跨越外部修改；完成需复核整个所选合同，续办只重做该确认。
-      const assess = async () => {
-        await operation.verify?.();
-        await connection.verify?.();
-      };
-      return sequence([
-        ...(before ? [before] : []),
-        operation,
+        selection.action === 'reinstall' && entries.length ? await detach(entries, selection.id) : undefined;
+      const detached = before ?? programPrepared([]);
+      const programOperations = operation.operations!.map(value => ({
+        ...value,
+        dependsOn: [...value.dependsOn, ...detached.operations!.map(entry => entry.id)],
+      }));
+      const connected = composeProgramOperations(
         connection,
-        { changes: [], run: assess, verify: assess },
-      ]);
+        selection.id,
+        'connection',
+        programOperations.map(value => value.id),
+      );
+      const superseded = detached.operations!.map(operation => {
+        const next = connected.operations!.find(value =>
+          operation.handler === 'skill.disable'
+            ? value.handler === 'skill.deploy'
+            : operation.handler === 'skill.source-remove'
+              ? value.handler === 'skill.source'
+              : operation.handler === 'mcp.registration' &&
+                value.handler === 'mcp.registration' &&
+                value.payload.target !== null,
+        );
+        return next ? { ...operation, payload: { ...operation.payload, supersededBy: next.id } } : operation;
+      });
+      return programPrepared([...superseded, ...programOperations, ...connected.operations!]);
     },
   };
 }
@@ -397,6 +437,16 @@ interface OfficeTarget {
   readonly binary: string;
   readonly source: 'npm' | 'native';
   readonly registry?: NpmRegistry;
+}
+
+function officeConnections(skill: Prepared, mcp: Prepared): Prepared {
+  return programPrepared([
+    ...skill.operations!,
+    ...mcp.operations!.map(operation => ({
+      ...operation,
+      dependsOn: [...operation.dependsOn, ...skill.operations!.map(value => value.id)],
+    })),
+  ]);
 }
 
 async function officeRevision(ctx: Context, target: OfficeTarget): Promise<string> {
@@ -455,22 +505,13 @@ async function prepareOfficeConnection(
         registration: () => registration,
       },
     );
-    return {
-      ...operation,
-      get changes() {
-        return operation.changes;
-      },
-      async verify() {
-        await operation.verify?.();
-        unchanged((await readMcpServers(ctx)).officecli, registration);
-      },
-    };
+    return operation;
   };
 
   if (selection.action === 'install') {
     if (before !== null && observed.skillEvidence !== 'none') {
       const skill = currentSkill(ctx, 'officecli', directory, before);
-      if (integration === 'both') return sequence([skill, await mcp('connect')]);
+      if (integration === 'both') return officeConnections(skill, await mcp('connect'));
       return integration === 'mcp' ? mcp('connect') : skill;
     }
   }
@@ -484,13 +525,7 @@ async function prepareOfficeConnection(
       record.stamp !== before
     ) {
       const code = before === null ? 'office-connection-kept' : 'office-local-skill-kept';
-      return {
-        changes: [{ code }],
-        run(report) {
-          report({ state: 'kept', code });
-          return Promise.resolve();
-        },
-      };
+      return programPrepared([programOperation(selection.id, 'connection-kept', 'office.keep', {}, [{ code }])]);
     }
   }
 
@@ -528,5 +563,5 @@ async function prepareOfficeConnection(
       { repository, revision, files, stamp: skillFilesStamp(files) },
     );
   }
-  return shouldConnectBoth ? sequence([skill, await mcp('connect', isReinstall)]) : skill;
+  return shouldConnectBoth ? officeConnections(skill, await mcp('connect', isReinstall)) : skill;
 }
