@@ -117,6 +117,15 @@ test('plugin installation restores its approved marketplace revision without res
   const name = 'github@claude-plugins-official';
   const claude = path.join(f.home, 'claude.exe');
   await f.write(claude, 'claude binary');
+  await f.json(f.settingsFile, {
+    extraKnownMarketplaces: {
+      'claude-plugins-official': {
+        source: { source: 'github', repo: 'anthropics/claude-plugins-official', ref: 'stable' },
+        keep: 'custom-setting',
+      },
+      external: { keep: true },
+    },
+  });
   const files = [
     {
       path: '.claude-plugin/marketplace.json',
@@ -185,6 +194,13 @@ test('plugin installation restores its approved marketplace revision without res
   assert.equal((await second.apply(resumed.id)).state, 'done');
   assert.equal(resolutions, 1);
   assert.equal(installs, 1);
+  assert.equal(
+    (await f.read(path.join(f.claudeRoot, 'plugins/known_marketplaces.json')))['claude-plugins-official'].source.ref,
+    undefined,
+  );
+  assert.equal((await f.read(f.settingsFile)).extraKnownMarketplaces['claude-plugins-official'].source.ref, 'stable');
+  assert.equal((await f.read(f.settingsFile)).extraKnownMarketplaces['claude-plugins-official'].keep, 'custom-setting');
+  assert.deepEqual((await f.read(f.settingsFile)).extraKnownMarketplaces.external, { keep: true });
 });
 
 test('Serena same-byte reinstall with a lost command receipt stays unknown after restart', async t => {

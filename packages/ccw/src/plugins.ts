@@ -18,6 +18,7 @@ import type {
   JsonObject,
   OperationDefinition,
   OperationHandler,
+  OperationFact,
 } from './model.js';
 import { claudeCommand } from './programs.js';
 import {
@@ -204,6 +205,7 @@ interface PluginPatch {
   readonly path: readonly string[];
   readonly before: string;
   readonly value: Json;
+  readonly remove: boolean;
 }
 function pluginPatches(value: unknown): readonly PluginPatch[] {
   return extensionObjects(value).map(patch => {
@@ -213,7 +215,12 @@ function pluginPatches(value: unknown): readonly PluginPatch[] {
       !Object.hasOwn(patch, 'value')
     )
       throw new Error('operation-record-invalid');
-    return { path: patch.path, before: extensionString(patch.before), value: patch.value ?? null };
+    return {
+      path: patch.path,
+      before: extensionString(patch.before),
+      value: patch.value ?? null,
+      remove: patch.remove === true,
+    };
   });
 }
 function at(document: Record<string, unknown>, parts: readonly string[]): unknown {
@@ -226,7 +233,7 @@ function patchOperation(
   suffix: string,
   file: string,
   document: Record<string, unknown>,
-  values: readonly { path: readonly string[]; value: Json }[],
+  values: readonly { path: readonly string[]; value: Json; remove?: boolean }[],
   dependsOn: readonly string[],
   changes: OperationDefinition['changes'],
 ): OperationDefinition {
@@ -288,6 +295,7 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
     (await Promise.all(records.map(record => pluginFilePresent(ctx, record)))).every(Boolean);
   if (action === 'connect' && !canReuse) throw new Error('plugin-not-ready');
   const operations: OperationDefinition[] = [];
+  const restores: OperationDefinition[] = [];
   let dependencies: readonly string[] = [];
   if (action === 'reinstall') {
     const help = await claudeCommand(ctx, ['plugin', 'uninstall', '--help']);
@@ -392,7 +400,54 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       [marketWrite.id],
       [],
     );
-    operations.push(stage, marketWrite, settingWrite);
+    const originalKnownRef = object(object(markets?.[source.marketName]).source).ref;
+    const originalSettingsRef = extraSource.ref;
+    if (originalSettingsRef !== undefined && typeof originalSettingsRef !== 'string')
+      throw new Error('marketplace-source-conflict');
+    const knownRestore: OperationDefinition = {
+      id: `${itemId}/marketplace-source-restore`,
+      itemId,
+      handler: 'plugin.fields',
+      dependsOn: [`${itemId}/command`],
+      writes: [marketplaceFile],
+      payload: {
+        file: marketplaceFile,
+        patches: [
+          {
+            path: [source.marketName, 'source', 'ref'],
+            before: extensionDigest(revision),
+            value: originalKnownRef === undefined ? null : extensionString(originalKnownRef),
+            remove: originalKnownRef === undefined,
+          },
+        ],
+      },
+      changes: [],
+    };
+    const settingsRestore: OperationDefinition = {
+      id: `${itemId}/marketplace-settings-restore`,
+      itemId,
+      handler: 'plugin.fields',
+      dependsOn: [`${itemId}/command`],
+      writes: [ctx.settingsFile],
+      payload: {
+        file: ctx.settingsFile,
+        patches: [
+          {
+            path: ['extraKnownMarketplaces', source.marketName, 'source', 'ref'],
+            before: extensionDigest(revision),
+            value: originalSettingsRef === undefined ? null : originalSettingsRef,
+            remove: originalSettingsRef === undefined,
+          },
+        ],
+      },
+      changes: [],
+    };
+    restores.push(knownRestore, settingsRestore);
+    operations.push(
+      stage,
+      { ...marketWrite, payload: { ...marketWrite.payload, supersededBy: knownRestore.id } },
+      { ...settingWrite, payload: { ...settingWrite.payload, supersededBy: settingsRestore.id } },
+    );
     dependencies = [settingWrite.id];
     frozen = {
       directory,
@@ -401,6 +456,10 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       stamp: treeFilesStamp(pluginFiles),
       repository: source.repository,
       marketName: source.marketName,
+      knownRestore: knownRestore.id,
+      settingsRestore: settingsRestore.id,
+      originalKnownRef: extensionDigest(originalKnownRef),
+      originalSettingsRef: extensionDigest(originalSettingsRef),
     };
   }
   if (action === 'reinstall') {
@@ -447,6 +506,7 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
     changes: [{ code: canReuse ? 'plugin-reuse' : 'plugin-confirm', detail: name }, { code: 'new-session-required' }],
   };
   operations.push(command);
+  operations.push(...restores);
   if (name.startsWith('github@') && selection.fields?.secret) {
     const credential: OperationDefinition = {
       id: `${itemId}/credential`,
@@ -493,7 +553,7 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
     const name = extensionString(p.name);
     unchanged(extensionDigest(pluginSource(name, markets) ?? declaredMarketSource(name, markets)), p.sourceIdentity);
   };
-  const sourceReady = async (source: JsonObject) => {
+  const sourceReady = async (source: JsonObject, facts: Readonly<Record<string, OperationFact>> = {}) => {
     const market = object(
       (await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json')))[
         extensionString(source.marketName)
@@ -506,9 +566,13 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
       ).source,
     );
     unchanged(known.repo, source.repository);
-    unchanged(known.ref, source.revision);
+    if (facts[extensionString(source.knownRestore)]?.status === 'confirmed')
+      unchanged(extensionDigest(known.ref), source.originalKnownRef);
+    else unchanged(known.ref, source.revision);
     unchanged(extra.repo, source.repository);
-    unchanged(extra.ref, source.revision);
+    if (facts[extensionString(source.settingsRestore)]?.status === 'confirmed')
+      unchanged(extensionDigest(extra.ref), source.originalSettingsRef);
+    else unchanged(extra.ref, source.revision);
     unchanged(
       (await ctx.machine.read(path.join(extensionString(source.directory), '.gcs-sha')))?.trim(),
       source.revision,
@@ -517,7 +581,7 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
   };
   return {
     'plugin.fields': {
-      async assess(definition, fact) {
+      async assess(definition, fact, facts) {
         const patches = pluginPatches(definition.payload.patches);
         const current = await json(ctx.machine, extensionString(definition.payload.file));
         if (definition.payload.pluginName !== undefined)
@@ -527,7 +591,16 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
             ),
             definition.payload.records,
           );
-        if (patches.every(patch => extensionDigest(at(current, patch.path)) === extensionDigest(patch.value)))
+        const superseded =
+          typeof definition.payload.supersededBy === 'string' &&
+          facts[definition.payload.supersededBy]?.status === 'confirmed';
+        if (
+          patches.every(
+            patch =>
+              extensionDigest(at(current, patch.path)) === extensionDigest(patch.remove ? undefined : patch.value) ||
+              (superseded && patch.path.at(-1) === 'ref' && extensionDigest(at(current, patch.path)) === patch.before),
+          )
+        )
           return {
             state: 'complete',
             evidence: { matched: true },
@@ -535,7 +608,11 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
           };
         if (
           fact.status === 'confirmed' ||
-          patches.some(patch => extensionDigest(at(current, patch.path)) !== patch.before)
+          patches.some(
+            patch =>
+              extensionDigest(at(current, patch.path)) !== patch.before &&
+              extensionDigest(at(current, patch.path)) !== extensionDigest(patch.remove ? undefined : patch.value),
+          )
         )
           return { state: 'unknown', problem: 'target-changed' };
         return { state: 'ready' };
@@ -551,14 +628,17 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
           );
         await ctx.effects.editJson(extensionString(definition.payload.file), document => {
           for (const patch of patches) {
-            unchanged(extensionDigest(at(document, patch.path)), patch.before);
+            const current = extensionDigest(at(document, patch.path));
+            if (current !== patch.before && current !== extensionDigest(patch.remove ? undefined : patch.value))
+              throw new Error('target-changed');
             let parent = document;
             for (const part of patch.path.slice(0, -1)) {
               const child = object(parent[part]);
               parent[part] = child;
               parent = child;
             }
-            parent[patch.path.at(-1)!] = patch.value;
+            if (patch.remove) delete parent[patch.path.at(-1)!];
+            else parent[patch.path.at(-1)!] = patch.value;
           }
         });
         return { receipt: { kind: 'returned', failure: null }, evidence: { matched: true } };
@@ -597,7 +677,7 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
         const p = definition.payload;
         await sourceIdentity(p);
         const current = await capture(extensionString(p.name));
-        if (p.source) await sourceReady(extensionObject(p.source));
+        if (p.source) await sourceReady(extensionObject(p.source), facts);
         if (p.verb === 'uninstall') {
           const successor = facts[extensionString(p.successor)];
           if (successor?.status === 'confirmed' && fact.receipt?.kind === 'returned' && !fact.receipt.failure)
