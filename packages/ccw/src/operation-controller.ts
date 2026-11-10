@@ -433,7 +433,10 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           if (!done && !problems.size) problems.add('dependency-not-ready');
           for (const problem of [...problems].reverse())
             if (!effects.some(effect => effect.code === problem))
-              effects.push({ state: problem === 'cancelled' ? 'skipped' : 'failed', code: problem });
+              effects.push({
+                state: problem === 'cancelled' || problem === 'dependency-not-ready' ? 'skipped' : 'failed',
+                code: problem,
+              });
           const result: ItemResult = {
             id: item.id,
             title: item.title,
