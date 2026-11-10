@@ -97,12 +97,10 @@ test('恢复只补输缺失的凭据，确认前不写入，密钥不进入显�
   const secret = 'fixture-terminal-unsaved-secret';
   const f = await createEnv(t, { seed: { settings: { keep: true } } });
   const machine = f.machine();
-  await f
-    .ccw(machine)
-    .plan({
-      task: 'install',
-      selected: [{ id: 'settings', fields: { mode: 'api', baseUrl: 'https://gateway.example.test', secret } }],
-    });
+  await f.ccw(machine).plan({
+    task: 'install',
+    selected: [{ id: 'settings', fields: { mode: 'api', baseUrl: 'https://gateway.example.test', secret } }],
+  });
   let forms = 0;
   let confirmed = false;
   const views = [];
