@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { HOME_TITLE } from '../dist/render.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 import { isIgnoredText } from '../dist/terminal-view.js';
 import { wait } from './env.mjs';
 
@@ -305,7 +305,7 @@ test('清理数据：空选择不确认', async () => {
   assert.equal(plans, 1);
 });
 
-test('成员更新与套件整装互斥：提交前阻断', async () => {
+test('成员更新与套件整装冲突：展示核心计划结果', async () => {
   const member = {
     id: 'skill:tdd',
     title: 'tdd',
@@ -330,9 +330,16 @@ test('成员更新与套件整装互斥：提交前阻断', async () => {
       async inspect() {
         return { items: [member, suite], problems: [] };
       },
-      async plan() {
+      async plan(request) {
         planned++;
-        throw new Error('should not plan');
+        assert.deepEqual(request.selected, [{ id: member.id, maintenance: 'update' }, { id: suite.id }]);
+        return {
+          id: 'conflict',
+          problem: null,
+          items: [
+            { id: member.id, title: member.title, action: 'update', problem: 'overlapping-selection', changes: [] },
+          ],
+        };
       },
     },
     {
@@ -373,7 +380,7 @@ test('成员更新与套件整装互斥：提交前阻断', async () => {
       },
     },
   );
-  assert.equal(planned, 0, '冲突组合不应进入计划');
+  assert.equal(planned, 1, '选择与冲突统一由核心计划处理');
 });
 
 test('输入闸门：仅放行非命名的自由文本', () => {

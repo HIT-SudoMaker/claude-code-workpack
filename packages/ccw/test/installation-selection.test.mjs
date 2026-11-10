@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { HOME_TITLE } from '../dist/render.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 
 const item = (id, kind, name, actions = ['install']) => ({
   id,
@@ -22,7 +22,7 @@ const contents = [
 const indexOf = (page, name) => page.rows.findIndex(row => row.label.startsWith(name));
 const checked = page => page.rows.filter(row => row.checked).map(row => row.label);
 
-async function scenario(select, { items = contents, choose, plan, inspect, apply, resultChoice = 1 } = {}) {
+async function scenario(select, { items = contents, choose, plan, inspect, apply, preview, resultChoice = 1 } = {}) {
   const plans = [];
   const applications = [];
   let homes = 0;
@@ -55,6 +55,7 @@ async function scenario(select, { items = contents, choose, plan, inspect, apply
       wait: (_title, work) => work(new AbortController().signal),
       handoff: work => work(),
       show() {},
+      confirmInstallPreview: preview,
       select,
       async choose(title, choices, focus) {
         if (typeof title !== 'string') {
@@ -152,7 +153,7 @@ test('准备失败：保留选择并阻止执行', async () => {
           ...selection,
           title: contents.find(entry => entry.id === selection.id)?.title ?? selection.id,
           changes: [],
-          problem: selection.id === 'mcp:context7' ? 'invalid-base-url' : null,
+          problem: 'invalid-base-url',
         })),
       }),
     },
@@ -227,6 +228,7 @@ for (const replace of [true, false])
       },
       {
         items,
+        preview: () => (steps === 1 ? 1 : 0),
         choose: (_title, options) => {
           choices++;
           assert.deepEqual(options, ['备份并替换', '取消选择', '返回', '查看详情']);

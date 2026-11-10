@@ -20,6 +20,8 @@ test('验证 Windows 终端交互与恢复', { skip: process.platform !== 'win32
     'brand',
     'settings',
     'selection',
+    'recovery',
+    'recovery-unknown',
     'skills-cancel',
     'uninstall',
     'uninstall-data',

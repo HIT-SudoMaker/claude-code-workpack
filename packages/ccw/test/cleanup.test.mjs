@@ -9,7 +9,7 @@ import { createMachine } from '../dist/machine.js';
 import { formatBytes } from '../dist/cleanup.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { describeResult } from '../dist/run-presentation.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 import { createEnv } from './env.mjs';
 
 test('人类可读字节换算', () => {

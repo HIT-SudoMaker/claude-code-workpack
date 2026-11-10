@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { ERROR_MESSAGES } from '../dist/errors.js';
 import { describeRun } from '../dist/run-presentation.js';
 import { HOME_TITLE, TEXT } from '../dist/render.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 import { WARNING_MESSAGES } from '../dist/warnings.js';
 import { wait } from './env.mjs';
 
@@ -61,6 +61,16 @@ test('浏览结果详情：保留续办和选择', async () => {
   let details = 0;
   await runTerminal(
     {
+      async recovery() {
+        return applications === 1
+          ? {
+              id: 'frozen-remaining',
+              intent: { task: 'install' },
+              items: items.map(item => ({ ...item, state: 'pending' })),
+              inputs: [],
+            }
+          : undefined;
+      },
       async inspect() {
         inspections++;
         return { items, problems: [] };
@@ -115,6 +125,7 @@ test('浏览结果详情：保留续办和选择', async () => {
       },
       async choose(title, choices, focus, cancelIndex) {
         if (title === HOME_TITLE) return homes++ ? 4 : 0;
+        if (typeof title === 'string' && title.startsWith('未完成任务')) return 0;
         if (title === '选择结果') {
           assert.deepEqual([inspections, requests.length, applications], [1, 1, 1]);
           return detailSelections++;
@@ -137,7 +148,7 @@ test('浏览结果详情：保留续办和选择', async () => {
         assert.equal(typeof title, 'object');
         assert.ok(title.rows.every(row => row.details.length === 0));
         assert.equal(cancelIndex, 1);
-        assert.deepEqual(choices, [applications === 1 ? '重试未完成项' : '返回列表', '返回主菜单', '查看详情']);
+        assert.deepEqual(choices, [applications === 1 ? '继续未完成任务' : '返回列表', '返回主菜单', '查看详情']);
         if (applications === 2) return 1;
         assert.equal(focus, resultVisits === 0 ? 1 : 2);
         return resultVisits++ < 2 ? 2 : 0;
