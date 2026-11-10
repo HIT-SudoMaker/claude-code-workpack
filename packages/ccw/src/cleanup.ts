@@ -245,7 +245,6 @@ const operation = (
   payload,
   changes,
   dependsOn,
-  writes: typeof payload.file === 'string' ? [payload.file] : [],
 });
 
 /** Scope and target kind are checked on every assessment, including after a restart. */
