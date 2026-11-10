@@ -64,5 +64,5 @@ async function prepareClaudeProgram(ctx: Context, selection: Selection): Promise
     'defaults',
     [id + '/program-ready'],
   );
-  return programPrepared([...(operation.operations ?? []), ...defaults.operations!]);
+  return programPrepared([...operation.operations, ...defaults.operations]);
 }

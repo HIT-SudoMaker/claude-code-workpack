@@ -140,7 +140,7 @@ export function createOfficecli(ctx: Context) {
         entry.id === 'skill:officecli'
           ? await prepareSkill(ctx, 'officecli', 'skills', { id: entry.id, action: 'detach' })
           : await prepareMcp(ctx, 'officecli', { id: entry.id, action: 'detach' });
-      operations.push(...composeProgramOperations(prepared, itemId, 'detach-' + entry.id).operations!);
+      operations.push(...composeProgramOperations(prepared, itemId, 'detach-' + entry.id).operations);
     }
     return programPrepared(operations);
   }
@@ -251,7 +251,7 @@ export function createOfficecli(ctx: Context) {
       if (selection.action === 'uninstall') {
         if (!program)
           return programPrepared([
-            ...(await detach(entries, selection.id)).operations!,
+            ...(await detach(entries, selection.id)).operations,
             programOperation(selection.id, 'program-absent', 'office.keep', {}, [{ code: 'program-not-installed' }]),
           ]);
         const removal = await prepareProgram(ctx, 'officecli', selection, program);
@@ -288,14 +288,14 @@ export function createOfficecli(ctx: Context) {
             unmatched: observed.entries.filter(entry => entry.owner === undefined).map(entry => entry.id),
           },
           [],
-          detached.operations!.map(value => value.id),
+          detached.operations.map(value => value.id),
         );
-        const removalOperations = removal.operations!.map(operation => ({
+        const removalOperations = removal.operations.map(operation => ({
           ...operation,
           dependsOn: [...operation.dependsOn, guard.id],
         }));
         return programPrepared([
-          ...detached.operations!,
+          ...detached.operations,
           guard,
           ...removalOperations,
           programOperation(
@@ -365,9 +365,9 @@ export function createOfficecli(ctx: Context) {
       const before =
         selection.action === 'reinstall' && entries.length ? await detach(entries, selection.id) : undefined;
       const detached = before ?? programPrepared([]);
-      const programOperations = operation.operations!.map(value => ({
+      const programOperations = operation.operations.map(value => ({
         ...value,
-        dependsOn: [...value.dependsOn, ...detached.operations!.map(entry => entry.id)],
+        dependsOn: [...value.dependsOn, ...detached.operations.map(entry => entry.id)],
       }));
       const connected = composeProgramOperations(
         connection,
@@ -375,8 +375,8 @@ export function createOfficecli(ctx: Context) {
         'connection',
         programOperations.map(value => value.id),
       );
-      const superseded = detached.operations!.map(operation => {
-        const next = connected.operations!.find(value =>
+      const superseded = detached.operations.map(operation => {
+        const next = connected.operations.find(value =>
           operation.handler === 'skill.disable'
             ? value.handler === 'skill.deploy'
             : operation.handler === 'skill.source-remove'
@@ -387,7 +387,7 @@ export function createOfficecli(ctx: Context) {
         );
         return next ? { ...operation, payload: { ...operation.payload, supersededBy: next.id } } : operation;
       });
-      return programPrepared([...superseded, ...programOperations, ...connected.operations!]);
+      return programPrepared([...superseded, ...programOperations, ...connected.operations]);
     },
   };
 }
@@ -441,10 +441,10 @@ interface OfficeTarget {
 
 function officeConnections(skill: Prepared, mcp: Prepared): Prepared {
   return programPrepared([
-    ...skill.operations!,
-    ...mcp.operations!.map(operation => ({
+    ...skill.operations,
+    ...mcp.operations.map(operation => ({
       ...operation,
-      dependsOn: [...operation.dependsOn, ...skill.operations!.map(value => value.id)],
+      dependsOn: [...operation.dependsOn, ...skill.operations.map(value => value.id)],
     })),
   ]);
 }

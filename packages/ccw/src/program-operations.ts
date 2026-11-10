@@ -379,11 +379,12 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         if (current === null)
           return complete(
             { file: target.file, absent: true },
-            programEffects(
-              target.file.endsWith('install.cmd') ? 'failed-install-cleaned' : 'program-copy-removed',
-              target.file,
-              target.before === null ? 'kept' : 'done',
-            ),
+            target.before === null
+              ? []
+              : programEffects(
+                  target.file.endsWith('install.cmd') ? 'failed-install-cleaned' : 'program-copy-removed',
+                  target.file,
+                ),
           );
         const expected = target.ownerOperation ? facts[target.ownerOperation]?.evidence?.stamp : target.before;
         if (current !== expected) return blocked('program-changed');
@@ -486,6 +487,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
           for (const candidate of found.values.values()) {
             if (!(await matchesProgramScope(ctx, target.scope, candidate))) continue;
             const beforeProbe = await ctx.machine.treeStamp(candidate.binary);
+            if (beforeProbe === null) continue;
             const version =
               target.program.kind === 'claude'
                 ? await claudeVersion(ctx, candidate.binary)
@@ -499,7 +501,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
                 programEffects('package-command-completed'),
               );
           }
-          return unknown();
+          return unknown(current === null ? 'program-not-ready' : undefined);
         }
         if (current !== target.before) return blocked('program-changed');
         await verifyProgramBeforeCommand(ctx, target.program, programScope(ctx, target.scope, target.program));
@@ -546,6 +548,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
             { absent: true, binary: target.program.binary },
             programEffects('program-removed', target.program.binary),
           );
+        if (issued(fact) && current === null) return unknown('program-removal-unconfirmed');
         if (issued(fact) && (fact.receipt?.kind !== 'returned' || fact.receipt.failure === null))
           return unknown('program-removal-unconfirmed');
         if (current !== target.before) return blocked('program-changed');
@@ -632,11 +635,22 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
           return { state: 'ready', dispatch: { native: null, manifest: null } };
         }
         if (fact.evidence?.snapshotUnavailable === true) return unknown();
+        if (
+          fact.evidence?.stamp !== undefined &&
+          fact.evidence.stamp !== (await ctx.machine.treeStamp(requiredText(fact.evidence.binary)))
+        )
+          return blocked('program-changed');
         const selected = await installed(ctx, target, 'npm');
         if (selected) {
+          const captured: unknown = fact.evidence?.snapshot;
+          if (!npmSnapshot(captured)) return unknown();
+          await verifySnapshot(ctx, target, captured);
           if (fact.evidence?.stamp !== undefined && fact.evidence.stamp !== selected.stamp)
             return blocked('program-changed');
-          return complete({ ...selected, installed: true }, programEffects('package-command-completed'));
+          return complete(
+            { ...fact.evidence, ...selected, installed: true },
+            programEffects('package-command-completed'),
+          );
         }
         if (ctx.platform !== 'win32' || fact.receipt?.kind !== 'returned') return unknown();
         // A returned command with failed installation permits the frozen CMD alternative.
@@ -652,7 +666,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         } else await verifySnapshot(ctx, target, prior);
         return complete(
           { ...fact.evidence, fallback: true, installed: false },
-          programEffects(fact.receipt.failure ?? 'program-not-ready', undefined, 'kept'),
+          programEffects(fact.receipt.failure ?? 'program-not-ready', undefined, 'failed'),
         );
       },
       execute(definition) {
@@ -697,7 +711,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
           if (before.binary && (await ctx.machine.treeStamp(before.binary)) !== null) return blocked('program-changed');
           return complete(
             { absent: true },
-            programEffects('failed-install-cleaned', undefined, issued(fact) ? 'done' : 'kept'),
+            before.manifest === null && !issued(fact) ? [] : programEffects('failed-install-cleaned'),
           );
         }
         await verifySnapshot(ctx, target, before);
@@ -770,8 +784,13 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         await verifyInstallScope(ctx, target);
         if (issued(fact)) {
           if (fact.evidence?.snapshotUnavailable === true) return unknown();
+          if (
+            fact.evidence?.stamp !== undefined &&
+            fact.evidence.stamp !== (await ctx.machine.treeStamp(target.native))
+          )
+            return blocked('program-changed');
           const selected = await installed(ctx, target, 'native');
-          if (!selected) return unknown();
+          if (!selected) return unknown(fact.receipt?.failure ?? undefined);
           if (fact.evidence?.stamp !== undefined && fact.evidence.stamp !== selected.stamp)
             return blocked('program-changed');
           return complete({ ...selected, installed: true }, programEffects('package-command-completed'));
