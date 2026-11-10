@@ -275,7 +275,9 @@ async function checkProcess(ctx: Context, wholeRoot = false, signal?: AbortSigna
     throw new Error(wholeRoot ? (running ? 'claude-running' : 'process-state-unconfirmed') : 'claude-may-be-running');
 }
 const canRetryRemoval = (fact: OperationFact) =>
-  !fact.attemptId || (fact.receipt?.kind === 'returned' && fact.receipt.failure !== null);
+  !fact.attemptId ||
+  (fact.receipt?.kind === 'returned' && fact.receipt.failure !== null) ||
+  fact.evidence?.unchangedSinceDispatch === true;
 
 function cleanupHandlers(ctx: Context): Readonly<Record<string, OperationHandler>> {
   return {
@@ -326,7 +328,13 @@ function cleanupHandlers(ctx: Context): Readonly<Record<string, OperationHandler
             effects: [{ state: 'done', code: wholeRoot ? 'claude-data-removed' : 'data-file-removed', detail: file }],
           };
         } catch (error) {
-          return { receipt: { kind: 'unknown', failure: errorCode(error) } };
+          const receipt = { kind: 'unknown' as const, failure: errorCode(error) };
+          try {
+            const current = await ctx.machine.treeStamp(file);
+            return { receipt, evidence: { unchangedSinceDispatch: current === stamp, absent: current === null } };
+          } catch {
+            return { receipt };
+          }
         }
       },
     },

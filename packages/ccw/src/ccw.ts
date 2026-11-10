@@ -302,6 +302,13 @@ export function createCcw(options: CcwOptions): Ccw {
                   throw new Error('dependency-not-ready');
                 return prepareClaudeDataRemoval(preparationContext, prerequisites);
               });
+              if (problem && problem !== 'dependency-not-ready') {
+                for (const selection of claudeRemovals) {
+                  work.delete(selection.id);
+                  const index = items.findIndex(item => item.id === selection.id);
+                  items[index] = { ...items[index]!, problem: items[index]!.problem ?? problem };
+                }
+              }
               items.push({
                 id: CLAUDE_DATA_ID,
                 title: knownTitle(CLAUDE_DATA_ID),

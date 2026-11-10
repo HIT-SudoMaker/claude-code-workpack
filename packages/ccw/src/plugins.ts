@@ -607,7 +607,8 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
             effects: definition.id.endsWith('/disable') ? [{ state: 'done', code: 'plugin-disabled' }] : [],
           };
         if (
-          fact.status === 'confirmed' ||
+          fact.confirmed ||
+          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
           patches.some(
             patch =>
               extensionDigest(at(current, patch.path)) !== patch.before &&

@@ -398,7 +398,8 @@ function settingsHandlers(ctx: Context): Readonly<Record<string, OperationHandle
             evidence: { matched: true },
             effects: [{ state: 'done', code: 'settings-saved' }],
           };
-        if (fact.confirmed) return { state: 'unknown', problem: 'target-changed' };
+        if (fact.confirmed || (fact.receipt?.kind === 'returned' && fact.receipt.failure === null))
+          return { state: 'unknown', problem: 'target-changed' };
         if (patches.every(patch => patch.mode === 'default' || digest(valueAt(current, patch.path)) === patch.before))
           return { state: 'ready', dispatch: { defaults } };
         return { state: 'unknown', problem: 'target-changed' };

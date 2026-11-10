@@ -331,6 +331,7 @@ export function createCcline(options: Context): Domain {
           };
         if (
           fact.confirmed ||
+          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
           !p.selected.every(field => isDeepStrictEqual(current[field], p.before[field])) ||
           (p.shouldConnect && !isDeepStrictEqual(current.cclineHome ?? null, p.homeBefore))
         )
