@@ -158,6 +158,7 @@ export function createCcw(options: CcwOptions): Ccw {
     inspect,
     async plan(input, signal, progress) {
       cancelled(signal);
+      const submitted = structuredClone(input);
       const emit = progressGuard(progress);
       const observe = (id: string, title: string) => ({
         ...(signal ? { signal } : {}),
@@ -165,10 +166,12 @@ export function createCcw(options: CcwOptions): Ccw {
           emit({ id, title, stage });
         },
       });
-      return controller.plan(input, async () => {
+      return controller.plan(submitted, async () => {
         try {
-          if ('resume' in input) throw new Error('plan-unavailable');
-          const snapshot = structuredClone(input);
+          if ('resume' in submitted) throw new Error('plan-unavailable');
+          const snapshot = submitted;
+          if (new Set(snapshot.selected.map(pick => pick.id)).size !== snapshot.selected.length)
+            throw new Error('duplicate-selection');
           if (!['install', 'detach', 'uninstall', 'clean'].includes(snapshot.task))
             throw new Error('action-unavailable');
           if ('removeData' in snapshot && (snapshot.task !== 'uninstall' || typeof snapshot.removeData !== 'boolean'))
@@ -204,7 +207,6 @@ export function createCcw(options: CcwOptions): Ccw {
           if (shouldRemoveData && !claudeRemovals.length) throw new Error('claude-removal-required');
           const work = new Map<string, Prepared>();
           const items: PlanItem[] = [];
-          const seen = new Set<string>();
           const sorted = [...request].sort((a, b) =>
             snapshot.task === 'uninstall'
               ? Number(kindOf(a.id) === 'claude') - Number(kindOf(b.id) === 'claude')
@@ -233,8 +235,6 @@ export function createCcw(options: CcwOptions): Ccw {
             return preparation.run({ ...observer, report: stage => observer.report(stage) }, async () => {
               observer.report('inspect');
               const { changes, problem } = await attach(selection.id, async () => {
-                if (seen.has(selection.id)) throw new Error('duplicate-selection');
-                seen.add(selection.id);
                 if (hasOfficeConnectionChange && (OFFICECLI_ENTRY_IDS as readonly string[]).includes(selection.id))
                   throw new Error('overlapping-selection');
                 return prepare(selection, resolved => {

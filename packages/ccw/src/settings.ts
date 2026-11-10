@@ -245,7 +245,7 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
         changes[key] = field.role === selectedCredential ? credential : undefined;
     }
   }
-  if (shouldControlHelper) for (const key of helperKeys) if (settings[key] !== undefined) preferences[key] = undefined;
+  if (shouldControlHelper) for (const key of helperKeys) preferences[key] = undefined;
   for (const [key, field] of envFields)
     if (field.role === 'model' && fields[field.editor] !== undefined)
       changes[key] = fields[field.editor]?.trim() || undefined;
@@ -254,12 +254,12 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
   if ((ctx.inheritedKeys ?? []).some(key => Object.hasOwn(changes, key)))
     throw new Error('inherited-configuration-conflict');
   const patches: SettingsPatch[] = [];
-  const add = (parts: string[], before: unknown, after: unknown, isSecret = false) => {
+  const add = (parts: string[], before: unknown, after: unknown, isSecret = false, isDefault = false) => {
     patches.push({
       path: parts,
       before: digest(before),
       after: digest(after),
-      mode: after === undefined ? 'absent' : isSecret ? 'credential' : 'value',
+      mode: isDefault ? 'default' : after === undefined ? 'absent' : isSecret ? 'credential' : 'value',
       value: after === undefined || isSecret ? null : jsonValue(after),
     });
   };
@@ -272,13 +272,26 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
     );
   for (const [key, value] of Object.entries(preferences)) add([key], settings[key], value);
   if (selection.action === 'configure') {
-    const defaults = initializeDefaults(structuredClone(settings), ctx);
+    const draft = structuredClone(settings);
+    const draftEnv = { ...env };
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete draftEnv[key];
+      else draftEnv[key] = value;
+    }
+    draft.env = draftEnv;
+    const defaults = initializeDefaults(draft, ctx);
     for (const [key, value] of Object.entries(defaults.env))
-      if (!Object.hasOwn(changes, key)) add(['env', key], env[key], value);
+      if (!Object.hasOwn(changes, key)) add(['env', key], env[key], value, false, true);
     for (const [key, value] of Object.entries(defaults.root))
       if (key === 'permissions')
-        add(['permissions', 'defaultMode'], object(settings.permissions).defaultMode, object(value).defaultMode);
-      else if (!Object.hasOwn(preferences, key)) add([key], settings[key], value);
+        add(
+          ['permissions', 'defaultMode'],
+          object(settings.permissions).defaultMode,
+          object(value).defaultMode,
+          false,
+          true,
+        );
+      else if (!Object.hasOwn(preferences, key)) add([key], settings[key], value, false, true);
   }
   const id = selection.id + '/settings';
   const requiresSecret = fields.mode === 'api' && Boolean(fields.secret?.trim());
@@ -306,7 +319,7 @@ type SettingsPatch = {
   readonly path: readonly string[];
   readonly before: string;
   readonly after: string;
-  readonly mode: 'absent' | 'credential' | 'value';
+  readonly mode: 'absent' | 'credential' | 'value' | 'default';
   readonly value: Json;
 };
 function jsonValue(value: unknown): Json {
@@ -330,7 +343,7 @@ function patchesOf(definition: OperationDefinition): readonly SettingsPatch[] {
     value.path.every(part => typeof part === 'string') &&
     typeof value.before === 'string' &&
     typeof value.after === 'string' &&
-    ['absent', 'credential', 'value'].includes(String(value.mode)) &&
+    ['absent', 'credential', 'value', 'default'].includes(String(value.mode)) &&
     Object.hasOwn(value, 'value');
   if (!Array.isArray(patches) || !patches.every(isPatch)) throw new Error('operation-record-invalid');
   return patches;
@@ -359,21 +372,50 @@ function settingsHandlers(ctx: Context): Readonly<Record<string, OperationHandle
         if (definition.payload.file !== ctx.settingsFile) return { state: 'blocked', problem: 'target-changed' };
         const patches = patchesOf(definition);
         const current = await json(ctx.machine, ctx.settingsFile);
-        if (patches.every(patch => digest(valueAt(current, patch.path)) === patch.after))
+        const defaults = Object.fromEntries(
+          patches
+            .filter(patch => patch.mode === 'default')
+            .map(patch => {
+              const value = valueAt(current, patch.path);
+              return [
+                patch.path.join('/'),
+                value === undefined && !(patch.path[0] === 'attribution' && current.includeCoAuthoredBy === true)
+                  ? patch.after
+                  : digest(value),
+              ];
+            }),
+        );
+        const expectedDefaults = object(fact.dispatch?.defaults ?? defaults);
+        if (
+          patches.every(
+            patch =>
+              digest(valueAt(current, patch.path)) ===
+              (patch.mode === 'default' ? expectedDefaults[patch.path.join('/')] : patch.after),
+          )
+        )
           return {
             state: 'complete',
             evidence: { matched: true },
             effects: [{ state: 'done', code: 'settings-saved' }],
           };
-        if (fact.status === 'confirmed') return { state: 'unknown', problem: 'target-changed' };
-        if (patches.every(patch => digest(valueAt(current, patch.path)) === patch.before)) return { state: 'ready' };
+        if (fact.confirmed) return { state: 'unknown', problem: 'target-changed' };
+        if (patches.every(patch => patch.mode === 'default' || digest(valueAt(current, patch.path)) === patch.before))
+          return { state: 'ready', dispatch: { defaults } };
         return { state: 'unknown', problem: 'target-changed' };
       },
-      async execute(definition, _fact, inputs) {
+      async execute(definition, fact, inputs) {
         const patches = patchesOf(definition);
         await ctx.effects.editJson(ctx.settingsFile, current => {
           for (const patch of patches) {
-            if (digest(valueAt(current, patch.path)) !== patch.before) throw new Error('target-changed');
+            if (patch.mode === 'default') {
+              const value = valueAt(current, patch.path);
+              const expected = object(fact.dispatch?.defaults)[patch.path.join('/')];
+              if (value !== undefined || (patch.path[0] === 'attribution' && current.includeCoAuthoredBy === true)) {
+                if (digest(value) !== expected) throw new Error('target-changed');
+                continue;
+              }
+              if (expected !== patch.after) throw new Error('target-changed');
+            } else if (digest(valueAt(current, patch.path)) !== patch.before) throw new Error('target-changed');
             let parent = current;
             for (const part of patch.path.slice(0, -1)) {
               const child = object(parent[part]);
@@ -396,7 +438,8 @@ function settingsHandlers(ctx: Context): Readonly<Record<string, OperationHandle
     },
     'settings.login': {
       async assess(_definition, fact) {
-        if (fact.status === 'pending') return { state: 'ready' };
+        if (fact.status === 'pending' || (fact.receipt?.kind === 'returned' && fact.receipt.failure))
+          return { state: 'ready' };
         const status: unknown = JSON.parse(success(await claudeCommand(ctx, ['auth', 'status', '--json'])));
         return isObject(status) && status.loggedIn === true
           ? { state: 'complete', evidence: { loggedIn: true }, effects: [{ state: 'done', code: 'logged-in' }] }
