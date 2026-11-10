@@ -15,10 +15,11 @@ import type {
   Selection,
   OperationDefinition,
   OperationHandler,
+  OperationFact,
   JsonObject,
 } from './model.js';
 import { hasLegacyAmircPermissions, prepareLegacyAmircDetach, legacyAmircHandlers } from './legacy-amirc.js';
-import { extensionDigest, extensionPrepared } from './skill-files.js';
+import { extensionDigest, extensionString, extensionObject, extensionPrepared } from './skill-files.js';
 import { installScratch } from './storage.js';
 
 const MCP_PROTOCOLS: Readonly<Record<string, readonly string[]>> = {
@@ -219,7 +220,11 @@ export async function prepareMcp(
     credentialMode = selection.fields?.secret ? 'input' : value.headers !== undefined ? 'preserve' : 'none';
   } else if (options.registration) {
     target = options.registration();
-    if (target.headers !== undefined || target.env !== undefined && (name !== 'officecli' || extensionDigest(target.env) !== extensionDigest(officeIntegration.mcp.env)))
+    if (
+      target.headers !== undefined ||
+      (target.env !== undefined &&
+        (name !== 'officecli' || extensionDigest(target.env) !== extensionDigest(officeIntegration.mcp.env)))
+    )
       throw new Error('registration-credential-unsupported');
   } else {
     const release: unknown = JSON.parse(await ctx.machine.fetchText(mcpSpecs.serena.release.metadataUrl));
@@ -323,7 +328,7 @@ export async function prepareMcp(
           ? { headers: value.headers }
           : {}),
     };
-    const write = registrationOperation(ctx, itemId, name, expected, target as JsonObject, dependencies, 'save');
+    const write = registrationOperation(ctx, itemId, name, expected, extensionObject(target), dependencies, 'save');
     operations.push({
       ...write,
       payload: {
@@ -382,20 +387,24 @@ function registrationOperation(
 }
 
 export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHandler>> {
-  const toolPresent = async (p: JsonObject, facts: Readonly<Record<string, import('./model.js').OperationFact>>) => {
+  const toolPresent = async (p: JsonObject, facts: Readonly<Record<string, OperationFact>>) => {
     unchanged(
-      await ctx.machine.treeStamp(String(p.uv)),
-      p.uvDependency ? facts[String(p.uvDependency)]?.evidence?.stamp : p.uvStamp,
+      await ctx.machine.treeStamp(extensionString(p.uv)),
+      p.uvDependency ? facts[extensionString(p.uvDependency)]?.evidence?.stamp : p.uvStamp,
     );
     const text = success(
-      await ctx.machine.execute(String(p.uv), ['tool', 'list'], { env: { UV_TOOL_BIN_DIR: String(p.bin) } }),
+      await ctx.machine.execute(extensionString(p.uv), ['tool', 'list'], {
+        env: { UV_TOOL_BIN_DIR: extensionString(p.bin) },
+      }),
     );
     return (
       text
         .split('\n')
         .some(
-          line => line.trim().split(/\s+/).slice(0, 2).join(' ') === `${mcpSpecs.serena.release.package} v${p.version}`,
-        ) && (await ctx.machine.treeStamp(String(p.command))) !== null
+          line =>
+            line.trim().split(/\s+/).slice(0, 2).join(' ') ===
+            `${mcpSpecs.serena.release.package} v${extensionString(p.version)}`,
+        ) && (await ctx.machine.treeStamp(extensionString(p.command))) !== null
     );
   };
   return {
@@ -404,26 +413,30 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
         const p = definition.payload;
         if (facts[definition.id.replace('/uv-script', '/uv-script-remove')]?.status === 'confirmed')
           return { state: 'complete', evidence: { cleaned: true } };
-        const text = await ctx.machine.read(String(p.file));
-        if (extensionDigest(text) === p.digest) return { state: 'complete', evidence: { digest: p.digest! } };
+        const text = await ctx.machine.read(extensionString(p.file));
+        if (extensionDigest(text) === p.digest)
+          return { state: 'complete', evidence: { digest: extensionString(p.digest) } };
         return text === null ? { state: 'ready' } : { state: 'unknown', problem: 'target-changed' };
       },
       async execute(definition) {
-        await ctx.effects.initialize(String(definition.payload.file), String(definition.payload.script));
+        await ctx.effects.initialize(
+          extensionString(definition.payload.file),
+          extensionString(definition.payload.script),
+        );
         return {
           receipt: { kind: 'returned', failure: null },
-          evidence: { digest: extensionDigest(await ctx.machine.read(String(definition.payload.file))) },
+          evidence: { digest: extensionDigest(await ctx.machine.read(extensionString(definition.payload.file))) },
         };
       },
     },
     'mcp.uv-install': {
-      async assess(definition, fact, facts) {
+      async assess(definition, fact) {
         const p = definition.payload;
-        const stamp = await ctx.machine.treeStamp(String(p.uv));
+        const stamp = await ctx.machine.treeStamp(extensionString(p.uv));
         if (stamp !== null && fact.receipt?.kind === 'returned' && !fact.receipt.failure) {
           if (fact.evidence?.stamp !== undefined && stamp !== fact.evidence.stamp)
             return { state: 'unknown', problem: 'program-changed' };
-          const version = success(await ctx.machine.execute(String(p.uv), ['--version']))
+          const version = success(await ctx.machine.execute(extensionString(p.uv), ['--version']))
             .trim()
             .split(/\s+/)[1];
           return version === p.version
@@ -431,20 +444,20 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
             : { state: 'unknown', problem: 'binary-version-mismatch' };
         }
         if (fact.attemptId || stamp !== null) return { state: 'unknown', problem: 'program-installation-unconfirmed' };
-        unchanged(extensionDigest(await ctx.machine.read(String(p.file))), p.scriptDigest);
+        unchanged(extensionDigest(await ctx.machine.read(extensionString(p.file))), p.scriptDigest);
         return { state: 'ready' };
       },
       async execute(definition) {
         const p = definition.payload;
-        unchanged(extensionDigest(await ctx.machine.read(String(p.file))), p.scriptDigest);
+        unchanged(extensionDigest(await ctx.machine.read(extensionString(p.file))), p.scriptDigest);
         const result = await ctx.effects.execute(
           ctx.platform === 'win32' ? 'powershell.exe' : 'sh',
           ctx.platform === 'win32'
-            ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', String(p.file)]
-            : [String(p.file)],
+            ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', extensionString(p.file)]
+            : [extensionString(p.file)],
           {
             env: {
-              UV_DOWNLOAD_URL: `https://github.com/astral-sh/uv/releases/download/${p.version}`,
+              UV_DOWNLOAD_URL: `https://github.com/astral-sh/uv/releases/download/${extensionString(p.version)}`,
               UV_NO_MODIFY_PATH: '1',
               UV_INSTALL_DIR: userBinDirectory(ctx),
               UV_UNMANAGED_INSTALL: userBinDirectory(ctx),
@@ -456,7 +469,7 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
           failure: result.failed || result.code !== 0 ? 'uv-install-failed' : null,
         };
         try {
-          return { receipt, evidence: { stamp: await ctx.machine.treeStamp(String(p.uv)) } };
+          return { receipt, evidence: { stamp: await ctx.machine.treeStamp(extensionString(p.uv)) } };
         } catch {
           return { receipt };
         }
@@ -464,47 +477,50 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
     },
     'mcp.uv-script-remove': {
       async assess(definition) {
-        const text = await ctx.machine.read(String(definition.payload.file));
+        const text = await ctx.machine.read(extensionString(definition.payload.file));
         if (text === null) return { state: 'complete', evidence: { absent: true } };
         unchanged(extensionDigest(text), definition.payload.digest);
-        return { state: 'ready', dispatch: { stamp: await ctx.machine.treeStamp(String(definition.payload.file)) } };
+        return {
+          state: 'ready',
+          dispatch: { stamp: await ctx.machine.treeStamp(extensionString(definition.payload.file)) },
+        };
       },
       async execute(definition, fact) {
-        await ctx.effects.removeTree(String(definition.payload.file), String(fact.dispatch!.stamp));
+        await ctx.effects.removeTree(extensionString(definition.payload.file), extensionString(fact.dispatch!.stamp));
         return {
           receipt: { kind: 'returned', failure: null },
-          evidence: { absent: (await ctx.machine.read(String(definition.payload.file))) === null },
+          evidence: { absent: (await ctx.machine.read(extensionString(definition.payload.file))) === null },
         };
       },
     },
     'mcp.keep': {
       async assess(definition) {
         unchanged(
-          extensionDigest((await readMcpServers(ctx))[String(definition.payload.name)]),
+          extensionDigest((await readMcpServers(ctx))[extensionString(definition.payload.name)]),
           definition.payload.expected,
         );
         return {
           state: 'complete',
           evidence: { matched: true },
-          effects: [{ state: 'kept', code: 'registration-kept', detail: String(definition.payload.name) }],
+          effects: [{ state: 'kept', code: 'registration-kept', detail: extensionString(definition.payload.name) }],
         };
       },
-      async execute() {
-        throw new Error('operation-unavailable');
+      execute() {
+        return Promise.reject(new Error('operation-unavailable'));
       },
     },
     'mcp.registration': {
       async assess(definition, fact, facts) {
         const p = definition.payload;
         if (p.file !== ctx.stateFile) return { state: 'blocked', problem: 'target-changed' };
-        const current = (await readMcpServers(ctx))[String(p.name)];
+        const current = (await readMcpServers(ctx))[extensionString(p.name)];
         const target = extensionDigest(current);
         const successor = typeof p.supersededBy === 'string' ? facts[p.supersededBy] : undefined;
         if (p.target === null && successor?.status === 'confirmed' && successor.evidence?.target === target)
           return {
             state: 'complete',
             evidence: { superseded: true },
-            effects: [{ state: 'done', code: 'registration-removed', detail: String(p.name) }],
+            effects: [{ state: 'done', code: 'registration-removed', detail: extensionString(p.name) }],
           };
         if (target === p.after)
           return {
@@ -514,13 +530,13 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
               {
                 state: 'done',
                 code: p.target === null ? 'registration-removed' : 'registration-saved',
-                detail: String(p.name),
+                detail: extensionString(p.name),
               },
             ],
           };
         if (fact.status === 'confirmed' || extensionDigest(current) !== p.before)
           return { state: 'unknown', problem: 'target-changed' };
-        return { state: 'ready', dispatch: { before: String(p.before) } };
+        return { state: 'ready', dispatch: { before: extensionString(p.before) } };
       },
       async execute(definition, _fact, inputs) {
         const p = definition.payload;
@@ -528,27 +544,27 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
           const registrations: Record<string, unknown> = isObject(document[MCP_SERVERS_KEY])
             ? document[MCP_SERVERS_KEY]
             : {};
-          unchanged(extensionDigest(registrations[String(p.name)]), p.before);
-          if (p.target === null) delete registrations[String(p.name)];
+          unchanged(extensionDigest(registrations[extensionString(p.name)]), p.before);
+          if (p.target === null) delete registrations[extensionString(p.name)];
           else {
-            const target = { ...(p.target as JsonObject) };
+            const target = { ...extensionObject(p.target) };
             if (p.credentialMode === 'input') {
               if (!inputs.secret) throw new Error('credential-required');
               target.headers = { Authorization: `Bearer ${inputs.secret}` };
             } else if (p.credentialMode === 'preserve') {
-              const existing = registrations[String(p.name)];
+              const existing = registrations[extensionString(p.name)];
               const headers = isObject(existing) ? existing.headers : undefined;
               unchanged(extensionDigest(headers), p.headers);
-              target.headers = headers as JsonObject;
+              target.headers = extensionObject(headers);
             }
             unchanged(extensionDigest(target), p.after);
-            registrations[String(p.name)] = target;
+            registrations[extensionString(p.name)] = target;
           }
           document[MCP_SERVERS_KEY] = registrations;
         });
         const receipt = { kind: 'returned' as const, failure: null };
         try {
-          const target = extensionDigest((await readMcpServers(ctx))[String(p.name)]);
+          const target = extensionDigest((await readMcpServers(ctx))[extensionString(p.name)]);
           return { receipt, evidence: { matched: target === p.after, target } };
         } catch {
           return { receipt };
@@ -558,14 +574,14 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
     'mcp.serena-runtime': {
       async assess(definition, fact, facts) {
         const p = definition.payload;
-        if (p.uvDependency && facts[String(p.uvDependency)]?.status !== 'confirmed')
+        if (p.uvDependency && facts[extensionString(p.uvDependency)]?.status !== 'confirmed')
           return { state: 'blocked', problem: 'dependency-not-ready' };
         const present = await toolPresent(p, facts);
         if (
           present &&
           ((!p.reinstall && !fact.attemptId) || (fact.receipt?.kind === 'returned' && !fact.receipt.failure))
         ) {
-          const stamp = await ctx.machine.treeStamp(String(p.command));
+          const stamp = await ctx.machine.treeStamp(extensionString(p.command));
           if (fact.evidence?.stamp !== undefined && fact.evidence.stamp !== stamp)
             return { state: 'unknown', problem: 'program-changed' };
           return { state: 'complete', evidence: { stamp }, effects: [{ state: 'done', code: 'serena-installed' }] };
@@ -575,13 +591,13 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
           (fact.attemptId && (fact.receipt?.kind !== 'returned' || !fact.receipt.failure))
         )
           return { state: 'unknown', problem: 'program-installation-unconfirmed' };
-        unchanged(await ctx.machine.treeStamp(String(p.command)), p.beforeStamp);
+        unchanged(await ctx.machine.treeStamp(extensionString(p.command)), p.beforeStamp);
         return { state: 'ready', dispatch: { beforeStamp: p.beforeStamp! } };
       },
       async execute(definition) {
         const p = definition.payload;
         const result = await ctx.effects.execute(
-          String(p.uv),
+          extensionString(p.uv),
           [
             'tool',
             'install',
@@ -589,16 +605,16 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
             mcpSpecs.serena.release.python,
             '--upgrade',
             ...(p.reinstall ? ['--reinstall'] : []),
-            `${mcpSpecs.serena.release.package}==${p.version}`,
+            `${mcpSpecs.serena.release.package}==${extensionString(p.version)}`,
           ],
-          { env: { UV_TOOL_BIN_DIR: String(p.bin) } },
+          { env: { UV_TOOL_BIN_DIR: extensionString(p.bin) } },
         );
         const receipt = {
           kind: 'returned' as const,
           failure: result.failed || result.code !== 0 ? 'serena-install-failed' : null,
         };
         try {
-          return { receipt, evidence: { stamp: await ctx.machine.treeStamp(String(p.command)) } };
+          return { receipt, evidence: { stamp: await ctx.machine.treeStamp(extensionString(p.command)) } };
         } catch {
           return { receipt };
         }
@@ -606,8 +622,8 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
     },
     'mcp.serena-initialize': {
       async assess(definition, fact, facts) {
-        const runtime = facts[String(definition.payload.runtime)];
-        unchanged(await ctx.machine.treeStamp(String(definition.payload.command)), runtime?.evidence?.stamp);
+        const runtime = facts[extensionString(definition.payload.runtime)];
+        unchanged(await ctx.machine.treeStamp(extensionString(definition.payload.command)), runtime?.evidence?.stamp);
         if (fact.receipt?.kind === 'returned' && !fact.receipt.failure)
           return {
             state: 'complete',
@@ -618,7 +634,7 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
         return { state: 'ready' };
       },
       async execute(definition) {
-        const result = await ctx.effects.execute(String(definition.payload.command), ['init']);
+        const result = await ctx.effects.execute(extensionString(definition.payload.command), ['init']);
         return {
           receipt: {
             kind: 'returned',
