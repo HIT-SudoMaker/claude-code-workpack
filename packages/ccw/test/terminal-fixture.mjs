@@ -10,16 +10,74 @@ import stringWidth from 'string-width';
 
 import { createMachine } from '../dist/machine.js';
 import { createCcw } from '../dist/ccw.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal as run } from '../dist/terminal.js';
 import { createTerminal } from '../dist/terminal-view.js';
 import { createRunPresentation } from '../dist/run-presentation.js';
+
+const runTerminal = (ccw, ...args) =>
+  run({ recovery: async () => undefined, abandon: async () => {}, ...ccw }, ...args);
 
 let cancelled = false;
 const terminal = createTerminal(() => {
   cancelled = true;
 });
 const scenario = process.argv[2];
-if (scenario === 'cleanup') {
+if (scenario === 'recovery' || scenario === 'recovery-unknown') {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-terminal-recovery-')));
+  const home = path.join(root, 'home');
+  const claudeRoot = path.join(home, '.claude');
+  const settingsFile = path.join(claudeRoot, 'settings.json');
+  let approved = false;
+  let previews = 0;
+  let recoveryMenus = 0;
+  const base = createMachine({}, root);
+  const machine = {
+    ...base,
+    async editJson(file, edit) {
+      if (file === settingsFile) assert.equal(approved, true, '恢复必须先经用户确认');
+      return base.editJson(file, edit);
+    },
+  };
+  const options = {
+    machine,
+    home,
+    claudeRoot,
+    cclineRoot: path.join(claudeRoot, 'ccline'),
+    platform: process.platform,
+  };
+  try {
+    await fs.mkdir(claudeRoot, { recursive: true });
+    await fs.writeFile(settingsFile, JSON.stringify({ language: 'English', keep: true }));
+    await createCcw(options).plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
+    if (scenario === 'recovery-unknown')
+      await fs.writeFile(settingsFile, JSON.stringify({ language: 'external value', keep: true }));
+    const restarted = createCcw(options);
+    await runTerminal(restarted, {
+      ...terminal,
+      async choose(title, ...args) {
+        if (typeof title === 'string' && title.startsWith('未完成任务')) recoveryMenus++;
+        const choice = await terminal.choose(title, ...args);
+        if (typeof title === 'string' && title.startsWith('变更预览')) {
+          previews++;
+          assert.equal(JSON.parse(await fs.readFile(settingsFile, 'utf8')).language, 'English');
+          if (choice === 0) approved = true;
+        }
+        return choice;
+      },
+    });
+    await terminal.close();
+    const settings = JSON.parse(await fs.readFile(settingsFile, 'utf8'));
+    assert.equal(settings.language, scenario === 'recovery' ? '中文' : 'external value');
+    assert.equal(settings.keep, true);
+    assert.equal(await restarted.recovery(), undefined);
+    if (scenario === 'recovery') assert.equal(previews, 2, '返回修改后重新核对且再次预览');
+    else assert.equal(recoveryMenus, 2, '重新检查从中央重新核对任务');
+    assert.equal(process.stdin.isRaw, false);
+    console.log(scenario === 'recovery' ? 'RECOVERY_DONE' : 'RECOVERY_UNKNOWN_DONE');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+} else if (scenario === 'cleanup') {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-terminal-cleanup-')));
   const home = path.join(root, 'home');
   const claudeRoot = path.join(home, '.claude');
@@ -271,7 +329,7 @@ if (scenario === 'cleanup') {
   process.stdout.write = write;
   assert.equal(applications, 1, '连续提交只执行一次');
   assert.equal(process.stdin.isRaw, false);
-  assert.equal(output.includes('变更预览'), false);
+  assert.equal(output.includes('变更预览'), true);
   assert.equal(output.includes('fixture-settings-key'), false);
   const text = stripVTControlCharacters(output);
   if (scenario === 'settings') {

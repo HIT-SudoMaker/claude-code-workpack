@@ -6,7 +6,7 @@ import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 import { attribution, createEnv, exists, fail, ok, releaseContract, revision } from './env.mjs';
 
 const defaultEnv = {

@@ -158,6 +158,8 @@ internal static class ConPtyTest
                 WaitForTitle("安装套件 · 当前用户");
                 for (int i = 0; i < 6; i++) Send(inWrite, "\x1b[B");
                 Send(inWrite, "\r");
+                WaitFor("确认安装", 3000);
+                Send(inWrite, "\x1b[A\r");
                 WaitForTitle("运行结果 · 完成");
                 Send(inWrite, "\x1b");
                 WaitFor("请选择：", 3000);
@@ -192,13 +194,42 @@ internal static class ConPtyTest
                 Send(inWrite, "r");
                 Thread.Sleep(100);
                 Send(inWrite, "\x1b[B\r");
-                Thread.Sleep(20);
-                Send(inWrite, "\r");
+                WaitFor("确认安装", 3000);
+                Send(inWrite, "\x1b[A\r");
                 WaitForTitle("运行结果 · 完成");
                 Send(inWrite, "\x1b");
                 WaitFor("请选择：", 3000);
                 Send(inWrite, "\x1b");
                 WaitFor("SELECTION_DONE", 3000);
+            }
+            else if (args[2] == "recovery")
+            {
+                WaitFor("未完成任务", 3000);
+                WaitFor("未执行", 3000);
+                Send(inWrite, "\x1b[A\r");
+                WaitFor("确认安装", 3000);
+                Send(inWrite, "\x1b");
+                WaitFor("未完成任务", 3000);
+                Send(inWrite, "\x1b[A\r");
+                WaitFor("确认安装", 3000);
+                Send(inWrite, "\x1b[A\r");
+                WaitForTitle("运行结果 · 完成");
+                Send(inWrite, "\x1b");
+                WaitFor("请选择：", 3000);
+                Send(inWrite, "\x1b");
+                WaitFor("RECOVERY_DONE", 3000);
+            }
+            else if (args[2] == "recovery-unknown")
+            {
+                WaitFor("待核对", 3000);
+                Send(inWrite, "\r");
+                Thread.Sleep(200);
+                Send(inWrite, "\x1b[B\x1b[B\r");
+                WaitFor("已完成的安装与设置会保留", 3000);
+                Send(inWrite, "\x1b[A\r");
+                WaitFor("请选择：", 3000);
+                Send(inWrite, "\x1b");
+                WaitFor("RECOVERY_UNKNOWN_DONE", 3000);
             }
             else if (args[2] == "skills-cancel")
             {

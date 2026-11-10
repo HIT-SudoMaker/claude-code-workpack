@@ -165,3 +165,21 @@ test('保留未知原因码', () => {
   assert.match(details, /操作失败：原因未知/);
   assert.doesNotMatch(details, /权限不足|未安装/);
 });
+
+test('恢复进度与结果包含已完成条目，汇总沿用整份任务且保留冻结标题', () => {
+  const presentation = createRunPresentation(
+    { items: [{ id: 'mcp:context7', title: 'Context7', action: 'install', changes: [], problem: null }] },
+    'install',
+    [{ id: 'officecli', title: '原计划 OfficeCLI', state: 'done' }],
+  );
+  assert.equal(presentation.progress().summary, '处理 1/2 · 完成 1 · 失败 0 · 跳过 0');
+  const result = presentation.result({
+    state: 'done',
+    items: [
+      { id: 'officecli', title: '后来显示的名称', state: 'done', effects: [] },
+      { id: 'mcp:context7', title: 'Context7', state: 'done', effects: [] },
+    ],
+  });
+  assert.equal(result.summary, '处理 2/2 · 完成 2 · 失败 0 · 跳过 0');
+  assert.equal(result.rows.find(row => row.id === 'officecli').title, '原计划 OfficeCLI');
+});
