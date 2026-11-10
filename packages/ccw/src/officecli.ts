@@ -12,7 +12,7 @@ import { isExactVersion, resolveNpmView } from './npm-registry.js';
 import type { NpmRegistry } from './npm-registry.js';
 import { officeBinary, samePath } from './program-channels.js';
 import { officeVersion, prepareProgram, programs } from './programs.js';
-import { composeProgramOperations, programOperation, programPrepared } from './program-operations.js';
+import { composeProgramOperations, programOperation } from './program-operations.js';
 import { sourcesFile } from './storage.js';
 
 /** OfficeCLI 接入入口的 id 集合：域内入口类型与计划层的重叠门判共用 */
@@ -142,7 +142,7 @@ export function createOfficecli(ctx: Context) {
           : await prepareMcp(ctx, 'officecli', { id: entry.id, action: 'detach' });
       operations.push(...composeProgramOperations(prepared, itemId, 'detach-' + entry.id).operations);
     }
-    return programPrepared(operations);
+    return { operations };
   }
 
   return {
@@ -250,10 +250,12 @@ export function createOfficecli(ctx: Context) {
       if (selection.action === 'detach') return detach(entries, selection.id);
       if (selection.action === 'uninstall') {
         if (!program)
-          return programPrepared([
-            ...(await detach(entries, selection.id)).operations,
-            programOperation(selection.id, 'program-absent', 'office.keep', {}, [{ code: 'program-not-installed' }]),
-          ]);
+          return {
+            operations: [
+              ...(await detach(entries, selection.id)).operations,
+              programOperation(selection.id, 'program-absent', 'office.keep', {}, [{ code: 'program-not-installed' }]),
+            ],
+          };
         const removal = await prepareProgram(ctx, 'officecli', selection, program);
         const belongs = (value: Observation, entry: OfficeEntry) =>
           entry.owner === identity ||
@@ -277,7 +279,7 @@ export function createOfficecli(ctx: Context) {
             ? ['officecli']
             : []),
         ];
-        const detached = expected.length ? await detach(expected, selection.id) : programPrepared([]);
+        const detached = expected.length ? await detach(expected, selection.id) : { operations: [] };
         const guard = programOperation(
           selection.id,
           'integrations-detached',
@@ -294,18 +296,20 @@ export function createOfficecli(ctx: Context) {
           ...operation,
           dependsOn: [...operation.dependsOn, guard.id],
         }));
-        return programPrepared([
-          ...detached.operations,
-          guard,
-          ...removalOperations,
-          programOperation(
-            selection.id,
-            'preserved-integrations',
-            'office.keep',
-            {},
-            unmatched.map(detail => ({ code: 'unmatched-integration-kept', detail })),
-          ),
-        ]);
+        return {
+          operations: [
+            ...detached.operations,
+            guard,
+            ...removalOperations,
+            programOperation(
+              selection.id,
+              'preserved-integrations',
+              'office.keep',
+              {},
+              unmatched.map(detail => ({ code: 'unmatched-integration-kept', detail })),
+            ),
+          ],
+        };
       }
 
       if (!['install', 'connect', 'update', 'reinstall'].includes(selection.action))
@@ -329,7 +333,7 @@ export function createOfficecli(ctx: Context) {
       if (shouldKeepProgram) unchanged(await ctx.machine.treeStamp(program.binary), stamp);
       const operation = shouldKeepProgram
         ? {
-            ...programPrepared([
+            operations: [
               programOperation(
                 selection.id,
                 'program-ready',
@@ -349,7 +353,7 @@ export function createOfficecli(ctx: Context) {
                     ),
                   ]
                 : []),
-            ]),
+            ],
             targetVersion: version,
             targetBinary: program.binary,
             ...(program.channel === 'npm' ? { targetRegistry: null } : {}),
@@ -364,7 +368,7 @@ export function createOfficecli(ctx: Context) {
       });
       const before =
         selection.action === 'reinstall' && entries.length ? await detach(entries, selection.id) : undefined;
-      const detached = before ?? programPrepared([]);
+      const detached = before ?? { operations: [] };
       const programOperations = operation.operations.map(value => ({
         ...value,
         dependsOn: [...value.dependsOn, ...detached.operations.map(entry => entry.id)],
@@ -387,7 +391,7 @@ export function createOfficecli(ctx: Context) {
         );
         return next ? { ...operation, payload: { ...operation.payload, supersededBy: next.id } } : operation;
       });
-      return programPrepared([...superseded, ...programOperations, ...connected.operations]);
+      return { operations: [...superseded, ...programOperations, ...connected.operations] };
     },
   };
 }
@@ -440,13 +444,15 @@ interface OfficeTarget {
 }
 
 function officeConnections(skill: Prepared, mcp: Prepared): Prepared {
-  return programPrepared([
-    ...skill.operations,
-    ...mcp.operations.map(operation => ({
-      ...operation,
-      dependsOn: [...operation.dependsOn, ...skill.operations.map(value => value.id)],
-    })),
-  ]);
+  return {
+    operations: [
+      ...skill.operations,
+      ...mcp.operations.map(operation => ({
+        ...operation,
+        dependsOn: [...operation.dependsOn, ...skill.operations.map(value => value.id)],
+      })),
+    ],
+  };
 }
 
 async function officeRevision(ctx: Context, target: OfficeTarget): Promise<string> {
@@ -525,7 +531,7 @@ async function prepareOfficeConnection(
       record.stamp !== before
     ) {
       const code = before === null ? 'office-connection-kept' : 'office-local-skill-kept';
-      return programPrepared([programOperation(selection.id, 'connection-kept', 'office.keep', {}, [{ code }])]);
+      return { operations: [programOperation(selection.id, 'connection-kept', 'office.keep', {}, [{ code }])] };
     }
   }
 

@@ -451,7 +451,7 @@ async function prepareCleanup(ctx: Context, category: string): Promise<Prepared>
       operations.map(value => value.id),
     ),
   );
-  return { changes, operations };
+  return { operations };
 }
 
 /** Dependencies are the frozen absence checks for every selected Claude program. */
@@ -504,5 +504,5 @@ export async function prepareClaudeDataRemoval(ctx: Context, dependencies: reado
       operations.map(value => value.id),
     ),
   );
-  return { operations, changes: operations.flatMap(value => value.changes) };
+  return { operations };
 }

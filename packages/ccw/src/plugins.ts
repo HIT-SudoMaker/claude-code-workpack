@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { knownTitle } from './titles.js';
-import { applyFrozenJson, assessFrozenJson, jsonField } from './frozen-json.js';
+import { applyFrozenJson, assessFrozenJson, jsonField, jsonFingerprint as extensionDigest } from './frozen-json.js';
 import { ENABLED_PLUGINS_KEY } from './settings.js';
 import { marketplaceSources, pluginSpecs } from './management-catalog.js';
 import { errorCode, isGitRevision, isObject, treeFilesStamp } from './machine.js';
@@ -22,14 +22,7 @@ import type {
   OperationFact,
 } from './model.js';
 import { claudeCommand } from './programs.js';
-import {
-  extensionDigest,
-  extensionString,
-  extensionNullableString,
-  extensionObject,
-  extensionObjects,
-  extensionPrepared,
-} from './skill-files.js';
+import { extensionString, extensionNullableString, extensionObject, extensionObjects } from './skill-files.js';
 import { replacedDirectory } from './storage.js';
 
 function pluginSource(name: string, markets: Record<string, unknown>) {
@@ -264,15 +257,17 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       [],
       [{ code: 'plugin-disable', detail: name }, { code: 'keep-plugin-files' }],
     );
-    return extensionPrepared([
-      {
-        ...disable,
-        payload: {
-          ...disable.payload,
-          ...(enabled !== true ? { pluginName: name, records: extensionDigest(records) } : {}),
+    return {
+      operations: [
+        {
+          ...disable,
+          payload: {
+            ...disable.payload,
+            ...(enabled !== true ? { pluginName: name, records: extensionDigest(records) } : {}),
+          },
         },
-      },
-    ]);
+      ],
+    };
   }
   const beforeSnapshot = await pluginSnapshot(ctx, name);
   const source = pluginSource(name, markets ?? {});
@@ -505,9 +500,9 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       changes: [{ code: 'github-credential-configure' }],
     };
     operations.push(credential);
-    return { ...extensionPrepared(operations), inputs: { [credential.id]: { secret: selection.fields.secret } } };
+    return { operations, inputs: { [credential.id]: { secret: selection.fields.secret } } };
   }
-  return extensionPrepared(operations);
+  return { operations };
 }
 
 async function pluginSnapshot(ctx: Context, name: string) {

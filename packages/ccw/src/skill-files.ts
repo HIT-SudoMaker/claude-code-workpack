@@ -15,7 +15,6 @@ import type {
 } from './model.js';
 import { disabledDirectory, replacedDirectory, sourcesFile } from './storage.js';
 import { jsonFingerprint as extensionDigest } from './frozen-json.js';
-export { jsonFingerprint as extensionDigest } from './frozen-json.js';
 
 export function extensionString(value: unknown): string {
   if (typeof value !== 'string') throw new Error('operation-record-invalid');
@@ -42,24 +41,20 @@ export function extensionObjects(value: unknown): readonly JsonObject[] {
   if (!Array.isArray(value)) throw new Error('operation-record-invalid');
   return value.map(extensionObject);
 }
-export function extensionPrepared(operations: readonly OperationDefinition[]): Prepared {
-  return {
-    operations,
-    changes: operations.flatMap(operation => operation.changes),
-  };
-}
 export function currentSkill(_ctx: Context, name: string, directory: string, before: string): Prepared {
   const itemId = `skill:${name}`;
-  return extensionPrepared([
-    {
-      id: `${itemId}/keep`,
-      itemId,
-      handler: 'skill.keep',
-      payload: { directory, stamp: before, name },
-      dependsOn: [],
-      changes: [{ code: 'skill-current', detail: name }],
-    },
-  ]);
+  return {
+    operations: [
+      {
+        id: `${itemId}/keep`,
+        itemId,
+        handler: 'skill.keep',
+        payload: { directory, stamp: before, name },
+        dependsOn: [],
+        changes: [{ code: 'skill-current', detail: name }],
+      },
+    ],
+  };
 }
 interface SkillTarget {
   readonly name: string;
@@ -100,7 +95,7 @@ function sourceOperation(
   };
 }
 export function repairSkillSource(ctx: Context, target: SkillTarget, source: SkillSource): Prepared {
-  return extensionPrepared([sourceOperation(ctx, target, source, [])]);
+  return { operations: [sourceOperation(ctx, target, source, [])] };
 }
 export function prepareSkillFiles(ctx: Context, target: SkillTarget, source: SkillSource): Prepared {
   const { name, directory, stamp: before } = target;
@@ -126,7 +121,7 @@ export function prepareSkillFiles(ctx: Context, target: SkillTarget, source: Ski
       ...(destination ? [{ code: 'preserved-at', detail: destination }] : []),
     ],
   };
-  return extensionPrepared([deploy, sourceOperation(ctx, target, source, [deploy.id])]);
+  return { operations: [deploy, sourceOperation(ctx, target, source, [deploy.id])] };
 }
 export function disableSkillEntry(ctx: Context, directory: string, before: string, selectedId?: string): Prepared {
   const name = path.basename(directory);
@@ -144,17 +139,19 @@ export function disableSkillEntry(ctx: Context, directory: string, before: strin
       { code: 'keep-link-target' },
     ],
   };
-  return extensionPrepared([
-    disable,
-    {
-      id: `${itemId}/source-remove`,
-      itemId,
-      handler: 'skill.source-remove',
-      dependsOn: [disable.id],
-      payload: { file: sourcesFile(ctx), directory },
-      changes: [],
-    },
-  ]);
+  return {
+    operations: [
+      disable,
+      {
+        id: `${itemId}/source-remove`,
+        itemId,
+        handler: 'skill.source-remove',
+        dependsOn: [disable.id],
+        payload: { file: sourcesFile(ctx), directory },
+        changes: [],
+      },
+    ],
+  };
 }
 async function observed(observe: () => Promise<JsonObject>): Promise<OperationOutcome> {
   const receipt = { kind: 'returned' as const, failure: null };

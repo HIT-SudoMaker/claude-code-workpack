@@ -1,6 +1,7 @@
 import { json, object, readMcpServers } from './model.js';
 import type { Context, OperationDefinition, OperationHandler, Prepared } from './model.js';
-import { extensionDigest, extensionString, extensionPrepared } from './skill-files.js';
+import { jsonFingerprint as extensionDigest } from './frozen-json.js';
+import { extensionString } from './skill-files.js';
 
 const OWNED_RULES = ['mcp__amirc__organize_papers', 'mcp__amirc__search_papers', 'mcp__amirc__get_papers'];
 function allowedTools(settings: Record<string, unknown>): string[] {
@@ -47,7 +48,7 @@ export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> 
       changes: [{ code: 'amirc-permissions-remove' }],
     })),
   );
-  return extensionPrepared(operations);
+  return { operations };
 }
 export function legacyAmircHandlers(ctx: Context): Readonly<Record<string, OperationHandler>> {
   return {

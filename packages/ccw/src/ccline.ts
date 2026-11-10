@@ -668,7 +668,7 @@ export function createCcline(options: Context): Domain {
         operations.map(value => value.id),
       ),
     );
-    return { operations, changes: operations.flatMap(value => value.changes) };
+    return { operations };
   }
   async function inspectItem(): Promise<Item> {
     // 全量探测失败才降级只读探测
@@ -748,7 +748,7 @@ export function createCcline(options: Context): Domain {
           { code: 'ccline-detach', detail: settingsFile },
           { code: 'appearance-kept' },
         ]);
-        return { operations: [operation], changes: operation.changes };
+        return { operations: [operation] };
       }
       const scope = action === 'connect' ? null : (await freezeNpmScope(options)).data;
       if (scope && (await packageVersion(scope.npmRoot)) !== observed.version) throw new Error('program-changed');
@@ -878,7 +878,7 @@ export function createCcline(options: Context): Domain {
           ),
         );
       }
-      return { operations, changes: operations.flatMap(value => value.changes) };
+      return { operations };
     },
   };
 }

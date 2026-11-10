@@ -109,7 +109,6 @@ export interface Context extends Omit<CcwOptions, 'machine'> {
   readonly storage: string;
 }
 export interface Prepared {
-  readonly changes: readonly Change[];
   readonly operations: readonly OperationDefinition[];
   /** 仅在当前进程保留的输入；绝不写入任务记录。 */
   readonly inputs?: Readonly<Record<string, Readonly<Record<string, string>>>>;

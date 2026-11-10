@@ -217,11 +217,7 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
   const fields = selection.action === 'detach' ? {} : (selection.fields ?? {});
   const changes: Record<string, unknown> = {};
   const preferences: Record<string, unknown> = {};
-  if (selection.action === 'login')
-    return {
-      changes: [{ code: 'login-browser' }],
-      operations: [loginDefinition(selection.id, [])],
-    };
+  if (selection.action === 'login') return { operations: [loginDefinition(selection.id, [])] };
   const shouldLogin = fields.mode === 'official' && fields.login === 'yes';
   const shouldControlHelper = selection.action === 'detach' || fields.mode === 'official' || fields.mode === 'api';
   if (selection.action === 'detach' || fields.mode === 'official') {
@@ -307,7 +303,6 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
     ...(requiresSecret ? { requiresInput: ['secret'] } : {}),
   };
   return {
-    changes: [...definition.changes, ...(shouldLogin ? [{ code: 'login-browser' }] : [])],
     operations: [definition, ...(shouldLogin ? [loginDefinition(selection.id, [id])] : [])],
     ...(requiresSecret ? { inputs: { [id]: { secret: fields.secret!.trim() } } } : {}),
   };
