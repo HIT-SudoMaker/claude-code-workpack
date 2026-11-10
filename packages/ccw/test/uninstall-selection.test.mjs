@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { HOME_TITLE } from '../dist/render.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 
 const contents = [
   {
@@ -42,6 +42,16 @@ for (const [route, label] of [
     const item = contents[1];
     await runTerminal(
       {
+        async recovery() {
+          return applies === 1
+            ? {
+                id: 'frozen',
+                intent: { task: 'uninstall' },
+                items: [{ id: item.id, title: item.title, state: 'pending' }],
+                inputs: [],
+              }
+            : undefined;
+        },
         async inspect() {
           return { items: [item], problems: [] };
         },
@@ -73,14 +83,19 @@ for (const [route, label] of [
         },
         async choose(title, choices) {
           if (typeof title !== 'string') return applies === 1 && route !== 'home' ? 0 : 1;
-          if (title === HOME_TITLE) return homes++ === 0 || (route === 'home' && homes === 2) ? 2 : 4;
+          if (title === HOME_TITLE) return homes++ === 0 ? 2 : 4;
+          if (title.startsWith('未完成任务')) return 0;
           if (title.startsWith('变更预览')) return route === 'preview' && ++previews === 2 ? 1 : 0;
           if (choices.includes('取消选择')) return choices.indexOf('返回');
           return applies === 1 && route !== 'home' ? 0 : 1;
         },
       },
     );
-    assert.deepEqual(requests, [{ task: 'uninstall', selected: [{ id: item.id }] }, { resume: 'frozen' }]);
+    assert.deepEqual(requests, [
+      { task: 'uninstall', selected: [{ id: item.id }] },
+      { resume: 'frozen' },
+      ...(route === 'preview' ? [{ resume: 'frozen' }] : []),
+    ]);
     assert.equal(applies, 2);
   });
 
@@ -277,7 +292,10 @@ test('修改或刷新预览：保留数据选项', async () => {
   });
   assert.equal(pages, 3);
   assert.equal(previews, 2);
-  assert.deepEqual(requests, [{ task: 'uninstall', selected: [{ id: contents[0].id }], removeData: true }]);
+  assert.deepEqual(
+    requests,
+    Array.from({ length: 2 }, () => ({ task: 'uninstall', selected: [{ id: contents[0].id }], removeData: true })),
+  );
 });
 
 test('准备数据失败：允许取消选项', async () => {
@@ -337,7 +355,7 @@ test('准备数据失败：允许取消选项', async () => {
       },
     },
   );
-  assert.equal(confirmations, 0);
+  assert.equal(confirmations, 1);
   assert.deepEqual(requests, [{ task: 'uninstall', selected: [{ id: contents[0].id }], removeData: true }]);
 });
 
@@ -348,6 +366,19 @@ test('完成程序卸载：继续剩余数据删除', async () => {
   const requests = [];
   await runTerminal(
     {
+      async recovery() {
+        return applies === 1
+          ? {
+              id: 'data-frozen',
+              intent: { task: 'uninstall', removeData: true },
+              items: [
+                { id: contents[0].id, title: 'Claude Code', state: 'done' },
+                { id: 'data:claude', title: 'Claude 用户数据', state: 'pending' },
+              ],
+              inputs: [],
+            }
+          : undefined;
+      },
       async inspect() {
         return { items: applies ? [] : [contents[0]], problems: [] };
       },
@@ -400,14 +431,19 @@ test('完成程序卸载：继续剩余数据删除', async () => {
       },
       async choose(title, choices) {
         if (title === HOME_TITLE) return homes++ ? 4 : 2;
+        if (typeof title === 'string' && title.startsWith('未完成任务')) {
+          assert.match(title, /已完成 · Claude Code/);
+          assert.match(title, /未执行 · Claude 用户数据/);
+          return 0;
+        }
         if (typeof title === 'string' && title.startsWith('变更预览')) return 0;
-        assert.equal(choices[0], applies === 1 ? '重试未完成项' : '返回列表');
+        assert.equal(choices[0], applies === 1 ? '继续未完成任务' : '返回列表');
         return applies === 1 ? 0 : 1;
       },
     },
   );
   assert.equal(applies, 2);
-  assert.equal(pages, 2);
+  assert.equal(pages, 1, '剩余工作从中央任务查询展示，不另建列表续办状态');
   assert.deepEqual(requests, [
     { task: 'uninstall', selected: [{ id: contents[0].id }], removeData: true },
     { resume: 'data-frozen' },

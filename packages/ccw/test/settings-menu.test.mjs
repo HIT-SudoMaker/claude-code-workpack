@@ -4,7 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { HOME_TITLE } from '../dist/render.js';
-import { runTerminal } from '../dist/terminal.js';
+import { runTerminal } from './terminal-test.mjs';
 import { attribution, createEnv, wait } from './env.mjs';
 
 const defaultEnv = {

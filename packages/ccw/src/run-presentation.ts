@@ -1,4 +1,4 @@
-import type { Action, Effect, ItemResult, PlanItem, Progress, RunResult } from './model.js';
+import type { Action, Effect, ItemResult, PlanItem, Progress, Recovery, RunResult } from './model.js';
 import { CLEANUP_RESIDUE_CODES } from './cleanup.js';
 import { contentName, describeDiagnostic, failureLabel, safeText } from './render.js';
 
@@ -155,13 +155,27 @@ function resultView(result: RunResult, items: readonly ExecutionItem[], action?:
 }
 
 /** 统一投影冻结计划的进度与结果；名称由计划条目携带 */
-export function createRunPresentation(plan: { readonly items: readonly PlanItem[] }, action?: Action) {
+export function createRunPresentation(
+  plan: { readonly items: readonly PlanItem[] },
+  action?: Action,
+  history: Recovery['items'] = [],
+) {
   const execution = new Map<string, ExecutionItem>(
     plan.items.map(item => [
       item.id,
       { id: item.id, title: item.title, action: item.action, state: 'waiting', effects: [] },
     ]),
   );
+  for (const item of history) {
+    if (item.state === 'done' && !execution.has(item.id))
+      execution.set(item.id, {
+        id: item.id,
+        title: item.title,
+        ...(action ? { action } : {}),
+        state: 'done',
+        effects: [],
+      });
+  }
   const items = () => [...execution.values()];
   const recordResult = (result: RunResult) => {
     for (const item of result.items) {

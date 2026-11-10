@@ -1,6 +1,6 @@
-import { isDeepStrictEqual } from 'node:util';
-
 import type { Action, Ccw, Inspection, Item, Pick, Plan, Request } from './ccw.js';
+import { errorCode, isObject } from './machine.js';
+import type { Recovery, RunResult } from './model.js';
 import {
   ACTION_NAMES,
   BACK_TO_HOME,
@@ -35,14 +35,7 @@ import {
 import type { MenuRow, SettingsEditor } from './render.js';
 import { createRunPresentation } from './run-presentation.js';
 import type { RunView } from './run-presentation.js';
-import {
-  apiConfigurationProblem,
-  CLAUDE_DATA_ID,
-  defaultInstallAction,
-  kindOf,
-  REPLACE_CONSENT,
-  restOf,
-} from './model.js';
+import { apiConfigurationProblem, CLAUDE_DATA_ID, defaultInstallAction, kindOf, REPLACE_CONSENT } from './model.js';
 import { knownTitle } from './titles.js';
 
 export interface SelectionPage {
@@ -206,6 +199,80 @@ function availableActions(item: Item, task: Task): readonly Action[] {
     .sort((a, b) => Number(b === 'uninstall') - Number(a === 'uninstall'));
 }
 
+function recoveryTask(recovery: Recovery): Exclude<Task, 'inspect'> {
+  return recovery.intent.task === 'clean'
+    ? 'clean'
+    : recovery.intent.task === 'uninstall' || recovery.intent.task === 'detach'
+      ? 'uninstall'
+      : 'install';
+}
+
+function describeRecovery(recovery: Recovery) {
+  const states = { done: '已完成', unknown: '待核对', pending: '未执行', failed: '未完成' };
+  return [
+    '未完成任务 · 已核对实际状态',
+    ...recovery.items.map(
+      item => `${states[item.state]} · ${contentName(item)}${item.problem ? `\n  ${reason(item.problem)}` : ''}`,
+    ),
+    '继续前将展示剩余计划并请你确认',
+  ].join('\n');
+}
+
+async function confirmPlan(terminal: Terminal, plan: Plan, task: Task) {
+  const preview = plan.items
+    .map(
+      item =>
+        `${planVerb(item)} ${contentName(item)}\n${item.problem ? `  ${PROBLEM_MARK}${reason(item.problem)}` : item.changes.map(change => `  · ${describeChange(change)}`).join('\n')}`,
+    )
+    .join('\n');
+  const blocked = plan.items.length > 0 && plan.items.every(item => item.problem !== null);
+  const choice = await terminal.choose(
+    `变更预览\n${preview || '已完成项已核对，无需重复执行'}${blocked ? '\n当前没有可执行项，请重新检查或重新预览' : ''}`,
+    blocked ? ['返回'] : [task === 'clean' ? '确认清理' : task === 'uninstall' ? '确认卸载' : '确认安装', '返回修改'],
+    blocked ? 0 : 1,
+  );
+  return !blocked && choice === 0;
+}
+
+async function showResult(
+  terminal: Terminal,
+  presentation: ReturnType<typeof createRunPresentation>,
+  result: RunResult,
+  signal?: AbortSignal,
+) {
+  const view = presentation.result(result);
+  let resultFocus = 1;
+  let detailFocus = 0;
+  while (!signal?.aborted) {
+    const next = await terminal.choose(
+      view,
+      [result.remaining ? '继续未完成任务' : '返回列表', BACK_TO_HOME, '查看详情'],
+      resultFocus,
+      1,
+    );
+    if (next !== 2) return next;
+    resultFocus = next;
+    let item = result.items[0];
+    if (result.items.length > 1) {
+      detailFocus = await terminal.choose(
+        '选择结果',
+        [
+          ...result.items.map(item => {
+            const row = view.rows.find(candidate => candidate.id === item.id);
+            return { label: row?.title ?? contentName(item), detail: row?.status ?? '' };
+          }),
+          '返回',
+        ],
+        Math.min(detailFocus, result.items.length - 1),
+      );
+      item = result.items[detailFocus];
+    }
+    if (item) await terminal.choose(presentation.details(result, item.id), ['返回']);
+    else if (!result.items.length) await terminal.choose('结果详情\n本次没有条目记录', ['返回']);
+  }
+  return 1;
+}
+
 export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSignal) {
   const focus: Record<Task, number> = { install: 0, inspect: 0, uninstall: 0, clean: 0 };
   const knownItems = new Map<string, Item>();
@@ -219,26 +286,18 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
   const maintenanceActions = new Map<string, NonNullable<Pick['maintenance']>>();
   const problems = new Map<string, string>();
   let task: Task = 'inspect';
-  let pending: { task: Task; remaining?: string; plan?: Plan; removeData?: boolean } | undefined;
   let removeClaudeData = false;
   const selected = () => drafts[task];
-  const dataPending = () => task === 'uninstall' && pending?.task === task && pending.removeData === true;
   const dataVisible = () =>
     task === 'uninstall' &&
-    ([...selected().keys()].some(id => knownItems.get(id)?.kind === 'claude' || kindOf(id) === 'claude') ||
-      dataPending());
-  const hasSelection = () => selected().size > 0 || dataPending();
+    [...selected().keys()].some(id => knownItems.get(id)?.kind === 'claude' || kindOf(id) === 'claude');
+  const hasSelection = () => selected().size > 0;
   const reconcile = () => {
     if (task === 'uninstall' && !dataVisible()) removeClaudeData = false;
   };
   const changeSelection = (edit: () => void) => {
-    const before = [...selected()];
-    const dataBefore = removeClaudeData;
     edit();
-    if (!isDeepStrictEqual(before, [...selected()]) || dataBefore !== removeClaudeData) {
-      pending = undefined;
-      problems.delete(CLAUDE_DATA_ID);
-    }
+    problems.delete(CLAUDE_DATA_ID);
     reconcile();
   };
   const select = (id: string, pick?: Pick) => {
@@ -249,7 +308,110 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
     });
   };
   while (!signal?.aborted) {
+    let restoredTask: Task | undefined;
+    while (!signal?.aborted) {
+      let recovery: Recovery | undefined | null;
+      try {
+        recovery = await terminal.wait('核对未完成任务', () => ccw.recovery(), signal);
+      } catch (error) {
+        if (signal?.aborted) return;
+        if ((await terminal.choose(`无法读取未完成任务\n${reason(errorCode(error))}`, ['重新检查', '退出'], 1)) !== 0)
+          return;
+        continue;
+      }
+      if (recovery === null || signal?.aborted) return;
+      if (!recovery) break;
+      const choice = await terminal.choose(
+        describeRecovery(recovery),
+        ['继续任务', '重新检查', '重新预览', '放弃任务', '退出'],
+        1,
+        4,
+      );
+      if (choice === 4 || signal?.aborted) return;
+      if (choice === 1) continue;
+      if (choice === 2 || choice === 3) {
+        const label = choice === 2 ? '重新预览' : '放弃任务';
+        if (
+          (await terminal.choose(
+            `${label}\n已完成的安装与设置会保留。${choice === 2 ? '重新选择后将生成新的目标与预览。' : '未完成的工作将不再继续。'}`,
+            [label, '返回'],
+            1,
+          )) !== 0
+        )
+          continue;
+        await ccw.abandon(recovery.id);
+        if (choice === 2) {
+          restoredTask = recoveryTask(recovery);
+          drafts[restoredTask].clear();
+          for (const pick of Array.isArray(recovery.intent.selected) ? recovery.intent.selected : []) {
+            if (!isObject(pick) || typeof pick.id !== 'string') continue;
+            const maintenance = pick.maintenance;
+            const draft: Pick = {
+              id: pick.id,
+              ...(maintenance === 'update' || maintenance === 'reinstall' || maintenance === 'login'
+                ? { maintenance }
+                : {}),
+              ...(pick.removal === 'detach' || recovery.intent.task === 'detach' ? DETACH_REMOVAL : {}),
+            };
+            drafts[restoredTask].set(pick.id, draft);
+            if (draft.maintenance) maintenanceActions.set(pick.id, draft.maintenance);
+          }
+          removeClaudeData = recovery.intent.removeData === true;
+        }
+        break;
+      }
+      const inputs: Record<string, Record<string, string>> = {};
+      if (recovery.inputs.length) {
+        const values = await terminal.form(
+          '补充未保存的凭据',
+          recovery.inputs.map((input, index) => ({
+            key: `input-${index}`,
+            label: `${contentName(recovery.items.find(item => item.id === input.itemId) ?? { title: '所选内容' })} · ${input.field === 'secret' ? 'API Key' : '凭据'}`,
+            value: '',
+            secret: true,
+            placeholder: '必填',
+          })),
+          form => {
+            const missing = recovery.inputs.findIndex((_input, index) => !form[`input-${index}`]?.trim());
+            return missing < 0 ? null : { message: '请填写凭据', field: `input-${missing}` };
+          },
+        );
+        if (values === null) continue;
+        for (const [index, input] of recovery.inputs.entries())
+          (inputs[input.operationId] ??= {})[input.field] = values[`input-${index}`]!.trim();
+      }
+      let plan: Plan | null;
+      try {
+        plan = await terminal.wait(
+          '准备剩余计划',
+          reading => ccw.plan({ resume: recovery.id, ...(recovery.inputs.length ? { inputs } : {}) }, reading),
+          signal,
+        );
+      } catch (error) {
+        if (signal?.aborted) return;
+        await terminal.choose(`无法继续任务\n${reason(errorCode(error))}`, ['返回']);
+        continue;
+      }
+      if (plan === null || signal?.aborted) return;
+      const action = recoveryTask(recovery);
+      if (plan.problem) {
+        await terminal.choose(`无法继续任务\n${reason(plan.problem)}`, ['返回']);
+        continue;
+      }
+      if (!(await confirmPlan(terminal, plan, action))) continue;
+      const presentation = createRunPresentation(plan, action, recovery.items);
+      terminal.show(presentation.progress());
+      const result = await ccw.apply(plan.id, signal, event => terminal.show(presentation.progress(event)));
+      for (const item of result.items) {
+        if (item.state !== 'done' && item.isPending !== false) continue;
+        drafts[action].delete(item.id);
+        if (action === 'install') maintenanceActions.delete(item.id);
+        if (item.id === CLAUDE_DATA_ID) removeClaudeData = false;
+      }
+      await showResult(terminal, presentation, result, signal);
+    }
     const selectedTask =
+      restoredTask ??
       TASK_ORDER[await terminal.choose(HOME_TITLE, [...TASK_ORDER.map(task => TASKS[task].name), '退出'])];
     if (selectedTask === undefined || signal?.aborted) return;
     task = selectedTask;
@@ -347,13 +509,7 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
       const items = ordered.filter(
         item => availableActions(item, task).length > 0 || (task === 'install' && maintenanceActions.has(item.id)),
       );
-      const remaining = pending?.task === task ? pending : undefined;
-      const missing = new Set([...selected().keys()].filter(id => !remaining && !items.some(item => item.id === id)));
-      if (remaining)
-        for (const id of selected().keys()) {
-          const item = knownItems.get(id);
-          if (item && !items.some(value => value.id === id)) items.push(item);
-        }
+      const missing = new Set([...selected().keys()].filter(id => !items.some(item => item.id === id)));
       for (const id of missing) {
         const item = knownItems.get(id);
         if (item) items.push(item);
@@ -553,56 +709,36 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
         continue;
       }
       const picks = [...selected().values()];
-      // 套件整装保留已有成员、成员更新改写成员：同计划必然与冻结的目录摘要冲突，提交前阻断
-      const suiteTargets = new Set(picks.filter(pick => kindOf(pick.id) === 'skill-set').map(pick => restOf(pick.id)));
-      const overlappingUpdate = suiteTargets.size
-        ? picks.find(pick => {
-            if (pick.maintenance === undefined) return false;
-            const suite = knownItems.get(pick.id)?.skillSet;
-            return suite !== undefined && suiteTargets.has(suite);
-          })
-        : undefined;
-      if (overlappingUpdate) {
-        problems.set(overlappingUpdate.id, 'overlapping-selection');
-        focus[task] = Math.max(
-          0,
-          entries.findIndex(entry => entry.item.id === overlappingUpdate.id),
-        );
-        continue;
-      }
-      const saved = pending?.task === task ? pending : undefined;
-      const request: Request = saved?.remaining
-        ? { resume: saved.remaining }
-        : task === 'uninstall'
+      const request: Request =
+        task === 'uninstall'
           ? { task, selected: picks, ...(removeClaudeData ? { removeData: true } : {}) }
           : { task, selected: picks };
       const preparationTask = task;
       const preparation = preparationTitle(task);
       let preparing: Promise<Plan> | undefined;
-      const plan =
-        saved?.plan ??
-        (saved?.remaining
-          ? await ccw.plan(request, signal)
-          : await terminal.wait(
-              preparation,
-              (reading, update) => {
-                preparing = ccw.plan(request, reading, event => update?.(describePreparation(event, preparationTask)));
-                return preparing;
-              },
-              signal,
-              preparation,
-            ));
+      let plan: Plan | null;
+      try {
+        plan = await terminal.wait(
+          preparation,
+          (reading, update) => {
+            preparing = ccw.plan(request, reading, event => update?.(describePreparation(event, preparationTask)));
+            return preparing;
+          },
+          signal,
+          preparation,
+        );
+      } catch (error) {
+        if (signal?.aborted) return;
+        await chooseWithDetails(terminal, failureLabel(task), ['返回'], describeDiagnostic({ code: errorCode(error) }));
+        continue;
+      }
       if (plan === null) {
         await preparing?.catch(() => undefined);
-        pending = undefined;
         continue;
       }
       if (signal?.aborted) return;
-      pending = undefined;
       problems.clear();
       for (const item of plan.items) if (item.problem !== null) problems.set(item.id, item.problem);
-      if (plan.problem === null && problems.size === 0)
-        pending = { task, plan, ...(task === 'uninstall' && removeClaudeData ? { removeData: true } : {}) };
       if (plan.problem !== null) {
         await chooseWithDetails(terminal, failureLabel(task), ['返回'], describeDiagnostic({ code: plan.problem }));
         continue;
@@ -613,22 +749,9 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
           0,
           problemIndex >= 0 ? problemIndex : removeClaudeData && problems.has(CLAUDE_DATA_ID) ? entries.length : 0,
         );
-        continue;
+        if (plan.items.every(item => item.problem !== null)) continue;
       }
-      if (task !== 'install') {
-        const preview = plan.items
-          .map(
-            item =>
-              `${planVerb(item)} ${contentName(item)}\n${item.problem ? `  ${PROBLEM_MARK}${reason(item.problem)}` : item.changes.map(change => `  · ${describeChange(change)}`).join('\n')}`,
-          )
-          .join('\n');
-        const confirm = await terminal.choose(
-          `变更预览\n${preview}`,
-          [task === 'clean' ? '确认清理' : '确认卸载', '返回修改'],
-          1,
-        );
-        if (confirm !== 0) continue;
-      }
+      if (!(await confirmPlan(terminal, plan, task))) continue;
       const presentation = createRunPresentation(plan, taskAction);
       terminal.show(presentation.progress());
       const result = await ccw.apply(plan.id, signal, event => {
@@ -643,48 +766,9 @@ export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSi
           if (task === 'install') maintenanceActions.delete(item.id);
         }
       }
-      const dataRemaining =
-        removeClaudeData && result.items.some(item => item.id === CLAUDE_DATA_ID && item.isPending === true);
-      pending = result.remaining
-        ? { task, remaining: result.remaining, ...(dataRemaining ? { removeData: true } : {}) }
-        : undefined;
       reconcile();
-      const resultView = presentation.result(result);
-      let resultFocus = 1;
-      let detailFocus = 0;
-      while (!signal?.aborted) {
-        const next = await terminal.choose(
-          resultView,
-          [hasSelection() && result.remaining ? '重试未完成项' : '返回列表', BACK_TO_HOME, '查看详情'],
-          resultFocus,
-          1,
-        );
-        if (next !== 2) {
-          if (next === 1) returnToMenu = true;
-          break;
-        }
-        resultFocus = next;
-        let item = result.items[0];
-        if (result.items.length > 1) {
-          detailFocus = await terminal.choose(
-            '选择结果',
-            [
-              ...result.items.map(item => {
-                const row = resultView.rows.find(candidate => candidate.id === item.id);
-                return {
-                  label: row?.title ?? contentName(item),
-                  detail: row?.status ?? '',
-                };
-              }),
-              '返回',
-            ],
-            Math.min(detailFocus, result.items.length - 1),
-          );
-          item = result.items[detailFocus];
-        }
-        if (item) await terminal.choose(presentation.details(result, item.id), ['返回']);
-        else if (!result.items.length) await terminal.choose('结果详情\n本次没有条目记录', ['返回']);
-      }
+      const next = await showResult(terminal, presentation, result, signal);
+      if (next === 1 || result.remaining) returnToMenu = true;
     }
   }
 }
