@@ -185,7 +185,11 @@ test('更新 OfficeCLI：复用 npm 镜像', async t => {
     view: args => (registryOf(args) === MIRROR ? ok(JSON.stringify('1.0.160')) : fail()),
   });
   const machine = {
-    ...f.machine({ processes: async () => [], npm: world.npm }),
+    ...f.machine({
+      processes: async () => [],
+      npm: world.npm,
+      execute: versionProbe({ binary, output: () => `OfficeCLI ${world.state.version}` }),
+    }),
     async fetchText(url) {
       throw new Error(`unexpected network fetch: ${url}`);
     },
@@ -234,7 +238,11 @@ test('更新 OfficeCLI 技能：固定镜像提交', async t => {
     view: args =>
       registryOf(args) !== MIRROR ? fail() : ok(JSON.stringify(args.includes('gitHead') ? nextRevision : '1.0.160')),
   });
-  const base = f.machine({ processes: async () => [], npm: world.npm });
+  const base = f.machine({
+    processes: async () => [],
+    npm: world.npm,
+    execute: versionProbe({ binary, output: () => `OfficeCLI ${world.state.version}` }),
+  });
   const stamp = await base.treeStamp(skill);
   const metadataFile = path.join(f.home, '.ccw', 'sources.json');
   await f.write(
