@@ -67,19 +67,22 @@ function optional(value: Record<string, unknown>, key: string, validate: (field:
   return !Object.hasOwn(value, key) || validate(value[key]);
 }
 
-function isJson(value: unknown): value is Json {
-  return (
-    value === null ||
-    typeof value === 'string' ||
-    typeof value === 'boolean' ||
-    (typeof value === 'number' && Number.isFinite(value)) ||
-    (Array.isArray(value) && value.every(isJson)) ||
-    (isObject(value) && Object.values(value).every(isJson))
-  );
+function isJson(value: unknown, ancestors = new Set<object>()): value is Json {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value !== 'object' || ancestors.has(value) || Object.getOwnPropertySymbols(value).length) return false;
+  if (
+    Array.isArray(value)
+      ? Object.keys(value).length !== value.length
+      : Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null
+  )
+    return false;
+  const next = new Set(ancestors).add(value);
+  return Object.values(value).every(child => isJson(child, next));
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
-  return isObject(value) && Object.values(value).every(isJson);
+  return isObject(value) && isJson(value);
 }
 
 function isChange(value: unknown): value is Change {
@@ -245,6 +248,7 @@ export async function readOperation(machine: Machine, ctx: StorageContext): Prom
 
 /** 提交后回读完整校验；调用方只在此 Promise 成功后获得派发资格。 */
 export async function writeOperation(machine: Machine, ctx: StorageContext, record: OperationRecord): Promise<void> {
+  if (!isRecord(record)) throw invalid();
   const frozen = envelope({ schema: 1, checksum: checksum(record), record: structuredClone(record) });
   const file = operationFile(ctx);
   let before: string | null;

@@ -38,6 +38,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
   let record: OperationRecord | undefined;
   let busy = false;
   let editable: string | undefined;
+  let approval: string | undefined;
   let active: string | undefined;
   const scope = createEffectScope(machine, () => active !== undefined);
   const inputs: Record<string, Readonly<Record<string, string>>> = {};
@@ -160,6 +161,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
       try {
         await load();
         if (!record || record.phase === 'completed') return undefined;
+        approval = undefined;
         for (const operation of record.operations) await registerAssessment(operation, await assess(operation));
         await save({ ...record, planId: randomUUID(), phase: 'awaiting-confirmation' });
         return structuredClone(recovery());
@@ -174,6 +176,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
       await clearOperation(machine, ctx);
       record = undefined;
       editable = undefined;
+      approval = undefined;
       for (const key of Object.keys(inputs)) delete inputs[key];
     },
     async plan(
@@ -184,6 +187,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
       busy = true;
       try {
         await load();
+        approval = undefined;
         if ('resume' in input) {
           if (!record || record.id !== input.resume || record.phase === 'completed')
             throw new Error('plan-unavailable');
@@ -198,6 +202,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           await save({ ...record, phase: 'preparing' });
           for (const operation of record.operations) await registerAssessment(operation, await assess(operation));
           await save({ ...record, planId: randomUUID(), phase: 'awaiting-confirmation' });
+          approval = record.planId;
           return structuredClone(currentPlan());
         }
         if (
@@ -281,6 +286,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           facts: Object.fromEntries(operations.map(operation => [operation.id, { status: 'pending', effects: [] }])),
         });
         editable = id;
+        approval = prepared.plan.id;
         return structuredClone(prepared.plan);
       } finally {
         busy = false;
@@ -306,8 +312,9 @@ export function createOperationController(ctx: Context, machine: Machine, handle
       };
       try {
         await load();
-        if (!record || record.phase !== 'awaiting-confirmation' || record.planId !== planId)
+        if (!record || record.phase !== 'awaiting-confirmation' || record.planId !== planId || approval !== planId)
           return invalid('plan-unavailable');
+        approval = undefined;
         const plan = currentPlan();
         await save({ ...record, phase: 'executing' });
         const attempted = new Set<string>();

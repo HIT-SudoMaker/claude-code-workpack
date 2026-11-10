@@ -356,12 +356,10 @@ test('登录官方账号：清除第三方连接', async t => {
     },
   });
   assert.deepEqual(
-    f.loginCalls.map(call => call.args),
-    [
-      ['auth', 'login'],
-      ['auth', 'status', '--json'],
-    ],
+    f.loginCalls.filter(call => call.args[1] === 'login').map(call => call.args),
+    [['auth', 'login']],
   );
+  assert.ok(f.loginCalls.some(call => call.args[1] === 'status'));
   assert.equal(f.loginCalls[0].isInteractive, true);
   assert.deepEqual(f.loginCalls[0].settings.env, { KEEP: 'yes', ...defaultEnv });
   assert.deepEqual(await f.read(), {

@@ -12,6 +12,8 @@ test('重建实例发现冻结的设置计划，确认前不修改目标', async
   const first = f.ccw(machine);
   const plan = await first.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
   const restarted = f.ccw(machine);
+  assert.equal((await restarted.apply(plan.id)).state, 'failed');
+  assert.equal((await f.read(f.settingsFile)).language, 'English');
   const recovery = await restarted.recovery();
   assert.ok(recovery);
   assert.equal((await f.read(f.settingsFile)).language, 'English');
@@ -88,12 +90,10 @@ test('恢复仅接收缺失凭据，错误重输后仍可重新输入冻结凭�
   const secret = 'fixture-frozen-secret';
   const f = await createEnv(t, { seed: { settings: { keep: true } } });
   const machine = f.machine();
-  await f
-    .ccw(machine)
-    .plan({
-      task: 'install',
-      selected: [{ id: 'settings', fields: { mode: 'api', baseUrl: 'https://gateway.example.test', secret } }],
-    });
+  await f.ccw(machine).plan({
+    task: 'install',
+    selected: [{ id: 'settings', fields: { mode: 'api', baseUrl: 'https://gateway.example.test', secret } }],
+  });
   const restarted = f.ccw(machine);
   let recovery = await restarted.recovery();
   assert.deepEqual(recovery.inputs, [{ operationId: 'settings/settings', itemId: 'settings', field: 'secret' }]);
@@ -232,4 +232,44 @@ test('准备失败不阻断独立设置，放弃保留已成功结果', async t 
   assert.equal((await f.read(f.settingsFile)).language, '中文');
   const next = await ccw.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: 'English' } }] });
   assert.equal((await ccw.apply(next.id)).state, 'done');
+});
+
+test('提交瞬间冻结选择：读取任务记录期间的调用方修改不改变预览', async t => {
+  const f = await createEnv(t, { seed: { settings: { language: 'English' } } });
+  const base = f.machine();
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let gate = true;
+  const machine = {
+    ...base,
+    async read(file) {
+      if (gate && file === path.join(f.home, '.ccw/operation.json')) {
+        gate = false;
+        entered.resolve();
+        await release.promise;
+      }
+      return base.read(file);
+    },
+  };
+  const ccw = f.ccw(machine);
+  const selected = [{ id: 'settings', fields: { language: '中文' } }];
+  const preparing = ccw.plan({ task: 'install', selected });
+  await entered.promise;
+  selected[0].fields.language = 'external mutation';
+  release.resolve();
+  const plan = await preparing;
+  assert.equal((await ccw.apply(plan.id)).state, 'done');
+  assert.equal((await f.read(f.settingsFile)).language, '中文');
+});
+
+test('重复选择在准备前拒绝，并撤回旧预览的执行许可', async t => {
+  const f = await createEnv(t, { seed: { settings: { language: 'English' } } });
+  const ccw = f.ccw(f.machine());
+  const old = await ccw.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
+  await assert.rejects(
+    ccw.plan({ task: 'install', selected: [{ id: 'settings' }, { id: 'settings' }] }),
+    /duplicate-selection/,
+  );
+  assert.equal((await ccw.apply(old.id)).state, 'failed');
+  assert.equal((await f.read(f.settingsFile)).language, 'English');
 });
