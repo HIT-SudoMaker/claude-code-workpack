@@ -5,7 +5,7 @@ import { knownTitle } from './titles.js';
 import { ENABLED_PLUGINS_KEY } from './settings.js';
 import { marketplaceSources, pluginSpecs } from './management-catalog.js';
 import { errorCode, isGitRevision, isObject, treeFilesStamp } from './machine.js';
-import { json, object, restOf, success, unchanged } from './model.js';
+import { commandReceipt, json, object, restOf, success, unchanged } from './model.js';
 import type {
   Context,
   Describe,
@@ -736,10 +736,7 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
           'user',
           ...(p.keepData ? ['--keep-data'] : []),
         ]);
-        const receipt = {
-          kind: 'returned' as const,
-          failure: result.failed || result.code !== 0 ? 'plugin-command-failed' : null,
-        };
+        const receipt = commandReceipt(result, 'plugin-command-failed');
         try {
           return { receipt, evidence: await capture(extensionString(p.name)) };
         } catch {

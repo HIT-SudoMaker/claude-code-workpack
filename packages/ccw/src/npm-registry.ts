@@ -22,8 +22,32 @@ const installFlags = ['--fetch-retries=1', '--fetch-timeout=30000'] as const;
 export const isExactVersion = (value: unknown): value is string =>
   typeof value === 'string' && /^\d+\.\d+\.\d+$/.test(value);
 
+function packageScope(packageSpec: string) {
+  return /^(@[a-z0-9._-]+)\/[a-z0-9._-]+(?:@[^\s]+)?$/i.exec(packageSpec)?.[1];
+}
+
+/** Only public source identity may enter a durable plan; npm retains credential handling. */
+function publicRegistry(value: string): string {
+  try {
+    const url = new URL(value);
+    if (
+      value !== value.trim() ||
+      /[\r\n\0]/.test(value) ||
+      !['https:', 'http:'].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    )
+      throw new Error();
+    return value;
+  } catch {
+    throw new Error('source-registry-unconfirmed');
+  }
+}
+
 function registryFlags(registry: string, packageSpec: string) {
-  const scope = /^(@[a-z0-9._-]+)\/[a-z0-9._-]+(?:@[^\s]+)?$/i.exec(packageSpec)?.[1];
+  const scope = packageScope(packageSpec);
   if (scope === undefined) return [`--registry=${registry}`];
   return [`--registry=${registry}`, `--${scope}:registry=${registry}`];
 }
@@ -31,6 +55,20 @@ function registryFlags(registry: string, packageSpec: string) {
 function registries(preferred: NpmRegistry = null) {
   const values: NpmRegistry[] = preferred === null ? [null, NPM_MIRROR] : [preferred, null, NPM_MIRROR];
   return values.filter((value, index) => values.indexOf(value) === index);
+}
+
+/** Read the same project/user context as npm view, then bind it for global installs too. */
+async function configuredRegistry(machine: Pick<Machine, 'npm'>, packageSpec: string): Promise<string | null> {
+  const scope = packageScope(packageSpec);
+  for (const key of [...(scope ? [`${scope}:registry`] : []), 'registry']) {
+    const result = await machine.npm(['config', 'get', key], { timeoutMs: NPM_READ_TIMEOUT_MS });
+    if (result.reason === 'npm-not-found') return null;
+    if (!succeeded(result)) throw new Error('source-registry-unconfirmed');
+    const value = result.stdout.trim();
+    if (key !== 'registry' && (value === 'undefined' || value === 'null' || value === '')) continue;
+    return publicRegistry(value);
+  }
+  throw new Error('source-registry-unconfirmed');
 }
 
 /** 查询当前 npm 配置，并在失败或返回无效值时尝试国内镜像 */
@@ -41,15 +79,10 @@ export async function resolveNpmView<T>(
   parse: (value: unknown) => T | null,
   preferred: NpmRegistry = null,
 ): Promise<NpmResolution<T> | null> {
-  for (const registry of registries(preferred)) {
-    const args = [
-      'view',
-      packageSpec,
-      field,
-      '--json',
-      ...queryFlags,
-      ...(registry === null ? [] : registryFlags(registry, packageSpec)),
-    ];
+  for (const candidate of registries(preferred)) {
+    const registry = candidate === null ? await configuredRegistry(machine, packageSpec) : publicRegistry(candidate);
+    if (registry === null) return null;
+    const args = ['view', packageSpec, field, '--json', ...queryFlags, ...registryFlags(registry, packageSpec)];
     try {
       const result = await machine.npm(args, { timeoutMs: NPM_READ_TIMEOUT_MS });
       if (!succeeded(result)) continue;
@@ -66,11 +99,12 @@ export async function resolveNpmView<T>(
 export function npmInstallArgs(args: readonly string[], registry: NpmRegistry): readonly string[] {
   const target = args.at(-1);
   if (target === undefined) throw new Error('invalid-npm-command');
+  if (registry === null) throw new Error('source-registry-unconfirmed');
   return [
     ...args.slice(0, -1),
     ...NPM_AUDIT_FREE,
     ...installFlags,
-    ...(registry === null ? [] : registryFlags(registry, target)),
+    ...registryFlags(publicRegistry(registry), target),
     target,
   ];
 }

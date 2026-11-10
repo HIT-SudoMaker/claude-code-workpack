@@ -60,6 +60,13 @@ export function scopedRegistryOf(args, scope) {
   const index = args.indexOf(option);
   return index < 0 ? null : (args[index + 1]?.replace(/\/$/, '') ?? null);
 }
+/** Model only the public registry getters used to freeze npm metadata and installation sources. */
+export function npmConfig(args, registry = 'https://registry.npmjs.org') {
+  if (args.length !== 3 || args[0] !== 'config' || args[1] !== 'get') throw new Error('unexpected npm config command');
+  if (args[2] === 'registry') return ok(registry);
+  if (/^@[a-z0-9._-]+:registry$/i.test(args[2])) return ok('undefined');
+  throw new Error('unexpected npm config key');
+}
 /** 构造 npm 世界应答器：ls/root/view/install/uninstall 共性集中，差异经策略参数暴露，返回 {npm, state} */
 export function npmWorld({
   package: name,
@@ -81,6 +88,7 @@ export function npmWorld({
   const npm = async args => {
     if (onCommand) await onCommand(args);
     if (failCommand !== null && args[0] === failCommand(args)) return fail();
+    if (args[0] === 'config') return npmConfig(args);
     if (args[0] === 'ls')
       return ok(
         JSON.stringify({

@@ -46,6 +46,13 @@ test('读取能力：变更命令与未知命令在派发前拒绝', async () =>
     () => undefined,
   );
   await assert.rejects(reading.npm(['install', '-g', 'anything']), /read-command-not-allowed/);
+  for (const args of [
+    ['config', 'list'],
+    ['config', 'get', '//registry.example.test/:_authToken'],
+    ['config', 'get', 'registry', '_authToken'],
+    ['config', 'set', 'registry', 'https://registry.example.test'],
+  ])
+    await assert.rejects(reading.npm(args), /read-command-not-allowed/);
   await assert.rejects(
     reading.execute('powershell.exe', ['-Command', 'Remove-Item anything']),
     /read-command-not-allowed/,
@@ -77,12 +84,14 @@ test('读取能力：实际查询与暂存来源仍可用', async () => {
     () => undefined,
   );
   await reading.npm(['view', '@officecli/officecli@latest', 'version', '--json']);
+  await reading.npm(['config', 'get', 'registry']);
+  await reading.npm(['config', 'get', '@officecli:registry']);
   await reading.execute('git', ['ls-remote', 'https://github.com/example/skills', 'HEAD']);
   assert.equal(
     (await reading.source('https://github.com/example/skills', 'a'.repeat(40), 'skills'))[0].path,
     'SKILL.md',
   );
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 4);
 });
 
 test('效果能力：每次派发复核执行资格，捕获方法不能带走许可', async () => {

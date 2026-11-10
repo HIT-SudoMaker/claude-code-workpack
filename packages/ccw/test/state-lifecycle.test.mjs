@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { contentRows } from '../dist/render.js';
-import { createEnv, ok, pluginMarketplaceFiles, revision } from './env.mjs';
+import { npmConfig, createEnv, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 const quietNpm = () => ({ code: 0, failed: false, stdout: '{}' });
 const seed = {
@@ -210,13 +210,15 @@ test('失效 Claude 计划：停止依赖续跑', async t => {
       code: 0,
       failed: false,
       stdout:
-        args[0] === 'root'
-          ? npmRoot
-          : args[0] === 'view'
-            ? '"2.1.2"'
-            : JSON.stringify({
-                dependencies: args.at(-1) === packageName ? { [packageName]: { version: '2.1.1' } } : {},
-              }),
+        args[0] === 'config'
+          ? npmConfig(args).stdout
+          : args[0] === 'root'
+            ? npmRoot
+            : args[0] === 'view'
+              ? '"2.1.2"'
+              : JSON.stringify({
+                  dependencies: args.at(-1) === packageName ? { [packageName]: { version: '2.1.1' } } : {},
+                }),
     }),
     execute: async (_file, args) => {
       if (_file === 'git') return ok(`${revision}\tHEAD\n`);

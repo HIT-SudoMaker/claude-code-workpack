@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
-import { createEnv, exists, ok } from './env.mjs';
+import { npmConfig, createEnv, exists, ok } from './env.mjs';
 
 const bytes = Buffer.from('fixed native OfficeCLI release payload');
 const checksum = createHash('sha256').update(bytes).digest('hex');
@@ -76,6 +76,7 @@ async function fixture(t, platform = process.platform, extra = {}) {
     processes: async () => (state.running ? [{ name: 'claude.exe', command: 'claude --resume' }] : []),
     npm: async args => {
       if (state.npmFailure !== null) return { code: null, failed: true, stdout: '', ...state.npmFailure };
+      if (args[0] === 'config') return npmConfig(args);
       if (args[0] === 'ls' && state.confirming && state.registryUnavailable)
         return { code: null, failed: true, stdout: '' };
       const name = args.at(-1);

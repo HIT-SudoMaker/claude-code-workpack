@@ -153,6 +153,12 @@ export interface OperationOutcome {
   readonly evidence?: JsonObject;
   readonly effects?: readonly Effect[];
 }
+/** A missing exit status never proves that an external command returned. */
+export function commandReceipt(result: CommandResult, failure: string): OperationOutcome['receipt'] {
+  return result.failed || result.code === null
+    ? { kind: 'unknown', failure }
+    : { kind: 'returned', failure: succeeded(result) ? null : failure };
+}
 export interface OperationHandler {
   assess(
     definition: OperationDefinition,

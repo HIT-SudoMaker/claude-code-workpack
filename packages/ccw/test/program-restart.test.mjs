@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { test } from 'node:test';
-import { createEnv, ok, releaseContract } from './env.mjs';
+import { npmConfig, createEnv, ok, releaseContract } from './env.mjs';
 
 test('OfficeCLI restart reconciles deployed binary and resumes PATH without deploying again', async t => {
   const f = await createEnv(t);
@@ -62,6 +62,7 @@ test('Claude same-byte reinstall with a lost command receipt remains paused afte
   let queries = 0;
   const machine = f.machine({
     npm: async args => {
+      if (args[0] === 'config') return npmConfig(args);
       if (args[0] === 'root') return ok(root);
       if (args[0] === 'ls')
         return ok(JSON.stringify({ dependencies: { '@anthropic-ai/claude-code': { version: '2.1.2' } } }));
@@ -107,6 +108,7 @@ test('Claude restart completes only defaults after a verified installation', asy
   let failDefaults = true;
   const base = f.machine({
     npm: async args => {
+      if (args[0] === 'config') return npmConfig(args);
       if (args[0] === 'root') return ok(root);
       if (args[0] === 'ls')
         return ok(JSON.stringify({ dependencies: version ? { '@anthropic-ai/claude-code': { version } } : {} }));
@@ -160,6 +162,7 @@ test('Claude CMD restart cleans its frozen installer directory without reinstall
   let cleanups = 0;
   const base = f.machine({
     npm: async args => {
+      if (args[0] === 'config') return npmConfig(args);
       if (args[0] === 'root') return ok(root);
       if (args[0] === 'view') return ok('"2.1.2"');
       if (args[0] === 'ls') return ok('{"dependencies":{}}');

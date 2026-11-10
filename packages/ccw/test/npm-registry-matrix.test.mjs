@@ -15,6 +15,7 @@ import {
   versionProbe,
 } from './env.mjs';
 
+const OFFICIAL = 'https://registry.npmjs.org';
 const MIRROR = 'https://registry.npmmirror.com';
 const PACKAGE = '@cometix/ccline';
 
@@ -57,13 +58,13 @@ test('安装 CCometixLine：复用镜像与查询期限', async t => {
   const views = npmOf(f, 'view');
   assert.deepEqual(
     views.map(call => registryOf(call.args)),
-    [null, MIRROR],
+    [OFFICIAL, MIRROR],
   );
   assert.ok(
     views.every(call => call.options?.timeoutMs === 5_000),
     JSON.stringify(views),
   );
-  assert.equal(scopedRegistryOf(views[0].args, '@cometix'), null);
+  assert.equal(scopedRegistryOf(views[0].args, '@cometix'), OFFICIAL);
   assert.equal(
     scopedRegistryOf(views[1].args, '@cometix'),
     MIRROR,
@@ -92,12 +93,12 @@ test('安装 CCometixLine：沿用有效配置源', async t => {
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null],
+    [OFFICIAL],
   );
   assert.equal((await f.ccw.apply(plan.id)).state, 'done');
   const installs = npmOf(f, 'install');
   assert.equal(installs.length, 1);
-  assert.equal(registryOf(installs[0].args), null);
+  assert.equal(registryOf(installs[0].args), OFFICIAL);
 });
 
 test('配置源版本无效：查询镜像', async t => {
@@ -106,7 +107,7 @@ test('配置源版本无效：查询镜像', async t => {
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null, MIRROR],
+    [OFFICIAL, MIRROR],
   );
   assert.equal((await f.ccw.apply(plan.id)).state, 'done');
   assert.equal(registryOf(f.calls.find(call => call.kind === 'npm' && call.target === 'install').args), MIRROR);
@@ -118,7 +119,7 @@ test('拒绝不兼容的 CCometixLine 主版本', async t => {
   assert.equal(plan.items[0]?.problem, 'unsupported-ccline-release');
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null],
+    [OFFICIAL],
   );
   assert.equal(
     f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
@@ -132,7 +133,7 @@ test('npm 来源均失败：阻止 CCometixLine 安装', async t => {
   assert.notEqual(plan.items[0]?.problem, null);
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null, MIRROR],
+    [OFFICIAL, MIRROR],
   );
   assert.equal(
     f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
@@ -203,7 +204,7 @@ test('更新 OfficeCLI：复用 npm 镜像', async t => {
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null, MIRROR],
+    [OFFICIAL, MIRROR],
   );
   assert.ok(
     f.calls
@@ -275,7 +276,7 @@ test('更新 OfficeCLI 技能：固定镜像提交', async t => {
   assert.deepEqual(
     views.map(call => [call.args.includes('gitHead') ? 'gitHead' : 'version', registryOf(call.args)]),
     [
-      ['version', null],
+      ['version', OFFICIAL],
       ['version', MIRROR],
       ['gitHead', MIRROR],
     ],

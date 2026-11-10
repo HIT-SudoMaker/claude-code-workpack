@@ -102,6 +102,10 @@ export const ERROR_MESSAGES: Readonly<Record<string, MessageText>> = {
   'local-edits-preserved': { brief: '替换未执行', detail: '保留内容：来源未知或内容已修改；可备份并替换' },
   'source-version-unavailable': { brief: '资源版本待确认', detail: '确认资源失败：版本对应关系未知' },
   'source-unavailable': { brief: '获取资源失败', detail: '获取来源失败' },
+  'source-registry-unconfirmed': {
+    brief: '来源待确认',
+    detail: '无法固定安全的 npm 来源；请检查 registry 设置后重新预览',
+  },
   'source-empty': { brief: '预期资源缺失', detail: '获取来源失败：预期资源缺失' },
   'skill-payload-missing': { brief: '技能资源无效', detail: '读取技能资源失败：下载内容缺少有效 SKILL.md' },
   'skill-name-conflict': { brief: '技能名称冲突', detail: '安装技能失败：同名技能导致目录未知' },

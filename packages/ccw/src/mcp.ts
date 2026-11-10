@@ -4,7 +4,16 @@ import { randomUUID } from 'node:crypto';
 import { knownTitle } from './titles.js';
 import { mcpSpecs, officeIntegration } from './management-catalog.js';
 import { errorCode, isObject } from './machine.js';
-import { MCP_SERVERS_KEY, readMcpServers, restOf, success, unchanged, userBinary, userBinDirectory } from './model.js';
+import {
+  commandReceipt,
+  MCP_SERVERS_KEY,
+  readMcpServers,
+  restOf,
+  success,
+  unchanged,
+  userBinary,
+  userBinDirectory,
+} from './model.js';
 import { isExactVersion } from './npm-registry.js';
 import type {
   Context,
@@ -471,10 +480,7 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
             },
           },
         );
-        const receipt = {
-          kind: 'returned' as const,
-          failure: result.failed || result.code !== 0 ? 'uv-install-failed' : null,
-        };
+        const receipt = commandReceipt(result, 'uv-install-failed');
         try {
           return { receipt, evidence: { stamp: await ctx.machine.treeStamp(extensionString(p.uv)) } };
         } catch {
@@ -627,10 +633,7 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
           ],
           { env: { UV_TOOL_BIN_DIR: extensionString(p.bin) } },
         );
-        const receipt = {
-          kind: 'returned' as const,
-          failure: result.failed || result.code !== 0 ? 'serena-install-failed' : null,
-        };
+        const receipt = commandReceipt(result, 'serena-install-failed');
         try {
           return { receipt, evidence: { stamp: await ctx.machine.treeStamp(extensionString(p.command)) } };
         } catch {
@@ -654,10 +657,7 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
       async execute(definition) {
         const result = await ctx.effects.execute(extensionString(definition.payload.command), ['init']);
         return {
-          receipt: {
-            kind: 'returned',
-            failure: result.failed || result.code !== 0 ? 'serena-initialization-failed' : null,
-          },
+          receipt: commandReceipt(result, 'serena-initialization-failed'),
           evidence: { initialized: !result.failed && result.code === 0 },
         };
       },

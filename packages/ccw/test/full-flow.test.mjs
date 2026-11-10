@@ -7,7 +7,17 @@ import { test } from 'node:test';
 import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from './terminal-test.mjs';
-import { attribution, createEnv, exists, fail, ok, pluginMarketplaceFiles, releaseContract, revision } from './env.mjs';
+import {
+  npmConfig,
+  attribution,
+  createEnv,
+  exists,
+  fail,
+  ok,
+  pluginMarketplaceFiles,
+  releaseContract,
+  revision,
+} from './env.mjs';
 
 const defaultEnv = {
   DISABLE_TELEMETRY: '1',
@@ -99,6 +109,7 @@ async function fixture(t, { platform = process.platform } = {}) {
         if (state.onNpm) await state.onNpm(args, options);
         const last = args.at(-1);
         if (state.fail === `npm:${args[0]}`) return fail();
+        if (args[0] === 'config') return npmConfig(args);
         if (args[0] === 'root') return ok(npmRoot);
         if (args[0] === 'ls')
           return ok(
