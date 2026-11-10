@@ -1,6 +1,6 @@
-import { json, MCP_SERVERS_KEY, object, readMcpServers } from './model.js';
+import { json, object, readMcpServers } from './model.js';
 import type { Context, OperationDefinition, OperationHandler, Prepared } from './model.js';
-import { extensionDigest, extensionPrepared } from './skill-files.js';
+import { extensionDigest, extensionString, extensionPrepared } from './skill-files.js';
 
 const OWNED_RULES = ['mcp__amirc__organize_papers', 'mcp__amirc__search_papers', 'mcp__amirc__get_papers'];
 function allowedTools(settings: Record<string, unknown>): string[] {
@@ -67,7 +67,7 @@ export function legacyAmircHandlers(ctx: Context): Readonly<Record<string, Opera
         return { state: 'ready' };
       },
       async execute(definition) {
-        const rule = String(definition.payload.rule);
+        const rule = extensionString(definition.payload.rule);
         await ctx.effects.editJson(ctx.settingsFile, settings => {
           settings.permissions = {
             ...object(settings.permissions),
