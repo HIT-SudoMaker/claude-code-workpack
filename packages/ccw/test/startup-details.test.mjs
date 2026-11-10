@@ -10,8 +10,15 @@ import { startupFailure } from '../dist/render.js';
 const { version } = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const main = fileURLToPath(new URL('../dist/main.js', import.meta.url));
+// Isolate the OS user boundary so parallel CLI test files do not contend for
+// this file's startup lease. Configuration environment variables remain real.
+const userFixture = `data:text/javascript,${encodeURIComponent(`
+  import os from 'node:os';
+  const user = os.userInfo();
+  os.userInfo = () => ({ ...user, username: user.username + '-ccw-details-${process.pid}' });
+`)}`;
 const run = (args, env = {}) =>
-  spawnSync(process.execPath, [main, ...args], {
+  spawnSync(process.execPath, ['--import', userFixture, main, ...args], {
     encoding: 'utf8',
     windowsHide: true,
     timeout: 5000,
