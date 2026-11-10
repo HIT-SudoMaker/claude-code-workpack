@@ -263,12 +263,16 @@ export function createCcw(options: CcwOptions): Ccw {
           if (shouldRemoveData) {
             await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
               preparation.getStore()?.report('inspect');
-              const { changes, problem } = await attach(CLAUDE_DATA_ID, () =>
-                prepareClaudeDataRemoval(
-                  preparationContext,
-                  claudeRemovals.map(selection => `${selection.id}/program-removed`),
-                ),
-              );
+              const { changes, problem } = await attach(CLAUDE_DATA_ID, () => {
+                const prerequisites = claudeRemovals.map(selection => `${selection.id}/program-removed`);
+                if (
+                  !claudeRemovals.every((selection, index) =>
+                    work.get(selection.id)?.operations?.some(operation => operation.id === prerequisites[index]),
+                  )
+                )
+                  throw new Error('dependency-not-ready');
+                return prepareClaudeDataRemoval(preparationContext, prerequisites);
+              });
               items.push({
                 id: CLAUDE_DATA_ID,
                 title: knownTitle(CLAUDE_DATA_ID),

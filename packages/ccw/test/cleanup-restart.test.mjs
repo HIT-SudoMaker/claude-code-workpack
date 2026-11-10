@@ -147,3 +147,19 @@ test('删除 Claude 数据：等待所有已选择程序的卸载验收', async 
   assert.equal((await restarted.apply(resumed.id)).state, 'done');
   assert.equal(f.rootRemovals(), 1);
 });
+
+test('Claude 卸载准备失败：数据暂停且独立解除接入仍可执行', async t => {
+  const f = await fixture(t);
+  await f.json(f.settingsFile, { statusLine: { type: 'command', command: 'ccline' }, language: 'user' });
+  const ccw = f.ccw();
+  const plan = await ccw.plan({
+    task: 'uninstall',
+    selected: [{ id: 'claude:missing-copy' }, { id: 'ccline', removal: 'detach' }],
+    removeData: true,
+  });
+  assert.equal(plan.items.find(item => item.id === 'data:claude').problem, 'dependency-not-ready');
+  assert.equal((await ccw.apply(plan.id)).state, 'partial');
+  assert.equal((await f.read(f.settingsFile)).statusLine, undefined);
+  assert.equal(await exists(f.claudeRoot), true);
+  assert.equal(f.rootRemovals(), 0);
+});
