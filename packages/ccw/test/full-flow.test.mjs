@@ -401,6 +401,7 @@ test('显示安装进度：区分失败与跳过', async t => {
     async choose(title) {
       if (title === HOME_TITLE) return homes++ ? 4 : 0;
       if (title === '选择结果') return 0;
+      if (typeof title === 'string' && title.startsWith('未完成任务')) return 4;
       assert.equal(typeof title, 'object');
       if (title.title === '结果详情') {
         detailView = title;
@@ -520,7 +521,10 @@ for (const platform of ['darwin', 'linux', 'win32']) {
   test(`${platform} 安装 Claude：固定 npm 版本`, async t => {
     const f = await fixture(t, { platform });
     await f.write(f.settings, '{"language":"zh"}');
-    assert.equal((await f.apply({ task: 'install', selected: [{ id: 'claude' }] })).state, 'done');
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+    const preparedFetches = f.calls.filter(call => call.kind === 'fetch').length;
+    assert.equal((await f.ccw.apply(plan.id)).state, 'done');
+    assert.equal(f.calls.filter(call => call.kind === 'fetch').length, preparedFetches);
     assert.ok(
       f.calls.some(
         call =>
@@ -531,7 +535,7 @@ for (const platform of ['darwin', 'linux', 'win32']) {
       ),
     );
     assert.equal(
-      f.calls.some(call => call.target === 'cmd.exe' || call.target === 'powershell.exe' || call.kind === 'fetch'),
+      f.calls.some(call => call.target === 'cmd.exe' || call.target === 'powershell.exe'),
       false,
     );
     const item = (await f.ccw.inspect()).items.find(item => item.kind === 'claude');
@@ -589,10 +593,12 @@ test('取消 npm 安装：跳过备用渠道', async t => {
   f.faults.npm.set('install', async () => controller.abort());
   f.state.fail = 'npm:install';
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+  const preparedFetches = f.calls.filter(call => call.kind === 'fetch').length;
   const result = await f.ccw.apply(plan.id, controller.signal);
   assert.equal(result.state, 'cancelled');
+  assert.equal(f.calls.filter(call => call.kind === 'fetch').length, preparedFetches);
   assert.equal(
-    f.calls.some(call => call.target === 'cmd.exe' || call.kind === 'fetch'),
+    f.calls.some(call => call.target === 'cmd.exe'),
     false,
   );
 });

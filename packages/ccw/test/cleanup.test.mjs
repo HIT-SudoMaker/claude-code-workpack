@@ -241,6 +241,31 @@ test('删除抛错后证实原目标未变：新实例重新确认后可删除�
   assert.equal(await f.exists('debug/b.log'), false);
 });
 
+test('后一次删除结果不可读：新实例不能借用前一次未变证据再次删除', async t => {
+  const f = await fixture(t);
+  await f.write('debug/a.log');
+  f.state.failRemoveOn = 1;
+  const first = await f.ccw.apply((await f.plan(['data:cache'])).id);
+  const retry = await f.ccw.plan({ resume: first.remaining });
+  f.state.failRemoveOn = 2;
+  f.state.unreadableAfterFailure = true;
+  const second = await f.ccw.apply(retry.id);
+  assert.ok(second.remaining);
+  f.state.treeStampFails = false;
+  const restarted = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  });
+  const recovery = await restarted.recovery();
+  const remaining = await restarted.plan({ resume: recovery.id });
+  assert.notEqual((await restarted.apply(remaining.id)).state, 'done');
+  assert.equal(f.state.removeTreeCalls, 2);
+  assert.equal(await f.exists('debug/a.log'), true);
+});
+
 test('清理数据：时钟回拨仍复核进程', async t => {
   const f = await fixture(t);
   await f.write('debug/a.log');

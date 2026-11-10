@@ -159,6 +159,21 @@ test('技能套件保留不同成员的所有失败原因', async t => {
   assert.ok(result.items[0].effects.some(effect => effect.code === 'fixture-write-failed'));
 });
 
+test('取消剩余技能时仍保留已经发生的成员失败原因', async t => {
+  const f = await fixture(t);
+  f.state.failReplaceTree = 'tdd';
+  const abort = new AbortController();
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] });
+  const result = await f.ccw.apply(plan.id, abort.signal, event => {
+    if (event.kind === 'effect' && event.effect.code === 'skill-installed') abort.abort();
+  });
+  assert.equal(result.state, 'cancelled');
+  assert.ok(
+    result.items[0].effects.some(effect => effect.code === 'fixture-write-failed' && effect.state === 'failed'),
+  );
+  assert.ok(result.items[0].effects.some(effect => effect.code === 'cancelled'));
+});
+
 test('删除已有技能：阻止旧安装计划', async t => {
   const f = await fixture(t);
   const directory = path.join(f.claudeRoot, 'skills/tdd');

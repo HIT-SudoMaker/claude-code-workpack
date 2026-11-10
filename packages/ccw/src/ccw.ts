@@ -296,7 +296,7 @@ export function createCcw(options: CcwOptions): Ccw {
                 const prerequisites = claudeRemovals.map(selection => `${selection.id}/program-removed`);
                 if (
                   !claudeRemovals.every((selection, index) =>
-                    work.get(selection.id)?.operations?.some(operation => operation.id === prerequisites[index]),
+                    work.get(selection.id)?.operations.some(operation => operation.id === prerequisites[index]),
                   )
                 )
                   throw new Error('dependency-not-ready');

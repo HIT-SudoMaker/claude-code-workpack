@@ -343,8 +343,11 @@ export function createOperationController(ctx: Context, machine: Machine, handle
                 await update(operation, { ...fact(operation), status: 'failed', problem: 'credential-required' });
                 continue;
               }
+              const previous = { ...fact(operation) };
+              delete previous.receipt;
+              delete previous.evidence;
               const issued: OperationFact = {
-                ...fact(operation),
+                ...previous,
                 status: 'issued',
                 attemptId: randomUUID(),
                 effects: [],
@@ -427,12 +430,16 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           const problems = new Set([
             ...(storageProblem ? [storageProblem] : []),
             ...(item.problem ? [item.problem] : []),
-            ...(wasCancelled ? ['cancelled'] : facts.flatMap(value => (value.problem ? [value.problem] : []))),
+            ...facts.flatMap(value => (value.problem ? [value.problem] : [])),
+            ...(wasCancelled ? ['cancelled'] : []),
           ]);
           if (!done && !problems.size) problems.add('dependency-not-ready');
           for (const problem of [...problems].reverse())
             if (!effects.some(effect => effect.code === problem))
-              effects.push({ state: wasCancelled ? 'skipped' : 'failed', code: problem });
+              effects.push({
+                state: problem === 'cancelled' || problem === 'dependency-not-ready' ? 'skipped' : 'failed',
+                code: problem,
+              });
           const result: ItemResult = {
             id: item.id,
             title: item.title,
