@@ -146,7 +146,7 @@ test('重复保存配置：输出字节保持一致', async t => {
   const first = await f.contents();
   assert.equal((await f.apply(fields)).state, 'done');
   assert.equal(await f.contents(), first);
-  assert.equal(f.state.writes, 2);
+  assert.equal(f.state.writes, 1);
 });
 
 for (const { platform, baseUrl, header } of [
@@ -626,7 +626,7 @@ test('继续保存后确认：拒绝已保存目标漂移', async t => {
   const later = await f.contents();
   const resumed = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'failed');
+  assert.equal(result.state, 'partial');
   assert.equal(result.items[0].effects.at(-1).code, 'target-changed');
   assert.equal(f.state.writes, 1);
   assert.equal(await f.contents(), later);
@@ -649,7 +649,7 @@ test('继续官方登录：保留已保存配置', async t => {
   assert.equal(result.state, 'done');
   assert.deepEqual(
     result.items[0].effects.map(effect => effect.code),
-    ['logged-in'],
+    ['settings-saved', 'logged-in'],
   );
   assert.equal(f.state.writes, 1);
   assert.equal(f.state.loginCalls, 2);
@@ -669,7 +669,7 @@ test('单独登录：保留配置字节', async t => {
   assert.equal(await f.contents(), before);
 });
 
-test('适配器写后拒绝：续办保护已变化目标', async t => {
+test('适配器写后拒绝：核查已生效配置后继续登录', async t => {
   const f = await fixture(t, {
     hasProgram: true,
     before: { env: { ANTHROPIC_API_KEY: 'fixture-key' }, apiKeyHelper: 'fixture-helper' },
@@ -677,11 +677,11 @@ test('适配器写后拒绝：续办保护已变化目标', async t => {
   const plan = await f.prepare({ mode: 'official', login: 'yes' });
   f.state.rejectAfterWrite = true;
   const first = await f.ccw.apply(plan.id);
-  assert.equal(first.state, 'failed');
-  assert.ok(first.remaining);
+  assert.equal(first.state, 'done');
+  assert.equal(first.remaining, undefined);
   assert.deepEqual(
     first.items[0].effects.map(effect => effect.code),
-    ['fixture-cleanup-failed'],
+    ['settings-saved', 'logged-in'],
   );
   assert.equal(f.state.writes, 1);
   const committed = await f.read(f.settingsFile);
@@ -690,12 +690,10 @@ test('适配器写后拒绝：续办保护已变化目标', async t => {
   await f.json(f.settingsFile, { ...committed, USER_LATER: { keep: true } });
   const later = await f.contents();
   f.state.rejectAfterWrite = false;
-  const resumed = await f.ccw.plan({ resume: first.remaining });
-  const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'failed');
-  assert.equal(result.items[0].effects.at(-1).code, 'target-changed');
+  const result = await f.apply({ mode: 'official' });
+  assert.equal(result.state, 'done');
   assert.equal(f.state.writes, 1);
-  assert.equal(f.state.loginCalls, 0);
+  assert.equal(f.state.loginCalls, 1);
   assert.equal(await f.contents(), later);
 });
 
