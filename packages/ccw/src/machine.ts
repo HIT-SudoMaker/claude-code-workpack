@@ -741,9 +741,9 @@ export function createMachine(
           return result.stdout;
         };
         try {
-          const root = relativeFile(temporary, subdirectory);
+          const root = subdirectory === '.' ? temporary : relativeFile(temporary, subdirectory);
           await git(['init', '--quiet']);
-          await git(['sparse-checkout', 'set', '--cone', subdirectory]);
+          if (subdirectory !== '.') await git(['sparse-checkout', 'set', '--cone', subdirectory]);
           await git([
             '-c',
             'protocol.version=2',
@@ -761,6 +761,7 @@ export function createMachine(
             reading.check();
             for (const entry of await entries(directory)) {
               reading.check();
+              if (directory === temporary && entry.name === '.git') continue;
               const file = path.join(directory, entry.name);
               if (entry.kind === 'link') throw new Error('source-link-unsupported');
               if (entry.kind === 'directory') await collect(file);
