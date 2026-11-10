@@ -378,7 +378,7 @@ test('重试卸载 OfficeCLI：保护重建入口', async t => {
   const count = f.calls.filter(call => call.args[0] === 'uninstall').length;
   plan = await f.ccw.plan({ resume: first.remaining });
   const next = await f.ccw.apply(plan.id);
-  assert.equal(next.state, 'failed', JSON.stringify(next));
+  assert.equal(next.state, 'partial', JSON.stringify(next));
   assert.equal(f.calls.filter(call => call.args[0] === 'uninstall').length, count);
   assert.equal(f.state.npm, true);
   assert.match(await fs.readFile(path.join(f.skill, 'SKILL.md'), 'utf8'), /name: officecli/);
@@ -398,6 +398,7 @@ test('管理同名 OfficeCLI：保护未知入口', async t => {
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: office.id }] });
   assert.equal(plan.items[0].problem, 'integration-source-conflict');
   assert.match(await fs.readFile(path.join(f.skill, 'SKILL.md'), 'utf8'), /user workflow/);
+  await f.ccw.abandon((await f.ccw.recovery()).id);
   const removal = await f.ccw.plan({ task: 'uninstall', selected: [{ id: office.id }] });
   assert.deepEqual(
     removal.items[0].changes
@@ -586,7 +587,7 @@ async function releaseFixture(t) {
     if (file === f.native) f.calls.push({ kind: 'replaceFile', target: file });
     if (f.state.fail === 'office-native-replace' && file === f.native) throw new Error('office-native-replace-failed');
     await replaceFile(file, data, expected, executable);
-    f.state.abortAfterReplace?.abort();
+    if (file === f.native) f.state.abortAfterReplace?.abort();
     if (f.state.failReadAfterReplace && file === f.native) {
       f.state.failReadAfterReplace = false;
       f.state.pendingFingerprintFailure = true;
@@ -662,43 +663,37 @@ async function releaseFixture(t) {
   };
 }
 
-test('OfficeCLI 写入已落地但返回丢失：续办先确认，不重复部署或下载', async t => {
+test('OfficeCLI 写入已落地但返回丢失：立即核对原文件，不重复部署或下载', async t => {
   const f = await releaseFixture(t);
   f.state.failAfterReplace = true;
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
   assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
   const first = await f.ccw.apply(plan.id);
-  assert.notEqual(first.state, 'done');
-  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(first.state, 'done', JSON.stringify(first));
   assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
   const replacements = f.calls.filter(call => call.kind === 'replaceFile').length;
   const downloads = f.calls.filter(call => call.kind === 'bytes').length;
-  const resumed = await f.ccw.plan({ resume: first.remaining });
-  assert.ok(resumed.items[0].changes.some(change => change.code === 'program-installation-confirm'));
-  const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'done', JSON.stringify(result));
+  assert.equal(await f.ccw.recovery(), undefined);
   assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, replacements);
   assert.equal(f.calls.filter(call => call.kind === 'bytes').length, downloads);
   assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
   assert.ok(await exists(path.join(f.skill, 'SKILL.md')));
 });
 
-test('OfficeCLI 写入后的回读暂时失败：续办确认原文件，不重复部署', async t => {
+test('OfficeCLI 写入后的回读暂时失败：立即重新核对原文件，不重复部署', async t => {
   const f = await releaseFixture(t);
   f.state.failReadAfterReplace = true;
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
   const first = await f.ccw.apply(plan.id);
-  assert.notEqual(first.state, 'done');
-  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(first.state, 'done', JSON.stringify(first));
   assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
   const deployments = f.calls.filter(call => call.kind === 'replaceFile').length;
-  const resumed = await f.ccw.plan({ resume: first.remaining });
-  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  assert.equal(await f.ccw.recovery(), undefined);
   assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
   assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
 });
 
-test('OfficeCLI 清理已落地但返回丢失：续办复核缺失，不重复删除', async t => {
+test('OfficeCLI 清理已落地但返回丢失：立即复核缺失，不重复删除', async t => {
   const f = await releaseFixture(t);
   const leftover = f.native + '.update.partial';
   await f.write(leftover, 'partial updater payload');
@@ -706,12 +701,10 @@ test('OfficeCLI 清理已落地但返回丢失：续办复核缺失，不重复�
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
   assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
   const first = await f.ccw.apply(plan.id);
-  assert.notEqual(first.state, 'done');
-  assert.ok(first.remaining, JSON.stringify(first));
+  assert.equal(first.state, 'done', JSON.stringify(first));
   assert.equal(await exists(leftover), false);
   const removals = f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length;
-  const resumed = await f.ccw.plan({ resume: first.remaining });
-  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  assert.equal(await f.ccw.recovery(), undefined);
   assert.equal(f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length, removals);
   assert.equal(await exists(leftover), false);
   assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
@@ -723,25 +716,31 @@ test('OfficeCLI 清理返回丢失后残留被重建：续办保护新内容', a
   await f.write(leftover, 'original partial updater payload');
   f.state.failAfterRemove = leftover;
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
-  const first = await f.ccw.apply(plan.id);
+  const abort = new AbortController();
+  const first = await f.ccw.apply(plan.id, abort.signal, event => {
+    if (event.kind === 'effect' && event.effect.code === 'program-copy-removed') abort.abort();
+  });
   assert.ok(first.remaining, JSON.stringify(first));
   assert.equal(await exists(leftover), false);
   await f.write(leftover, 'new unrelated updater payload');
   const removals = f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length;
   const resumed = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.equal(result.state, 'partial', JSON.stringify(result));
   assert.equal(await fs.readFile(leftover, 'utf8'), 'new unrelated updater payload');
   assert.equal(f.calls.filter(call => call.kind === 'removeTree' && call.target === leftover).length, removals);
   assert.equal(await exists(f.native), false);
 });
 
 for (const changeBinary of [false, true])
-  test(`OfficeCLI 路径写入后返回丢失：${changeBinary ? '续办拒绝程序变化' : '幂等重试路径但不重部署'}`, async t => {
+  test(`OfficeCLI 路径写入后返回丢失：${changeBinary ? '续办拒绝程序变化' : '确认路径且不重部署'}`, async t => {
     const f = await releaseFixture(t);
     f.state.failAfterPath = true;
     const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
-    const first = await f.ccw.apply(plan.id);
+    const abort = new AbortController();
+    const first = await f.ccw.apply(plan.id, abort.signal, event => {
+      if (event.kind === 'effect' && event.effect.code === 'program-user-path') abort.abort();
+    });
     assert.ok(first.remaining, JSON.stringify(first));
     assert.equal(await fs.readFile(f.pathRecord, 'utf8'), path.dirname(f.native));
     if (changeBinary) await f.write(f.native, 'user replaced program');
@@ -749,13 +748,13 @@ for (const changeBinary of [false, true])
     const pathWrites = f.calls.filter(call => call.kind === 'ensureUserPath').length;
     const resumed = await f.ccw.plan({ resume: first.remaining });
     const result = await f.ccw.apply(resumed.id);
-    assert.equal(result.state, changeBinary ? 'failed' : 'done', JSON.stringify(result));
+    assert.equal(result.state, changeBinary ? 'partial' : 'done', JSON.stringify(result));
     assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
     assert.equal(
       await fs.readFile(f.native, 'utf8'),
       changeBinary ? 'user replaced program' : officePayload.toString(),
     );
-    if (changeBinary) assert.equal(f.calls.filter(call => call.kind === 'ensureUserPath').length, pathWrites);
+    assert.equal(f.calls.filter(call => call.kind === 'ensureUserPath').length, pathWrites);
   });
 
 test('OfficeCLI 接入失败后程序被替换：续办不得覆盖或继续接入', async t => {
@@ -771,7 +770,7 @@ test('OfficeCLI 接入失败后程序被替换：续办不得覆盖或继续接�
   const deployments = f.calls.filter(call => call.kind === 'replaceFile').length;
   const resumed = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.equal(result.state, 'partial', JSON.stringify(result));
   assert.equal(await fs.readFile(f.native, 'utf8'), 'user supplied replacement');
   assert.equal(await exists(path.join(f.skill, 'SKILL.md')), false);
   assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
@@ -866,7 +865,7 @@ test('OfficeCLI MCP 注册失败后已装技能被编辑：续办保留本地技
   f.faults.editJson.delete(f.stateFile);
   const resumed = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.equal(result.state, 'partial', JSON.stringify(result));
   assert.equal(await fs.readFile(path.join(f.skill, 'SKILL.md'), 'utf8'), 'user edited installed skill');
   const state = JSON.parse(await fs.readFile(f.stateFile, 'utf8').catch(() => '{}'));
   assert.equal(state.mcpServers?.officecli, undefined);
@@ -1031,8 +1030,13 @@ test('重装 OfficeCLI 失败：保留原技能副本', async t => {
   f.state.fail = '';
   const resume = await f.ccw.plan({ resume: result.remaining });
   assert.equal(resume.items[0].problem, null, JSON.stringify(resume));
-  assert.equal((await f.ccw.apply(resume.id)).state, 'done');
-  assert.ok((await f.read(f.stateFile)).mcpServers.officecli);
+  const replacements = f.calls.filter(call => call.kind === 'replaceFile').length;
+  const paused = await f.ccw.apply(resume.id);
+  assert.notEqual(paused.state, 'done', JSON.stringify(paused));
+  assert.ok(paused.remaining);
+  assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, replacements);
+  assert.equal((await f.read(f.stateFile)).mcpServers.officecli, undefined);
+  assert.ok(await exists(path.join(backup, 'SKILL.md')));
 });
 
 test('重装 OfficeCLI：恢复接入并检查重叠', async t => {

@@ -127,7 +127,7 @@ test('隔离异步进度通知异常', () => {
     import fs from 'node:fs/promises';
     import { createMachine } from ${JSON.stringify(new URL('../dist/machine.js', import.meta.url).href)};
     import { createCcw } from ${JSON.stringify(new URL('../dist/ccw.js', import.meta.url).href)};
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-observer-')); 
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-observer-'));
     const claudeRoot = path.join(home, '.claude');
     let settings = { enabledPlugins: { 'active@market': true } };
     const machine = createMachine({}, home);

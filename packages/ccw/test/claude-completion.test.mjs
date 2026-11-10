@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { createEnv, fail, npmOf, npmWorld, ok, versionProbe } from './env.mjs';
+import { createEnv, fail, npmOf, npmWorld, ok, pluginMarketplaceFiles, revision, versionProbe } from './env.mjs';
 
 async function fixture(t, { replaceDuringDefaults = false, failProgramReadDuringDefaults = false } = {}) {
   const f = await createEnv(t, { seed: { settings: { language: 'English' } } });
@@ -11,6 +11,7 @@ async function fixture(t, { replaceDuringDefaults = false, failProgramReadDuring
   const binary = path.join(npmRoot, '@anthropic-ai/claude-code/cli.js');
   const pluginCommands = [];
   let isProgramReadUnavailable = false;
+  let defaultsHandled = false;
   const world = npmWorld({
     package: '@anthropic-ai/claude-code',
     npmRoot,
@@ -26,6 +27,7 @@ async function fixture(t, { replaceDuringDefaults = false, failProgramReadDuring
       node: true,
       output: '2.1.2 Claude Code',
       before: async (file, args) => {
+        if (file === 'git') return ok(`${revision}\tHEAD`);
         const command = file === process.execPath ? args.slice(1) : args;
         if (command[0] !== 'plugin') return undefined;
         pluginCommands.push(command);
@@ -36,13 +38,20 @@ async function fixture(t, { replaceDuringDefaults = false, failProgramReadDuring
   });
   const machine = {
     ...wrapped,
+    async source(repository, commit, folder) {
+      assert.equal(repository, 'https://github.com/anthropics/claude-plugins-official');
+      assert.equal(commit, revision);
+      assert.equal(folder, '.');
+      return pluginMarketplaceFiles();
+    },
     async treeStamp(file, ...args) {
       if (file === binary && isProgramReadUnavailable) throw new Error('program-read-unavailable');
       return wrapped.treeStamp(file, ...args);
     },
     async editJson(file, edit) {
       await wrapped.editJson(file, edit);
-      if (file !== f.settingsFile) return;
+      if (file !== f.settingsFile || defaultsHandled) return;
+      defaultsHandled = true;
       if (replaceDuringDefaults) await f.write(binary, 'external replacement');
       if (failProgramReadDuringDefaults) isProgramReadUnavailable = true;
     },
@@ -74,7 +83,7 @@ test('Claude 新安装：默认设置写入期间程序被替换，拒绝完成�
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
   const result = await f.ccw.apply(plan.id);
   assert.equal(result.state, 'partial');
-  assert.equal(result.remaining, undefined);
+  assert.ok(result.remaining);
   assert.ok(result.items[0].effects.some(effect => effect.code === 'program-changed'));
   assert.equal(npmOf(f, 'install').length, 1);
   assert.equal(await fs.readFile(f.binary, 'utf8'), 'external replacement');
@@ -92,14 +101,14 @@ test('Claude 最终验收失效：即使早先报告 ready 也不执行依赖的
   );
   const result = await f.ccw.apply(plan.id);
   assert.equal(result.state, 'partial');
-  assert.equal(result.remaining, undefined);
+  assert.ok(result.remaining);
   assert.ok(result.items[0].effects.some(effect => effect.code === 'program-ready'));
   assert.ok(result.items[0].effects.some(effect => effect.code === 'program-changed'));
   assert.ok(result.items[1].effects.some(effect => effect.code === 'dependency-not-ready'));
   assert.equal(f.pluginCommands.length, 0);
 });
 
-test('Claude 最终程序复核暂时不可读：暂停依赖，恢复后只验收不重装或重写设置', async t => {
+test('Claude 最终程序复核暂时不可读：暂停依赖，恢复后不重装或重复写入默认设置', async t => {
   const f = await fixture(t, { failProgramReadDuringDefaults: true });
   const plan = await f.ccw.plan({
     task: 'install',
@@ -118,10 +127,14 @@ test('Claude 最终程序复核暂时不可读：暂停依赖，恢复后只验�
   f.recoverProgramRead();
   const continued = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(continued.id);
-  assert.equal(result.items[0].state, 'done');
+  assert.equal(result.items[0].state, 'done', JSON.stringify(result));
   assert.ok(f.pluginCommands.length > 0);
   assert.equal(npmOf(f, 'install').length, 1);
-  assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length, 1);
+  assert.equal(
+    f.calls.filter(call => call.kind === 'editJson' && call.target === f.settingsFile).length,
+    2,
+    '仅首次默认设置与冻结插件市场登记各写入一次',
+  );
 });
 
 test('Claude 就绪通知后的程序复核失败：停止依赖，续办沿用已确认的安装', async t => {
@@ -141,7 +154,7 @@ test('Claude 就绪通知后的程序复核失败：停止依赖，续办沿用�
   f.recoverProgramRead();
   const continued = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(continued.id);
-  assert.equal(result.items[0].state, 'done');
+  assert.equal(result.items[0].state, 'done', JSON.stringify(result));
   assert.ok(f.pluginCommands.length > 0);
   assert.equal(npmOf(f, 'install').length, 1);
 });

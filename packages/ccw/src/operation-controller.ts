@@ -164,10 +164,19 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           ? 'done'
           : facts.some(value => value.status === 'checking' || value.status === 'issued')
             ? 'unknown'
-            : item.problem || facts.some(value => value.status === 'failed')
+            : item.problem ||
+                facts.some(
+                  value =>
+                    value.status === 'failed' &&
+                    (value.attemptId !== undefined || value.problem !== 'dependency-not-ready'),
+                )
               ? 'failed'
               : 'pending';
-      const problem = item.problem ?? facts.find(value => value.problem)?.problem;
+      const problem =
+        item.problem ??
+        facts.find(
+          value => value.problem && (value.attemptId !== undefined || value.problem !== 'dependency-not-ready'),
+        )?.problem;
       return { id: item.id, title: item.title, state, ...(problem ? { problem } : {}) };
     }),
     inputs: missingInputs(),

@@ -283,8 +283,16 @@ async function prepareClaudeInstall(
   } catch (error) {
     if (errorCode(error) !== 'npm-not-found') throw error;
   }
-  const script = ctx.platform === 'win32' ? await ctx.machine.fetchText('https://claude.ai/install.cmd') : null;
-  if (script !== null && (/^\s*</.test(script) || !script.trim())) throw new Error('installer-unavailable');
+  let script: string | null = null;
+  if (ctx.platform === 'win32') {
+    try {
+      const source = await ctx.machine.fetchText('https://claude.ai/install.cmd');
+      if (!/^\s*</.test(source) && source.trim()) script = source;
+    } catch (error) {
+      if (errorCode(error) === 'cancelled') throw error;
+    }
+    if (npm === null && script === null) throw new Error('installer-unavailable');
+  }
   const target = {
     version: release.value,
     registry: release.registry,
@@ -300,7 +308,7 @@ async function prepareClaudeInstall(
   };
   const operations = [
     programOperation(itemId, 'npm-install', 'claude.install-npm', target, [
-      { code: ctx.platform === 'win32' ? 'program-install-cmd' : 'program-install', detail: 'npm · ' + release.value },
+      { code: script === null ? 'program-install' : 'program-install-cmd', detail: 'npm · ' + release.value },
       { code: 'keep-user-data' },
     ]),
   ];
