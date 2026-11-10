@@ -133,9 +133,9 @@ export function prepareSkillFiles(ctx: Context, target: SkillTarget, source: Ski
   };
   return extensionPrepared([deploy, sourceOperation(ctx, target, source, [deploy.id])]);
 }
-export function disableSkillEntry(ctx: Context, directory: string, before: string): Prepared {
+export function disableSkillEntry(ctx: Context, directory: string, before: string, selectedId?: string): Prepared {
   const name = path.basename(directory);
-  const itemId = `${directory.includes(`${path.sep}commands${path.sep}`) ? 'command' : 'skill'}:${name}`;
+  const itemId = selectedId ?? `${directory.includes(`${path.sep}commands${path.sep}`) ? 'command' : 'skill'}:${name}`;
   const destination = path.join(disabledDirectory(ctx), `${randomUUID()}-${name}`);
   const disable: OperationDefinition = {
     id: `${itemId}/disable`,

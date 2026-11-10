@@ -214,10 +214,11 @@ export async function prepareMcp(
     dependencies = [remove.id];
   }
   let target: Record<string, unknown>;
-  let credentialMode: 'input' | 'preserve' | 'none' = 'none';
+  let credentialMode: 'input' | 'headers-input' | 'preserve' | 'none' = 'none';
   if (name === 'context7') {
     target = { ...mcpSpecs.context7.registration };
     credentialMode = selection.fields?.secret ? 'input' : value.headers !== undefined ? 'preserve' : 'none';
+    if (credentialMode === 'preserve' && action === 'reinstall') credentialMode = 'headers-input';
   } else if (options.registration) {
     target = options.registration();
     if (
@@ -324,7 +325,7 @@ export async function prepareMcp(
       ...target,
       ...(credentialMode === 'input'
         ? { headers: { Authorization: `Bearer ${selection.fields!.secret}` } }
-        : credentialMode === 'preserve'
+        : credentialMode === 'preserve' || credentialMode === 'headers-input'
           ? { headers: value.headers }
           : {}),
     };
@@ -337,7 +338,11 @@ export async function prepareMcp(
         credentialMode,
         headers: credentialMode === 'preserve' ? extensionDigest(value.headers) : null,
       },
-      ...(credentialMode === 'input' ? { requiresInput: ['secret'] } : {}),
+      ...(credentialMode === 'input'
+        ? { requiresInput: ['secret'] }
+        : credentialMode === 'headers-input'
+          ? { requiresInput: ['headers'] }
+          : {}),
     });
     for (let index = 0; index < operations.length; index++) {
       const operation = operations[index]!;
@@ -346,9 +351,11 @@ export async function prepareMcp(
     }
   }
   const result = extensionPrepared(operations);
-  return credentialMode === 'input'
-    ? { ...result, inputs: { [`${itemId}/registration-save`]: { secret: selection.fields!.secret! } } }
-    : result;
+  return credentialMode === 'headers-input'
+    ? { ...result, inputs: { [`${itemId}/registration-save`]: { headers: JSON.stringify(value.headers) } } }
+    : credentialMode === 'input'
+      ? { ...result, inputs: { [`${itemId}/registration-save`]: { secret: selection.fields!.secret! } } }
+      : result;
 }
 
 function registrationOperation(
@@ -551,6 +558,13 @@ export function mcpHandlers(ctx: Context): Readonly<Record<string, OperationHand
             if (p.credentialMode === 'input') {
               if (!inputs.secret) throw new Error('credential-required');
               target.headers = { Authorization: `Bearer ${inputs.secret}` };
+            } else if (p.credentialMode === 'headers-input') {
+              try {
+                const headers: unknown = JSON.parse(inputs.headers ?? '');
+                target.headers = extensionObject(headers);
+              } catch {
+                throw new Error('credential-required');
+              }
             } else if (p.credentialMode === 'preserve') {
               const existing = registrations[extensionString(p.name)];
               const headers = isObject(existing) ? existing.headers : undefined;

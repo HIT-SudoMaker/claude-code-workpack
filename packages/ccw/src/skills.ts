@@ -264,7 +264,7 @@ export async function prepareSkill(
   if (!['install', 'update', 'detach'].includes(action)) throw new Error('action-unavailable');
   if (action === 'detach') {
     if (before === null) throw new Error('no-connection');
-    const prepared = disableSkillEntry(ctx, directory, before);
+    const prepared = disableSkillEntry(ctx, directory, before, selection.id);
     return extensionPrepared((prepared.operations ?? []).map(operation => ({ ...operation, itemId: selection.id })));
   }
 
