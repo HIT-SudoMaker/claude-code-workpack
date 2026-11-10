@@ -41,7 +41,7 @@ export interface Pick {
 export type Request =
   | { readonly task: 'install' | 'detach' | 'clean'; readonly selected: readonly Pick[] }
   | { readonly task: 'uninstall'; readonly selected: readonly Pick[]; readonly removeData?: boolean }
-  | { readonly resume: string };
+  | { readonly resume: string; readonly inputs?: Readonly<Record<string, Readonly<Record<string, string>>>> };
 export interface Effect extends Change {
   readonly state: 'done' | 'kept' | 'failed' | 'skipped';
 }
@@ -111,9 +111,65 @@ export interface Context extends Omit<CcwOptions, 'machine'> {
 export interface Prepared {
   readonly writes?: readonly string[];
   readonly changes: readonly Change[];
-  readonly run: (report: (effect: Effect) => void, signal?: AbortSignal) => Promise<void>;
+  readonly run?: (report: (effect: Effect) => void, signal?: AbortSignal) => Promise<void>;
   readonly remaining?: () => Prepared | undefined;
   readonly verify?: () => Promise<void>;
+  /** 迁移后的域只交付冻结描述；临时兼容 run 随领域迁移删除。 */
+  readonly operations?: readonly OperationDefinition[];
+  /** 仅在当前进程保留的输入；绝不写入任务记录。 */
+  readonly inputs?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+}
+
+export type Json = null | boolean | number | string | readonly Json[] | { readonly [key: string]: Json };
+export type JsonObject = { readonly [key: string]: Json };
+export interface OperationDefinition {
+  readonly id: string;
+  readonly itemId: string;
+  readonly handler: string;
+  readonly payload: JsonObject;
+  readonly dependsOn: readonly string[];
+  readonly writes: readonly string[];
+  readonly changes: readonly Change[];
+}
+export type OperationPhase = 'preparing' | 'awaiting-confirmation' | 'executing' | 'paused' | 'completed';
+export type OperationStatus = 'pending' | 'issued' | 'confirmed' | 'failed' | 'checking' | 'unneeded';
+export interface OperationFact {
+  readonly status: OperationStatus;
+  readonly attemptId?: string;
+  readonly dispatch?: JsonObject;
+  readonly receipt?: { readonly kind: 'returned'; readonly failure: string | null } | { readonly kind: 'unknown'; readonly failure: string };
+  readonly evidence?: JsonObject;
+  readonly problem?: string;
+  readonly effects: readonly Effect[];
+}
+export type Assessment =
+  | { readonly state: 'complete'; readonly evidence: JsonObject; readonly effects?: readonly Effect[] }
+  | { readonly state: 'ready'; readonly dispatch?: JsonObject }
+  | { readonly state: 'unknown' | 'blocked'; readonly problem: string }
+  | { readonly state: 'unneeded'; readonly reason: string };
+export interface OperationOutcome {
+  readonly receipt: NonNullable<OperationFact['receipt']>;
+  readonly evidence?: JsonObject;
+  readonly effects?: readonly Effect[];
+}
+export interface OperationHandler {
+  assess(definition: OperationDefinition, fact: OperationFact, facts: Readonly<Record<string, OperationFact>>): Promise<Assessment>;
+  execute(definition: OperationDefinition, fact: OperationFact, inputs: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<OperationOutcome>;
+}
+export interface OperationRecord {
+  readonly schema: 1;
+  readonly id: string;
+  readonly phase: OperationPhase;
+  readonly planId: string;
+  readonly intent: JsonObject;
+  readonly items: readonly PlanItem[];
+  readonly operations: readonly OperationDefinition[];
+  readonly facts: Readonly<Record<string, OperationFact>>;
+}
+export interface Recovery {
+  readonly id: string;
+  readonly phase: OperationPhase;
+  readonly items: readonly { readonly id: string; readonly title: string; readonly state: 'done' | 'pending' | 'unknown' | 'failed'; readonly problem?: string }[];
 }
 /** 补全计划显示标题；核心据此更新冻结标题并重启进度 */
 export type Describe = (title: string) => void;
@@ -122,6 +178,7 @@ export type Describe = (title: string) => void;
 export interface Domain {
   inspect(): Promise<Inspection>;
   prepare(selection: Selection, describe?: Describe): Promise<Prepared>;
+  readonly handlers?: Readonly<Record<string, OperationHandler>>;
 }
 
 /** 顺序消费本次有限步骤；完成步骤只复核，继续不重新解析来源 */
@@ -145,7 +202,7 @@ export function sequence(operations: readonly Prepared[]): Prepared {
         const next = active ?? operations[index];
         if (!next) break;
         try {
-          await next.run(report, signal);
+          await next.run?.(report, signal);
         } catch (error) {
           active = next.remaining ? next.remaining() : next;
           if (!active) {
