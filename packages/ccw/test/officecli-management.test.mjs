@@ -50,6 +50,7 @@ async function fixture(t, { npm, read, execute, fetchText, source } = {}) {
         }),
       ...(read ? { read } : {}),
     }),
+    userPathContains: async () => true,
     ensureUserPath: async () => {},
     fetchText:
       fetchText ??
@@ -582,7 +583,7 @@ async function releaseFixture(t) {
   };
   const replaceFile = f.machine.replaceFile;
   f.machine.replaceFile = async (file, data, expected, executable) => {
-    f.calls.push({ kind: 'replaceFile', target: file });
+    if (file === f.native) f.calls.push({ kind: 'replaceFile', target: file });
     if (f.state.fail === 'office-native-replace' && file === f.native) throw new Error('office-native-replace-failed');
     await replaceFile(file, data, expected, executable);
     f.state.abortAfterReplace?.abort();
@@ -622,6 +623,7 @@ async function releaseFixture(t) {
     }
   };
   const pathRecord = path.join(f.home, 'sandbox-path.txt');
+  f.machine.userPathContains = () => exists(pathRecord);
   f.machine.ensureUserPath = async directory => {
     f.calls.push({ kind: 'ensureUserPath', target: directory });
     await f.write(pathRecord, directory);
@@ -823,7 +825,7 @@ for (const abortAt of ['abortAfterRemove', 'abortAfterReplace', 'abortAfterPath'
     assert.equal(f.calls.filter(call => call.kind === 'bytes').length, downloads);
   });
 
-test('OfficeCLI 同字节重装返回丢失：保留未决尝试并使用冻结资源续办', async t => {
+test('OfficeCLI 同字节重装返回丢失：重建实例仍暂停且不重复替换', async t => {
   const f = await releaseFixture(t);
   await f.write(f.native, officePayload);
   const document = path.join(f.home, 'documents', 'keep.docx');
@@ -835,8 +837,17 @@ test('OfficeCLI 同字节重装返回丢失：保留未决尝试并使用冻结�
   assert.notEqual(first.state, 'done');
   assert.ok(first.remaining);
   const downloads = f.calls.filter(call => call.kind === 'bytes').length;
-  const resumed = await f.ccw.plan({ resume: first.remaining });
-  assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
+  const deployments = f.calls.filter(call => call.kind === 'replaceFile').length;
+  const restarted = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: 'linux',
+  });
+  const resumed = await restarted.plan({ resume: first.remaining });
+  assert.notEqual((await restarted.apply(resumed.id)).state, 'done');
+  assert.equal(f.calls.filter(call => call.kind === 'replaceFile').length, deployments);
   assert.equal(await fs.readFile(f.native, 'utf8'), officePayload.toString());
   assert.equal(await fs.readFile(document, 'utf8'), 'protected document');
   assert.equal(f.calls.filter(call => call.kind === 'bytes').length, downloads);

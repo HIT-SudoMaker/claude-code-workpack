@@ -36,6 +36,7 @@ export interface CommandOptions {
 type ReadOptions = Pick<CommandOptions, 'timeoutMs' | 'signal'>;
 export interface Machine {
   npmIdentity(): Promise<{ readonly entry: string; readonly binary: string; readonly stamp: string }>;
+  userPathContains(directory: string): Promise<boolean>;
   read(file: string): Promise<string | null>;
   fingerprint(file: string, signal?: AbortSignal): Promise<string | null>;
   initialize(file: string, text: string): Promise<boolean>;
@@ -74,6 +75,7 @@ export interface Machine {
 export type ReadMachine = Pick<
   Machine,
   | 'npmIdentity'
+  | 'userPathContains'
   | 'read'
   | 'fingerprint'
   | 'npm'
@@ -492,7 +494,7 @@ function relativeFile(root: string, relative: string) {
 
 /** POSIX 还需提交目录项；Windows 不支持用普通目录句柄执行 fsync。 */
 async function syncParentDirectory(file: string) {
-  if (process.platform === 'win32') return;
+  if (os.type() === 'Windows_NT') return;
   const directory = await fs.open(path.dirname(file), 'r');
   try {
     await directory.sync();
@@ -524,12 +526,42 @@ async function replaceFile(file: string, data: Uint8Array, expected: string | nu
   }
 }
 
+function userPathProfile(environment: NodeJS.ProcessEnv, directory: string) {
+  if (
+    !path.isAbsolute(directory) ||
+    path.parse(directory).root === path.resolve(directory) ||
+    /[\r\n\0]/.test(directory)
+  )
+    throw new Error('invalid-target');
+  const home =
+    process.platform === 'win32'
+      ? (environment.USERPROFILE ?? environment.HOME)
+      : (environment.HOME ?? environment.USERPROFILE);
+  if (!home || !path.isAbsolute(home)) throw new Error('user-home-unconfirmed');
+  const shell = path.basename(environment.SHELL ?? '');
+  const shellRoot =
+    shell === 'zsh'
+      ? (environment.ZDOTDIR ?? home)
+      : shell === 'fish'
+        ? environment.XDG_CONFIG_HOME || path.join(home, '.config')
+        : home;
+  if (!path.isAbsolute(shellRoot)) throw new Error('user-home-unconfirmed');
+  const profile = path.join(
+    shellRoot,
+    shell === 'fish' ? 'fish/config.fish' : shell === 'zsh' ? '.zshrc' : shell === 'bash' ? '.bashrc' : '.profile',
+  );
+  const quoted = "'" + directory.replaceAll("'", "'\\''") + "'";
+  const line = shell === 'fish' ? 'fish_add_path -- ' + quoted : 'export PATH=' + quoted + ':"$PATH"';
+  return { profile, line };
+}
+
 export function createMachine(
   environment: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
   handoff?: (work: () => Promise<CommandResult>) => Promise<CommandResult>,
 ): Machine {
   environment = normalizeEnvironment(environment);
+  const inheritedPath = environment.PATH ?? '';
   let npmTool: Promise<{ entry: string; binary: string; stamp: string }> | undefined;
   const resolveNpm = () => {
     npmTool ??= (async () => {
@@ -643,6 +675,34 @@ export function createMachine(
     async fetchBytes(url, options = {}) {
       return remoteRead(options, FETCH_BYTES_TIMEOUT_MS, reading => download(url, DOWNLOAD_LIMIT_BYTES, reading, true));
     },
+    async userPathContains(directory) {
+      if (
+        !path.isAbsolute(directory) ||
+        path.parse(directory).root === path.resolve(directory) ||
+        /[\r\n\0]/.test(directory)
+      )
+        throw new Error('invalid-target');
+      const same = (value: string) =>
+        process.platform === 'win32'
+          ? path.resolve(value).toLowerCase() === path.resolve(directory).toLowerCase()
+          : value === directory;
+      if (inheritedPath.split(path.delimiter).filter(Boolean).some(same)) return true;
+      const target = userPathProfile(environment, directory);
+      if (process.platform !== 'win32')
+        return (await read(target.profile))?.split(/\r?\n/).includes(target.line) ?? false;
+      const script =
+        "$ErrorActionPreference='Stop'; $entry=$env:CCW_PATH_ENTRY; $parts=@(([Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine')) -split ';' | Where-Object { $_ }); if ($parts | Where-Object { $_.TrimEnd('\\') -ieq $entry.TrimEnd('\\') }) { 'true' } else { 'false' }";
+      const result = await run(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+        { ...environment, CCW_PATH_ENTRY: directory },
+        cwd,
+        { timeoutMs: READ_COMMAND_TIMEOUT_MS },
+      );
+      if (!succeeded(result) || !['true', 'false'].includes(result.stdout.trim()))
+        throw new Error('user-path-unconfirmed');
+      return result.stdout.trim() === 'true';
+    },
     async ensureUserPath(directory) {
       if (
         !path.isAbsolute(directory) ||
@@ -673,26 +733,7 @@ export function createMachine(
         );
         if (!succeeded(result)) throw new Error('user-path-save-failed');
       } else {
-        const shell = path.basename(environment.SHELL ?? '');
-        const shellRoot =
-          shell === 'zsh'
-            ? (environment.ZDOTDIR ?? home)
-            : shell === 'fish'
-              ? environment.XDG_CONFIG_HOME || path.join(home, '.config')
-              : home;
-        if (!path.isAbsolute(shellRoot)) throw new Error('user-home-unconfirmed');
-        const profile = path.join(
-          shellRoot,
-          shell === 'fish'
-            ? 'fish/config.fish'
-            : shell === 'zsh'
-              ? '.zshrc'
-              : shell === 'bash'
-                ? '.bashrc'
-                : '.profile',
-        );
-        const quoted = `'${directory.replaceAll("'", "'\\''")}'`;
-        const line = shell === 'fish' ? `fish_add_path -- ${quoted}` : `export PATH=${quoted}:"$PATH"`;
+        const { profile, line } = userPathProfile(environment, directory);
         const before = await read(profile);
         if (!before?.split(/\r?\n/).includes(line)) {
           const expected = before === null ? null : createHash('sha256').update(before).digest('hex');

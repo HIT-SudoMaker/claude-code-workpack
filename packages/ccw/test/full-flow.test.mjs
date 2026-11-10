@@ -222,6 +222,7 @@ async function fixture(t, { platform = process.platform } = {}) {
   });
   const machine = {
     ...base,
+    userPathContains: async () => true,
     async ensureUserPath() {},
     async fetchBytes(url) {
       assert.equal(url, officeRelease + officeAsset);

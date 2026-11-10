@@ -335,18 +335,18 @@ async function verifyInstallScope(ctx: Context, target: ClaudeInstall) {
 }
 async function installed(ctx: Context, target: ClaudeInstall, channel: 'npm' | 'native') {
   const found = await programs(ctx, 'claude');
+  if (found.problems.length) throw new Error('installation-state-unconfirmed');
   for (const program of found.values.values()) {
     if (program.channel !== channel || program.isMissing) continue;
     if (channel === 'npm' && (!target.npm || !program.npmRoot || !samePath(ctx, program.npmRoot, target.npm.npmRoot)))
       continue;
     if (channel === 'native' && !samePath(ctx, program.binary, target.native)) continue;
     const stamp = await ctx.machine.treeStamp(program.binary);
-    if (
-      stamp !== null &&
-      (await claudeVersion(ctx, program.binary)) === target.version &&
-      (await ctx.machine.treeStamp(program.binary)) === stamp
-    )
-      return { binary: program.binary, stamp };
+    if (stamp !== null) {
+      const version = await claudeVersion(ctx, program.binary);
+      if ((await ctx.machine.treeStamp(program.binary)) !== stamp) throw new Error('program-changed');
+      if (version === target.version) return { binary: program.binary, stamp };
+    }
   }
   return undefined;
 }
@@ -416,7 +416,10 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
               target.bytes === null ? 'kept' : 'done',
             ),
           );
-        if (issued(fact)) return unknown();
+        if (issued(fact))
+          return fact.confirmed || (current !== target.before && current !== target.digest)
+            ? blocked('program-changed')
+            : unknown();
         if (current !== target.before) return blocked('program-changed');
         if (target.bytes === null) return blocked('program-changed');
         return { state: 'ready', dispatch: { before: current } };
@@ -434,20 +437,18 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
       },
     },
     'program.path': {
-      assess(definition, fact) {
+      async assess(definition) {
         const { directory } = read(definition, directoryValue);
-        if (success(fact))
-          return Promise.resolve(
-            complete({ directory, configured: true }, programEffects('program-user-path', directory)),
-          );
+        if (await ctx.machine.userPathContains(directory))
+          return complete({ directory, configured: true }, programEffects('program-user-path', directory));
         // ensureUserPath is an adapter-owned idempotent configuration operation.
-        return Promise.resolve({ state: 'ready', dispatch: { directory } });
+        return { state: 'ready', dispatch: { directory } };
       },
       execute(definition) {
         const { directory } = read(definition, directoryValue);
         return outcome(
           () => ctx.effects.ensureUserPath(directory),
-          () => Promise.resolve({ directory, configured: true }),
+          async () => ({ directory, configured: await ctx.machine.userPathContains(directory) }),
           'user-path-save-failed',
         );
       },
@@ -525,6 +526,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
                 ),
           async () => ({ stamp: await ctx.machine.treeStamp(target.program.binary) }),
           target.action === 'login' ? 'login-failed' : 'program-installation-unconfirmed',
+          programEffects(target.action === 'login' ? 'logged-in' : 'package-command-completed'),
         );
       },
     },
@@ -640,7 +642,14 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         // A returned command with failed installation permits the frozen CMD alternative.
         const prior: unknown = fact.evidence?.snapshot;
         if (!npmSnapshot(prior)) return unknown();
-        if (facts[target.cleanupOperation]?.status !== 'confirmed') await verifySnapshot(ctx, target, prior);
+        const cleanup = facts[target.cleanupOperation];
+        if (cleanup?.confirmed && cleanup.evidence?.absent === true) {
+          if (
+            (await snapshot(ctx, target)).manifest !== null ||
+            (prior.binary && (await ctx.machine.treeStamp(prior.binary)) !== null)
+          )
+            return blocked('program-changed');
+        } else await verifySnapshot(ctx, target, prior);
         return complete(
           { ...fact.evidence, fallback: true, installed: false },
           programEffects(fact.receipt.failure ?? 'program-not-ready', undefined, 'kept'),
@@ -686,7 +695,10 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         const current = await snapshot(ctx, target);
         if (current.manifest === null) {
           if (before.binary && (await ctx.machine.treeStamp(before.binary)) !== null) return blocked('program-changed');
-          return complete({ absent: true }, programEffects('failed-install-cleaned', undefined, 'kept'));
+          return complete(
+            { absent: true },
+            programEffects('failed-install-cleaned', undefined, issued(fact) ? 'done' : 'kept'),
+          );
         }
         await verifySnapshot(ctx, target, before);
         if (!target.npm || (await npmVersion(ctx, PROGRAM_PACKAGES.claude, target.npm.npmRoot)) !== target.version)
@@ -711,8 +723,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         if (facts[target.cleanupOperation]?.status !== 'confirmed') return blocked('dependency-not-ready');
         if (!target.directory || !target.script) return blocked('installer-unavailable');
         const stamp = await ctx.machine.treeStamp(target.directory);
-        if (facts[target.scriptCleanupOperation]?.status === 'confirmed' && stamp === null)
-          return complete(fact.evidence ?? {});
+        if (facts[target.scriptCleanupOperation]?.confirmed && stamp === null) return complete(fact.evidence ?? {});
         if (issued(fact)) {
           if (fact.evidence?.snapshotUnavailable === true) return unknown();
           if (fact.receipt?.kind === 'returned' && fact.receipt.failure !== null) return unknown('installer-conflict');
@@ -758,6 +769,7 @@ export function programHandlers(ctx: Context): Readonly<Record<string, Operation
         if (alternative) return alternative;
         await verifyInstallScope(ctx, target);
         if (issued(fact)) {
+          if (fact.evidence?.snapshotUnavailable === true) return unknown();
           const selected = await installed(ctx, target, 'native');
           if (!selected) return unknown();
           if (fact.evidence?.stamp !== undefined && fact.evidence.stamp !== selected.stamp)

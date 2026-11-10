@@ -147,6 +147,35 @@ export function createOfficecli(ctx: Context) {
 
   return {
     handlers: {
+      'office.detached': {
+        async assess(definition) {
+          if (typeof definition.payload.binary !== 'string' || typeof definition.payload.identity !== 'string')
+            return { state: 'blocked', problem: 'operation-record-invalid' };
+          const binary = definition.payload.binary;
+          const identity = definition.payload.identity;
+          const unmatched = Array.isArray(definition.payload.unmatched) ? definition.payload.unmatched : [];
+          const current = await observe();
+          if (current.isConnectionsUnknown) return { state: 'unknown', problem: 'installation-state-unconfirmed' };
+          const entries = current.entries.filter(
+            entry =>
+              !unmatched.includes(entry.id) &&
+              (entry.owner === identity ||
+                (entry.owner === null &&
+                  (entry.id === 'skill:officecli' ||
+                    (current.mcpCommand !== undefined && !path.isAbsolute(current.mcpCommand)))) ||
+                (entry.id === 'mcp:officecli' &&
+                  current.mcpCommand !== undefined &&
+                  path.isAbsolute(current.mcpCommand) &&
+                  samePath(ctx, current.mcpCommand, binary))),
+          );
+          return entries.length
+            ? { state: 'blocked', problem: 'target-changed' }
+            : { state: 'complete', evidence: { detached: true } };
+        },
+        execute() {
+          return Promise.resolve({ receipt: { kind: 'returned', failure: null } });
+        },
+      } satisfies OperationHandler,
       'office.keep': {
         assess(definition) {
           return Promise.resolve({
@@ -249,12 +278,25 @@ export function createOfficecli(ctx: Context) {
             : []),
         ];
         const detached = expected.length ? await detach(expected, selection.id) : programPrepared([]);
+        const guard = programOperation(
+          selection.id,
+          'integrations-detached',
+          'office.detached',
+          {
+            binary: program.binary,
+            identity,
+            unmatched: observed.entries.filter(entry => entry.owner === undefined).map(entry => entry.id),
+          },
+          [],
+          detached.operations!.map(value => value.id),
+        );
         const removalOperations = removal.operations!.map(operation => ({
           ...operation,
-          dependsOn: [...operation.dependsOn, ...detached.operations!.map(value => value.id)],
+          dependsOn: [...operation.dependsOn, guard.id],
         }));
         return programPrepared([
           ...detached.operations!,
+          guard,
           ...removalOperations,
           programOperation(
             selection.id,
@@ -333,7 +375,19 @@ export function createOfficecli(ctx: Context) {
         'connection',
         programOperations.map(value => value.id),
       );
-      return programPrepared([...detached.operations!, ...programOperations, ...connected.operations!]);
+      const superseded = detached.operations!.map(operation => {
+        const next = connected.operations!.find(value =>
+          operation.handler === 'skill.disable'
+            ? value.handler === 'skill.deploy'
+            : operation.handler === 'skill.source-remove'
+              ? value.handler === 'skill.source'
+              : operation.handler === 'mcp.registration' &&
+                value.handler === 'mcp.registration' &&
+                value.payload.target !== null,
+        );
+        return next ? { ...operation, payload: { ...operation.payload, supersededBy: next.id } } : operation;
+      });
+      return programPrepared([...superseded, ...programOperations, ...connected.operations!]);
     },
   };
 }
@@ -383,6 +437,16 @@ interface OfficeTarget {
   readonly binary: string;
   readonly source: 'npm' | 'native';
   readonly registry?: NpmRegistry;
+}
+
+function officeConnections(skill: Prepared, mcp: Prepared): Prepared {
+  return programPrepared([
+    ...skill.operations!,
+    ...mcp.operations!.map(operation => ({
+      ...operation,
+      dependsOn: [...operation.dependsOn, ...skill.operations!.map(value => value.id)],
+    })),
+  ]);
 }
 
 async function officeRevision(ctx: Context, target: OfficeTarget): Promise<string> {
@@ -447,7 +511,7 @@ async function prepareOfficeConnection(
   if (selection.action === 'install') {
     if (before !== null && observed.skillEvidence !== 'none') {
       const skill = currentSkill(ctx, 'officecli', directory, before);
-      if (integration === 'both') return programPrepared([...skill.operations!, ...(await mcp('connect')).operations!]);
+      if (integration === 'both') return officeConnections(skill, await mcp('connect'));
       return integration === 'mcp' ? mcp('connect') : skill;
     }
   }
@@ -499,7 +563,5 @@ async function prepareOfficeConnection(
       { repository, revision, files, stamp: skillFilesStamp(files) },
     );
   }
-  return shouldConnectBoth
-    ? programPrepared([...skill.operations!, ...(await mcp('connect', isReinstall)).operations!])
-    : skill;
+  return shouldConnectBoth ? officeConnections(skill, await mcp('connect', isReinstall)) : skill;
 }
