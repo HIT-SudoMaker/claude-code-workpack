@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { knownTitle } from './titles.js';
 import { bundledSkills, SKILL_ENTRY, skillMembers, skillSuites } from './management-catalog.js';
 import { errorCode, isGitRevision, isObject } from './machine.js';
-import { json, kindOf, REPLACE_CONSENT, restOf, sequence, success, unchanged } from './model.js';
+import { json, kindOf, REPLACE_CONSENT, restOf, success } from './model.js';
 import type { Context, Domain, Inspection, Item, Prepared, Selection } from './model.js';
 import {
   currentSkill,
@@ -12,6 +12,8 @@ import {
   prepareSkillFiles,
   repairSkillSource,
   skillFilesStamp,
+  skillFileHandlers,
+  extensionPrepared,
 } from './skill-files.js';
 import { sourcesFile } from './storage.js';
 
@@ -82,6 +84,7 @@ async function readSkillMetadata(ctx: Context): Promise<Record<string, unknown>>
 /** 创建技能域渠道：余段即名字，组别由 kind 决定 */
 export function createSkillsDomain(ctx: Context): Domain {
   return {
+    handlers: skillFileHandlers(ctx),
     inspect: () => inspectSkills(ctx),
     prepare(selection) {
       const name = restOf(selection.id);
@@ -226,16 +229,7 @@ async function prepareSkillSet(ctx: Context, name: string, selection: Selection)
     const isEmptyDirectory = before !== null && entry === null && (await ctx.machine.entries(directory)).length === 0;
     if (before !== null && !isEmptyDirectory) {
       if (entry === null || !entry.trim()) throw new Error('local-edits-preserved');
-      operations.push({
-        changes: [{ code: 'skill-existing-kept', detail: member }],
-        async verify() {
-          unchanged(await ctx.machine.treeStamp(directory), before);
-        },
-        async run(report) {
-          unchanged(await ctx.machine.treeStamp(directory), before);
-          report({ state: 'kept', code: 'skill-existing-kept', detail: member });
-        },
-      });
+      operations.push(currentSkill(ctx, member, directory, before));
       continue;
     }
     const payload = files
@@ -249,7 +243,11 @@ async function prepareSkillSet(ctx: Context, name: string, selection: Selection)
       ),
     );
   }
-  return sequence(operations);
+  return extensionPrepared(
+    operations
+      .flatMap(prepared => prepared.operations ?? [])
+      .map(operation => ({ ...operation, itemId: selection.id })),
+  );
 }
 
 export async function prepareSkill(
@@ -266,7 +264,8 @@ export async function prepareSkill(
   if (!['install', 'update', 'detach'].includes(action)) throw new Error('action-unavailable');
   if (action === 'detach') {
     if (before === null) throw new Error('no-connection');
-    return disableSkillEntry(ctx, directory, before);
+    const prepared = disableSkillEntry(ctx, directory, before);
+    return extensionPrepared((prepared.operations ?? []).map(operation => ({ ...operation, itemId: selection.id })));
   }
 
   if (
