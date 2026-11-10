@@ -46,9 +46,8 @@ export function programOperation(
   payload: unknown,
   changes: readonly Change[] = [],
   dependsOn: readonly string[] = [],
-  writes: readonly string[] = [],
 ): OperationDefinition {
-  return { id: `${itemId}/${name}`, itemId, handler, payload: jsonObject(payload), changes, dependsOn, writes };
+  return { id: `${itemId}/${name}`, itemId, handler, payload: jsonObject(payload), changes, dependsOn };
 }
 export function programPrepared(operations: readonly OperationDefinition[]): Prepared {
   return { operations, changes: operations.flatMap(operation => operation.changes) };

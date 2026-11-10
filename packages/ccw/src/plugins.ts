@@ -243,7 +243,6 @@ function patchOperation(
     handler: 'plugin.fields',
     payload: { file, patches: values.map(value => ({ ...value, before: extensionDigest(at(document, value.path)) })) },
     dependsOn,
-    writes: [file],
     changes,
   };
 }
@@ -358,7 +357,6 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       itemId,
       handler: 'plugin.marketplace-files',
       dependsOn: [],
-      writes: [directory],
       payload: {
         repository,
         revision,
@@ -409,7 +407,6 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       itemId,
       handler: 'plugin.fields',
       dependsOn: [`${itemId}/command`],
-      writes: [marketplaceFile],
       payload: {
         file: marketplaceFile,
         patches: [
@@ -428,7 +425,6 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       itemId,
       handler: 'plugin.fields',
       dependsOn: [`${itemId}/command`],
-      writes: [ctx.settingsFile],
       payload: {
         file: ctx.settingsFile,
         patches: [
@@ -468,7 +464,6 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       itemId,
       handler: 'plugin.command',
       dependsOn: dependencies,
-      writes: [ctx.claudeRoot],
       payload: {
         name,
         verb: 'uninstall',
@@ -490,7 +485,6 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
     itemId,
     handler: 'plugin.command',
     dependsOn: dependencies,
-    writes: [ctx.claudeRoot],
     payload: {
       name,
       verb: canReuse ? 'enable' : action === 'update' ? 'update' : 'install',
@@ -513,7 +507,6 @@ async function preparePlugin(ctx: Context, name: string, selection: Selection, d
       itemId,
       handler: 'plugin.credential',
       dependsOn: [command.id],
-      writes: [ctx.settingsFile],
       payload: {
         before: extensionDigest(object(settings.env).GITHUB_PERSONAL_ACCESS_TOKEN),
         after: extensionDigest(selection.fields.secret),

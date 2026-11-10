@@ -243,12 +243,6 @@ export function createCcline(options: Context): Domain {
     payload,
     changes,
     dependsOn,
-    writes:
-      handler === 'ccline.connection'
-        ? [settingsFile]
-        : typeof payload.file === 'string'
-          ? [payload.file]
-          : [binaryFile],
   });
   const fieldsAt = async () => (await observe(false, false)).fields;
   function connectionDefinition(

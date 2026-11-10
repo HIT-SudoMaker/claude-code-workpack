@@ -202,7 +202,6 @@ export async function prepareMcp(
         handler: 'mcp.keep',
         payload: { name, expected: extensionDigest(before[name]) },
         dependsOn: [],
-        writes: [],
         changes: [{ code: 'registration-kept', detail: name }],
       },
     ]);
@@ -255,7 +254,6 @@ export async function prepareMcp(
         itemId,
         handler: 'mcp.uv-script',
         dependsOn: dependencies,
-        writes: [file],
         payload: { file, script, digest: extensionDigest(script) },
         changes: [{ code: 'uv-python-dependency' }],
       };
@@ -264,7 +262,6 @@ export async function prepareMcp(
         itemId,
         handler: 'mcp.uv-install',
         dependsOn: [stage.id],
-        writes: [local],
         payload: { file, scriptDigest: extensionDigest(script), uv: local, version },
         changes: [],
       };
@@ -273,7 +270,6 @@ export async function prepareMcp(
         itemId,
         handler: 'mcp.uv-script-remove',
         dependsOn: [install.id],
-        writes: [file],
         payload: { file, digest: extensionDigest(script) },
         changes: [],
       };
@@ -294,7 +290,6 @@ export async function prepareMcp(
       itemId,
       handler: 'mcp.serena-runtime',
       dependsOn: dependencies,
-      writes: [command],
       payload: {
         uv,
         uvStamp,
@@ -320,7 +315,6 @@ export async function prepareMcp(
         itemId,
         handler: 'mcp.serena-initialize',
         dependsOn: dependencies,
-        writes: [path.join(ctx.home, '.serena')],
         payload: { command, runtime: runtime.id },
         changes: [{ code: 'serena-initialize' }],
       };
@@ -390,7 +384,6 @@ function registrationOperation(
       headers: null,
     },
     dependsOn,
-    writes: [ctx.stateFile],
     changes:
       verb === 'remove'
         ? [

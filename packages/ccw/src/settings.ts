@@ -300,7 +300,6 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
     itemId: selection.id,
     handler: 'settings.write',
     dependsOn: [],
-    writes: [ctx.settingsFile],
     changes: [
       { code: selection.action === 'detach' ? 'settings-disconnect' : 'settings-edit', detail: ctx.settingsFile },
     ],
@@ -308,7 +307,6 @@ export async function prepareSettings(ctx: Context, selection: Selection): Promi
     ...(requiresSecret ? { requiresInput: ['secret'] } : {}),
   };
   return {
-    writes: definition.writes,
     changes: [...definition.changes, ...(shouldLogin ? [{ code: 'login-browser' }] : [])],
     operations: [definition, ...(shouldLogin ? [loginDefinition(selection.id, [id])] : [])],
     ...(requiresSecret ? { inputs: { [id]: { secret: fields.secret!.trim() } } } : {}),
@@ -361,7 +359,6 @@ function loginDefinition(itemId: string, dependsOn: readonly string[]): Operatio
     handler: 'settings.login',
     payload: {},
     dependsOn,
-    writes: [],
     changes: [{ code: 'login-browser' }],
   };
 }
