@@ -130,6 +130,7 @@ export interface OperationDefinition {
   readonly dependsOn: readonly string[];
   readonly writes: readonly string[];
   readonly changes: readonly Change[];
+  readonly requiresInput?: readonly string[];
 }
 export type OperationPhase = 'preparing' | 'awaiting-confirmation' | 'executing' | 'paused' | 'completed';
 export type OperationStatus = 'pending' | 'issued' | 'confirmed' | 'failed' | 'checking' | 'unneeded';
@@ -137,7 +138,9 @@ export interface OperationFact {
   readonly status: OperationStatus;
   readonly attemptId?: string;
   readonly dispatch?: JsonObject;
-  readonly receipt?: { readonly kind: 'returned'; readonly failure: string | null } | { readonly kind: 'unknown'; readonly failure: string };
+  readonly receipt?:
+    | { readonly kind: 'returned'; readonly failure: string | null }
+    | { readonly kind: 'unknown'; readonly failure: string };
   readonly evidence?: JsonObject;
   readonly problem?: string;
   readonly effects: readonly Effect[];
@@ -153,8 +156,17 @@ export interface OperationOutcome {
   readonly effects?: readonly Effect[];
 }
 export interface OperationHandler {
-  assess(definition: OperationDefinition, fact: OperationFact, facts: Readonly<Record<string, OperationFact>>): Promise<Assessment>;
-  execute(definition: OperationDefinition, fact: OperationFact, inputs: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<OperationOutcome>;
+  assess(
+    definition: OperationDefinition,
+    fact: OperationFact,
+    facts: Readonly<Record<string, OperationFact>>,
+  ): Promise<Assessment>;
+  execute(
+    definition: OperationDefinition,
+    fact: OperationFact,
+    inputs: Readonly<Record<string, string>>,
+    signal?: AbortSignal,
+  ): Promise<OperationOutcome>;
 }
 export interface OperationRecord {
   readonly schema: 1;
@@ -169,7 +181,13 @@ export interface OperationRecord {
 export interface Recovery {
   readonly id: string;
   readonly phase: OperationPhase;
-  readonly items: readonly { readonly id: string; readonly title: string; readonly state: 'done' | 'pending' | 'unknown' | 'failed'; readonly problem?: string }[];
+  readonly items: readonly {
+    readonly id: string;
+    readonly title: string;
+    readonly state: 'done' | 'pending' | 'unknown' | 'failed';
+    readonly problem?: string;
+  }[];
+  readonly inputs: readonly { readonly operationId: string; readonly itemId: string; readonly field: string }[];
 }
 /** 补全计划显示标题；核心据此更新冻结标题并重启进度 */
 export type Describe = (title: string) => void;

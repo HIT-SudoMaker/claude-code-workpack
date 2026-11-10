@@ -154,7 +154,7 @@ export function createOfficecli(ctx: Context) {
             await verify();
             return;
           }
-          await operation.run(report, signal);
+          await operation.run?.(report, signal);
           isComplete = true;
         },
         remaining: () => (isComplete ? undefined : step),
@@ -318,7 +318,7 @@ export function createOfficecli(ctx: Context) {
             targetBinary: program.binary,
             ...(program.channel === 'npm' ? { targetRegistry: null } : {}),
             changes: [{ code: 'program-kept' }],
-            async run(report: Parameters<Prepared['run']>[0]) {
+            async run(report: Parameters<NonNullable<Prepared['run']>>[0]) {
               unchanged(await ctx.machine.treeStamp(program.binary), stamp);
               if (program.channel === 'native') await ctx.effects.ensureUserPath(path.dirname(program.binary));
               report({ state: 'kept' as const, code: 'program-kept' });
