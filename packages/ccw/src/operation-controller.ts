@@ -343,8 +343,11 @@ export function createOperationController(ctx: Context, machine: Machine, handle
                 await update(operation, { ...fact(operation), status: 'failed', problem: 'credential-required' });
                 continue;
               }
+              const previous = { ...fact(operation) };
+              delete previous.receipt;
+              delete previous.evidence;
               const issued: OperationFact = {
-                ...fact(operation),
+                ...previous,
                 status: 'issued',
                 attemptId: randomUUID(),
                 effects: [],
