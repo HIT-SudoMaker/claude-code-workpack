@@ -14,6 +14,7 @@ const binary = path.join(cclineRoot, process.platform === 'win32' ? 'ccline.exe'
 const npmPrefix = path.resolve('npm-prefix');
 const npmRoot = path.join(npmPrefix, process.platform === 'win32' ? 'node_modules' : 'lib/node_modules');
 let installed = false;
+let userPathConfigured = false;
 const officeBytes = Buffer.from('packaged OfficeCLI program fixture');
 const officeDigest = createHash('sha256').update(officeBytes).digest('hex');
 const officeAsset =
@@ -58,7 +59,12 @@ const machine = {
   async processes() {
     return [];
   },
-  async ensureUserPath() {},
+  async userPathContains() {
+    return userPathConfigured;
+  },
+  async ensureUserPath() {
+    userPathConfigured = true;
+  },
   async fetchBytes(url) {
     assert.equal(url, officeBase + officeAsset);
     return officeBytes;
@@ -125,7 +131,7 @@ const scenarios = {
     assert.equal((await ccw.apply(plan.id)).state, 'done');
     assert.equal(
       createHash('sha256')
-        .update(await fs.readFile(path.join(cclineRoot, 'config.toml')))
+        .update((await fs.readFile(path.join(cclineRoot, 'config.toml'), 'utf8')).replaceAll('\r\n', '\n'))
         .digest('hex'),
       'a8a5cf6bbf69add6f5fb99bc96545e7948f61e6082ddbb3bcd48c12fe065da48',
     );
