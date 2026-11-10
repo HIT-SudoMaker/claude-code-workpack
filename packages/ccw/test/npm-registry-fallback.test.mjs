@@ -12,6 +12,7 @@ import {
   npmOf,
   npmWorld,
   ok,
+  pluginMarketplaceFiles,
   registryOf,
   releaseContract,
   revision,
@@ -21,6 +22,48 @@ import {
 
 const MIRROR = 'https://registry.npmmirror.com';
 const OFFICIAL = 'https://registry.npmjs.org';
+
+for (const backup of ['unreachable', 'html', 'empty'])
+  test(`Windows npm 安装可用：${backup} CMD 备用来源不阻止主安装`, async t => {
+    const f = await createEnv(t);
+    const npmRoot = path.join(f.root, 'npm/node_modules');
+    const binary = path.join(npmRoot, '@anthropic-ai/claude-code/cli.js');
+    const world = npmWorld({
+      package: '@anthropic-ai/claude-code',
+      npmRoot,
+      installVersion: '2.1.318',
+      bin: { claude: 'cli.js' },
+      view: async () => ok('"2.1.318"'),
+    });
+    const base = f.machine({
+      npm: world.npm,
+      execute: versionProbe({ binary, node: true, output: '2.1.318 Claude Code' }),
+      processes: async () => [],
+    });
+    let backupFetches = 0;
+    const ccw = f.ccw(
+      {
+        ...base,
+        async fetchText(url) {
+          assert.equal(url, 'https://claude.ai/install.cmd');
+          backupFetches++;
+          if (backup === 'unreachable') throw new Error('source-timeout');
+          return backup === 'html' ? '<html>network login</html>' : '';
+        },
+      },
+      { platform: 'win32' },
+    );
+    const plan = await ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+    assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+    assert.equal((await ccw.apply(plan.id)).state, 'done');
+    assert.equal(npmOf(f, 'install').length, 1);
+    assert.equal(
+      f.calls.some(call => call.target === 'cmd.exe'),
+      false,
+    );
+    assert.equal(backupFetches, 1);
+    assert.equal(await fs.readFile(binary, 'utf8'), 'fixture binary');
+  });
 
 test('回退 npm 镜像并冻结安装来源', async t => {
   const f = await createEnv(t, { seed: { settings: {}, state: {} } });
@@ -49,6 +92,7 @@ test('回退 npm 镜像并冻结安装来源', async t => {
   const machine = {
     ...base,
     async fetchText(url) {
+      if (url === 'https://claude.ai/install.cmd') return '@echo off\r\n';
       throw new Error(`unexpected direct registry fetch: ${url}`);
     },
   };
@@ -159,6 +203,7 @@ test('回退官方 npm 来源：限时单次安装', async t => {
     {
       ...machine,
       async fetchText(url, options) {
+        if (url === 'https://claude.ai/install.cmd') return '@echo off\r\n';
         fetches.push({ url, options });
         assert.equal(url, `${OFFICIAL}/@anthropic-ai%2Fclaude-code/stable`);
         return JSON.stringify({ version: '2.1.318' });
@@ -201,13 +246,16 @@ async function claudeFixture(
     view: () => (view === 'ok' ? ok(JSON.stringify(CLAUDE_VERSION)) : fail()),
     install: install === 'fail' ? 'fail' : null,
   });
-  const fetchText =
-    fetch === 'garbage'
-      ? async () => '{"version":"latest"}'
-      : async url => {
-          if (fetch === 'installer' && url === 'https://claude.ai/install.cmd') return '# isolated installer fixture';
-          throw new Error(`unexpected fetch: ${url}`);
-        };
+  const fetches = [];
+  const fetchText = async url => {
+    fetches.push(url);
+    if (fetch === 'garbage') return '{"version":"latest"}';
+    if (url === 'https://claude.ai/install.cmd') {
+      if (fetch === 'unreachable') throw new Error('source-timeout');
+      return '# isolated installer fixture';
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
   const machine = {
     ...f.machine({
       processes: async () => [],
@@ -221,12 +269,47 @@ async function claudeFixture(
         binary,
         node: true,
         output: () => `${world.state.version ?? CLAUDE_VERSION} (Claude Code)`,
+        before: async file => (file === 'git' ? ok(`${revision}\tHEAD`) : undefined),
       }),
     }),
+    async source(repository, commit, folder) {
+      assert.equal(repository, 'https://github.com/anthropics/claude-plugins-official');
+      assert.equal(commit, revision);
+      assert.equal(folder, '.');
+      return pluginMarketplaceFiles();
+    },
     fetchText,
   };
-  return { ...f, npmRoot, ccw: f.ccw(machine, { platform: 'win32' }) };
+  return { ...f, npmRoot, machine, fetches, ccw: f.ccw(machine, { platform: 'win32' }) };
 }
+
+test('CMD 备用来源不可用：重启保留冻结结果而不重新获取安装器', async t => {
+  const f = await claudeFixture(t, { install: 'fail', fetch: 'unreachable' });
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+  assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
+  const first = await f.ccw.apply(plan.id);
+  assert.equal(first.state, 'failed', JSON.stringify(first));
+  assert.ok(first.remaining);
+  assert.ok(first.items[0].effects.some(effect => effect.code === 'installer-unavailable'));
+  const restarted = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: 'win32',
+  });
+  const resumed = await restarted.plan({ resume: first.remaining });
+  const paused = await restarted.apply(resumed.id);
+  assert.equal(paused.state, 'failed', JSON.stringify(paused));
+  assert.ok(paused.remaining);
+  assert.equal(npmOf(f, 'install').length, 1);
+  assert.equal(
+    f.calls.some(call => call.target === 'cmd.exe'),
+    false,
+  );
+  assert.deepEqual(f.fetches, ['https://claude.ai/install.cmd']);
+  assert.deepEqual(await f.read(f.settingsFile), {});
+});
 
 for (const rootExists of [false, true])
   test(`npm 报 ENOENT：${rootExists ? '报告已有目录异常' : '允许首次安装'}`, async t => {
@@ -259,7 +342,7 @@ test('npm 报错但程序可用：跳过备用安装', async t => {
   assert.equal(result.state, 'done');
   assert.deepEqual(
     result.items[0].effects.find(effect => effect.code === 'program-ready'),
-    { state: 'done', code: 'program-ready', detail: 'npm · 2.1.318' },
+    { state: 'done', code: 'program-ready', detail: path.join(f.npmRoot, CLAUDE_PACKAGE, 'cli.js') },
   );
   assert.equal(
     f.calls.some(call => call.target === 'cmd.exe' || call.kind === 'fetch'),

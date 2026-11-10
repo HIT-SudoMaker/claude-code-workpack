@@ -4,7 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
-import { createEnv, exists, ok } from './env.mjs';
+import { createEnv, exists, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 const packageName = '@anthropic-ai/claude-code';
 
@@ -77,6 +77,7 @@ async function fixture(t, platform = 'win32') {
       throw new Error('unexpected-npm-command');
     },
     execute: async (executable, args, options) => {
+      if (executable === 'git') return ok(`${revision}\tHEAD`);
       if (executable === 'cmd.exe') {
         if (state.onCmd) await state.onCmd();
         await f.write(path.join(f.home, '.local/bin/claude.exe'), '2.1.2');
@@ -120,6 +121,12 @@ async function fixture(t, platform = 'win32') {
   });
   const machine = {
     ...wrapped,
+    async source(repository, commit, folder) {
+      assert.equal(repository, 'https://github.com/anthropics/claude-plugins-official');
+      assert.equal(commit, revision);
+      assert.equal(folder, '.');
+      return pluginMarketplaceFiles();
+    },
     async treeStamp(file, ...args) {
       if (file === state.snapshotFile && state.confirming && !state.snapshotFailed) {
         state.snapshotFailed = true;
@@ -218,9 +225,9 @@ test('npm 入口被替换：停止旧计划并完成独立配置', async t => {
   const result = await f.ccw.apply(plan.id);
   assert.equal(result.state, 'partial');
   assert.equal(result.items[0].effects.at(-1).code, 'npm-changed');
-  assert.equal(result.items[0].isPending, false);
+  assert.equal(result.items[0].isPending, true);
   assert.equal(result.items[1].state, 'done');
-  assert.equal(result.remaining, undefined);
+  assert.ok(result.remaining);
 });
 
 test('卸载 Homebrew：绑定所选根', async t => {
@@ -291,7 +298,7 @@ test('准备 Homebrew：核对登记版本', async t => {
   );
 });
 
-test('更新 Homebrew：固定管理器', async t => {
+test('更新 Homebrew：无法固定来源时不选择另一个管理器', async t => {
   const f = await fixture(t, 'darwin');
   const a = await f.seedBrew('a-brew');
   const b = await f.seedBrew('b-brew');
@@ -301,22 +308,31 @@ test('更新 Homebrew：固定管理器', async t => {
     task: 'install',
     selected: [{ id: selected.id, maintenance: 'update', fields: { connection: 'mcp' } }],
   });
-  assert.equal(plan.items[0].problem, null);
+  assert.equal(plan.items[0].problem, 'pinned-version-channel-unsupported');
   f.state.pathBrew = b.executable;
-  assert.equal((await f.ccw.apply(plan.id)).state, 'done');
-  assert.equal(await fs.readFile(a.binary, 'utf8'), 'updated package');
+  assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
+  assert.equal(await fs.readFile(a.binary, 'utf8'), '1.0.123');
   assert.equal(await fs.readFile(b.binary, 'utf8'), '1.0.123');
+  assert.equal(
+    f.calls.some(call => ['upgrade', 'reinstall'].includes(call.args[0])),
+    false,
+  );
 });
 
-test('维护 Homebrew：抑制自动更新', async t => {
+test('维护 Homebrew：无法固定来源时保留管理器', async t => {
   const f = await fixture(t, 'darwin');
   const a = await f.seedBrew('a-brew');
   f.state.pathBrew = a.executable;
-  const result = await f.apply({
+  const plan = await f.ccw.plan({
     task: 'install',
     selected: [{ id: 'officecli', maintenance: 'update', fields: { connection: 'mcp' } }],
   });
-  assert.equal(result.state, 'done');
+  assert.equal(plan.items[0].problem, 'pinned-version-channel-unsupported');
+  assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
+  assert.equal(
+    f.calls.some(call => ['upgrade', 'reinstall'].includes(call.args[0])),
+    false,
+  );
   assert.equal(await fs.readFile(a.executable, 'utf8'), 'brew manager');
 });
 
@@ -330,8 +346,8 @@ test('替换 Homebrew：阻止原卸载', async t => {
   const result = await f.ccw.apply(plan.id);
   assert.equal(result.state, 'failed');
   assert.equal(result.items[0].effects.at(-1).code, 'program-scope-unconfirmed');
-  assert.equal(result.remaining, undefined);
-  assert.equal(result.items[0].isPending, false);
+  assert.ok(result.remaining);
+  assert.equal(result.items[0].isPending, true);
   assert.equal(
     f.calls.some(call => call.args[0] === 'uninstall'),
     false,
@@ -361,7 +377,10 @@ test('继续 npm 更新：仅复核程序', async t => {
   assert.ok(first.remaining);
   f.state.unavailable = false;
   const plan = await f.ccw.plan({ resume: first.remaining });
-  assert.ok(plan.items[0].changes.some(change => change.code === 'program-installation-confirm'));
+  assert.equal(
+    plan.items.some(item => item.changes.some(change => change.code === 'program-update')),
+    false,
+  );
   assert.equal((await f.ccw.apply(plan.id)).state, 'done');
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
 });
@@ -370,7 +389,7 @@ test('继续 npm 新装：仅复核程序', async t => {
   const f = await fixture(t);
   f.state.unavailable = true;
   const first = await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'failed');
   assert.ok(first.remaining);
   assert.equal(
     f.calls.some(call => call.args[0] === 'uninstall' || (call.kind === 'execute' && call.target === 'cmd.exe')),
@@ -399,7 +418,7 @@ test('npm 新装回执丢失：仅确认已落地的固定版本', async t => {
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'uninstall').length, 0);
   assert.equal(f.calls.filter(call => call.kind === 'execute' && call.target === 'cmd.exe').length, 0);
-  assert.equal(f.state.scriptFetches, 0);
+  assert.equal(f.state.scriptFetches, 1);
 });
 
 test('切换 npm 根：阻止原新装', async t => {
@@ -427,13 +446,14 @@ test('停止失效程序：保留独立剩余工作', async t => {
   const first = await f.ccw.apply(plan.id);
   assert.equal(first.state, 'partial');
   assert.ok(first.remaining);
-  assert.equal(first.items.find(item => item.id === claude.id).isPending, false);
+  assert.equal(first.items.find(item => item.id === claude.id).isPending, true);
   const next = await f.ccw.plan({ resume: first.remaining });
   assert.deepEqual(
     next.items.map(item => item.id),
-    [selectedOffice.id],
+    [claude.id],
   );
-  assert.equal((await f.ccw.apply(next.id)).state, 'done');
+  assert.equal((await f.ccw.apply(next.id)).state, 'partial');
+  assert.equal(first.items.find(item => item.id === selectedOffice.id).state, 'done');
   assert.equal(f.versions.get(f.roots[0]), '2.1.1');
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'uninstall').length, 0);
 });
@@ -444,10 +464,11 @@ test('重试失败清理：保留安装进度', async t => {
   f.state.fetchScript = true;
   f.state.afterInstall = async () => fs.unlink(f.binary(f.roots[0]));
   const first = await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'failed');
   assert.equal(first.items[0].effects.at(-1).code, 'failed-install-cleanup-failed');
   f.state.cleanupFails = false;
-  assert.equal((await f.apply({ resume: first.remaining })).state, 'done');
+  const resumed = await f.apply({ resume: first.remaining });
+  assert.equal(resumed.state, 'done', JSON.stringify(resumed));
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
 });
 
@@ -485,7 +506,7 @@ test('继续 CMD 新装：仅复核程序', async t => {
     f.state.unavailable = true;
   };
   const first = await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'failed');
   assert.ok(first.remaining);
   f.state.unavailable = false;
   assert.equal((await f.apply({ resume: first.remaining })).state, 'done');
@@ -512,7 +533,7 @@ test('CMD 新装回执丢失：仅确认已落地的固定版本', async t => {
   f.state.unavailable = false;
   const result = await f.apply({ resume: first.remaining });
   assert.equal(result.state, 'done', JSON.stringify(result));
-  assert.ok(result.items[0].effects.some(effect => effect.code === 'program-ready' && effect.detail === 'CMD · 2.1.2'));
+  assert.ok(result.items[0].effects.some(effect => effect.code === 'program-ready' && effect.detail === native));
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
   const commands = f.calls.filter(call => call.kind === 'execute' && call.target === 'cmd.exe');
   assert.equal(commands.length, 1);
@@ -576,14 +597,17 @@ for (const recreated of [false, true])
     f.state.installFails = true;
     f.state.fetchScript = true;
     let removed;
+    const abort = new AbortController();
     f.state.afterRemoveTree = async directory => {
       if (!path.basename(directory).startsWith('install-claude-')) return;
       f.state.afterRemoveTree = null;
       removed = directory;
+      abort.abort();
       throw new Error('installer-remove-receipt-lost');
     };
-    const first = await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
-    assert.equal(first.state, 'partial');
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+    const first = await f.ccw.apply(plan.id, abort.signal);
+    assert.equal(first.state, 'cancelled');
     assert.ok(first.remaining, JSON.stringify(first));
     assert.ok(removed);
     assert.equal(await exists(removed), false);
@@ -668,14 +692,14 @@ test('CMD 快照与清理同时失败：未知安装结果优先阻断', async t
   const result = await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
   assert.notEqual(result.state, 'done', JSON.stringify(result));
   assert.equal(result.items[0].effects.at(-1).code, 'program-installation-unconfirmed');
-  assert.equal(result.remaining, undefined);
-  assert.equal(result.items[0].isPending, false);
+  assert.ok(result.remaining);
+  assert.equal(result.items[0].isPending, true);
   assert.equal(await fs.readFile(native, 'utf8'), '2.1.2');
   assert.equal(f.calls.filter(call => call.kind === 'execute' && call.target === 'cmd.exe').length, 1);
   assert.equal(f.state.scriptFetches, 1);
 });
 
-test('CMD 回执丢失后取消：续办仅确认原固定版本', async t => {
+test('CMD 回执丢失后取消：缺少快照时续办保持待核对', async t => {
   const f = await fixture(t);
   f.state.installFails = true;
   f.state.fetchScript = true;
@@ -692,7 +716,10 @@ test('CMD 回执丢失后取消：续办仅确认原固定版本', async t => {
   assert.equal(await fs.readFile(path.join(f.home, '.local/bin/claude.exe'), 'utf8'), '2.1.2');
   assert.deepEqual(await f.read(f.settingsFile), { language: 'English' });
   const result = await f.apply({ resume: first.remaining });
-  assert.equal(result.state, 'done', JSON.stringify(result));
+  assert.notEqual(result.state, 'done', JSON.stringify(result));
+  assert.ok(result.remaining);
+  assert.ok(result.items[0].effects.some(effect => effect.code === 'program-installation-unconfirmed'));
+  assert.deepEqual(await f.read(f.settingsFile), { language: 'English' });
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
   assert.equal(f.calls.filter(call => call.kind === 'execute' && call.target === 'cmd.exe').length, 1);
   assert.equal(f.state.scriptFetches, 1);
@@ -717,8 +744,8 @@ for (const channel of ['npm', 'cmd'])
     assert.equal(replacements, 1);
     assert.notEqual(result.state, 'done', JSON.stringify(result));
     assert.equal(result.items[0].effects.at(-1).code, 'program-changed');
-    assert.equal(result.remaining, undefined);
-    assert.equal(result.items[0].isPending, false);
+    assert.ok(result.remaining);
+    assert.equal(result.items[0].isPending, true);
     assert.equal(await fs.readFile(binary, 'utf8'), replacement);
     assert.deepEqual(await f.read(f.settingsFile), { language: 'English' });
     assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
@@ -727,7 +754,7 @@ for (const channel of ['npm', 'cmd'])
       f.calls.filter(call => call.kind === 'execute' && call.target === 'cmd.exe').length,
       channel === 'cmd' ? 1 : 0,
     );
-    assert.equal(f.state.scriptFetches, channel === 'cmd' ? 1 : 0);
+    assert.equal(f.state.scriptFetches, 1);
   });
 
 test('CMD 执行后安装目录被重建：保留用户文件并停止清理', async t => {
@@ -765,7 +792,7 @@ test('继续 npm 复核：保护外部替换', async t => {
   await f.write(binary, 'external replacement');
   f.state.unavailable = false;
   const result = await f.apply({ resume: first.remaining });
-  assert.equal(result.state, 'failed');
+  assert.equal(result.state, 'partial');
   assert.equal(result.items[0].effects.at(-1).code, 'program-changed');
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
 });
@@ -784,12 +811,23 @@ for (const [seeded, maintenance, label] of [
       task: 'install',
       selected: [maintenance ? { id: 'claude', maintenance } : { id: 'claude' }],
     });
-    assert.equal(first.state, 'partial');
-    assert.equal(first.remaining, undefined);
-    assert.equal(first.items[0].isPending, false);
+    assert.equal(first.state, 'failed');
+    assert.ok(first.remaining);
+    assert.equal(first.items[0].isPending, true);
     assert.equal(first.items[0].effects.at(-1).code, 'program-installation-unconfirmed');
     await f.write(binary, '2.1.2 external replacement');
-    await assert.rejects(f.ccw.plan({ resume: 'expired' }), /plan-unavailable/);
+    const restarted = createCcw({
+      machine: f.machine,
+      home: f.home,
+      claudeRoot: f.claudeRoot,
+      cclineRoot: f.cclineRoot,
+      platform: f.platform,
+    });
+    const resumed = await restarted.plan({ resume: first.remaining });
+    const paused = await restarted.apply(resumed.id);
+    assert.notEqual(paused.state, 'done', JSON.stringify(paused));
+    assert.ok(paused.remaining);
+    assert.equal(await fs.readFile(binary, 'utf8'), '2.1.2 external replacement');
     assert.equal(await fs.readFile(settingsFile, 'utf8'), settings);
     assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
   });
@@ -800,7 +838,7 @@ test('继续 npm 新装：保护缺失快照', async t => {
   const settings = await fs.readFile(settingsFile, 'utf8');
   f.state.afterInstall = async () => fs.rm(path.join(f.roots[0], packageName), { recursive: true, force: true });
   const first = await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'failed');
   assert.ok(first.remaining);
   await f.write(
     path.join(f.roots[0], packageName, 'package.json'),
@@ -811,8 +849,8 @@ test('继续 npm 新装：保护缺失快照', async t => {
   assert.equal(result.state, 'failed');
   assert.equal(result.items[0].effects.at(-1).code, 'program-changed');
   assert.equal(await fs.readFile(settingsFile, 'utf8'), settings);
-  assert.equal(result.remaining, undefined);
-  assert.equal(result.items[0].isPending, false);
+  assert.ok(result.remaining);
+  assert.equal(result.items[0].isPending, true);
   assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, 1);
 });
 
@@ -890,14 +928,14 @@ for (const channel of ['npm', 'cmd'])
     const f = await fixture(t);
     const native = path.join(f.home, '.local/bin/claude.exe');
     const controller = new AbortController();
-    if (channel === 'npm') f.faults.npm.set('install', async () => controller.abort());
-    else {
+    if (channel === 'cmd') {
       f.state.installFails = true;
       f.state.fetchScript = true;
-      f.faults.execute.set('cmd.exe', async () => controller.abort());
     }
     const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
-    const result = await f.ccw.apply(plan.id, controller.signal);
+    const result = await f.ccw.apply(plan.id, controller.signal, event => {
+      if (event.kind === 'effect' && event.effect.code === 'program-ready') controller.abort();
+    });
     if (channel === 'cmd') f.located.set('claude', [native]);
     assert.equal(result.state, 'cancelled');
     assert.equal(await fs.readFile(channel === 'npm' ? f.binary(f.roots[0]) : native, 'utf8'), '2.1.2');
@@ -906,12 +944,13 @@ for (const channel of ['npm', 'cmd'])
         item => item.kind === 'claude' && item.facts.some(fact => fact.code === 'program-exists'),
       ),
     );
-    assert.ok(result.items[0].effects.some(effect => effect.code === 'program-ready'));
     assert.ok(result.remaining);
     assert.deepEqual(await f.read(f.settingsFile), { language: 'English' });
     const retry = await f.ccw.plan({ resume: result.remaining });
     assert.equal(retry.items[0].problem, null);
-    assert.equal((await f.ccw.apply(retry.id)).state, 'done');
+    const done = await f.ccw.apply(retry.id);
+    assert.equal(done.state, 'done', JSON.stringify(done));
+    assert.ok(done.items[0].effects.some(effect => effect.code === 'program-ready'));
     assert.equal(
       f.calls.filter(call =>
         channel === 'npm'
@@ -922,7 +961,7 @@ for (const channel of ['npm', 'cmd'])
     );
   });
 
-test('取消 Claude 重装：仅重试配置', async t => {
+test('取消 Claude 同字节重装：缺少快照时不重发命令', async t => {
   const f = await fixture(t);
   await f.apply({ task: 'install', selected: [{ id: 'claude' }] });
   const id = (await f.ccw.inspect()).items.find(item => item.kind === 'claude').id;
@@ -931,7 +970,12 @@ test('取消 Claude 重装：仅重试配置', async t => {
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id, maintenance: 'reinstall' }] });
   const result = await f.ccw.apply(plan.id, controller.signal);
   assert.equal(result.state, 'cancelled');
-  assert.ok(result.items[0].effects.some(effect => effect.code === 'program-ready'));
+  const calls = f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length;
+  const retry = await f.ccw.plan({ resume: result.remaining });
+  const resumed = await f.ccw.apply(retry.id);
+  assert.notEqual(resumed.state, 'done', JSON.stringify(resumed));
+  assert.ok(resumed.items[0].effects.some(effect => effect.code === 'program-installation-unconfirmed'));
+  assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'install').length, calls);
   assert.ok(result.remaining);
 });
 
@@ -1003,7 +1047,7 @@ test('npm 安装失败：尝试 CMD 后验证程序', async t => {
     records.plugins ??= {};
     const installPath = path.join(f.claudeRoot, 'plugins/cache', id);
     await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
-    records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath }];
+    records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath, gitCommitSha: revision }];
     config.enabledPlugins[id] = true;
     await f.write(file, JSON.stringify(records));
     await f.write(f.settingsFile, JSON.stringify(config));
@@ -1027,7 +1071,7 @@ test('npm 安装失败：尝试 CMD 后验证程序', async t => {
   assert.ok(result.items[0].effects.some(effect => effect.code === 'npm-install-failed'));
   assert.deepEqual(
     result.items[0].effects.find(effect => effect.code === 'program-ready'),
-    { state: 'done', code: 'program-ready', detail: 'CMD · 2.1.2' },
+    { state: 'done', code: 'program-ready', detail: path.join(f.home, '.local/bin/claude.exe') },
   );
   assert.equal(f.calls.filter(call => call.kind === 'execute' && call.target === 'cmd.exe').length, 1);
   assert.equal(

@@ -97,8 +97,13 @@ async function fixture(t, platform = process.platform, extra = {}) {
     execute: async (file, args, options) => {
       if (state.managed !== null && file === state.managed.command[0] && args[0] === state.managed.command[1]) {
         await fs.unlink(state.managed.binary);
+        state.managed.removed = true;
         return { code: state.managedFails ? 1 : 0, failed: false, stdout: '' };
       }
+      if (file === 'rpm' && args[0] === '-qa') return ok(state.managed?.removed ? '' : 'claude-code');
+      if (file === 'dpkg-query' && args[0] === '-W') return ok(state.managed?.removed ? '' : 'claude-code installed');
+      if (file === 'apk' && args.length === 1 && args[0] === 'info')
+        return ok(state.managed?.removed ? '' : 'claude-code');
       if (['dpkg-query', 'rpm', 'apk'].includes(file) && args[0] !== 'del')
         return state.ownership !== null && file in state.ownership
           ? ok(state.ownership[file])
@@ -186,8 +191,8 @@ async function fixture(t, platform = process.platform, extra = {}) {
         throw new Error('version-removal-failed');
       return base.removeTree(...args);
     },
-    async fingerprint(...args) {
-      const stamp = await base.fingerprint(...args);
+    async treeStamp(...args) {
+      const stamp = await base.treeStamp(...args);
       if (state.swapStateFileAtFingerprint && args[0] === f.stateFile) {
         state.swapStateFileAtFingerprint = false;
         await fs.unlink(f.stateFile);
@@ -356,6 +361,12 @@ test('卸载 Claude 失败：保留用户数据', async t => {
   assert.ok(first.remaining);
   assert.equal(first.items.at(-1).effects.at(-1).code, 'dependency-not-ready');
   assert.ok(await fs.stat(path.join(f.claudeRoot, 'settings.json')));
+  const attempts = f.calls.filter(call => call.kind === 'npm' && call.target === 'uninstall').length;
+  const stillUnknown = await f.apply({ resume: first.remaining });
+  assert.equal(stillUnknown.state, 'failed');
+  assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'uninstall').length, attempts);
+  await fs.rm(path.join(f.npmRoot, '@anthropic-ai/claude-code'), { recursive: true });
+  f.packages.delete('@anthropic-ai/claude-code');
   f.state.leaveProgram = false;
   const resumed = await f.apply({ resume: first.remaining });
   assert.equal(resumed.state, 'done', JSON.stringify(resumed));
@@ -371,7 +382,8 @@ test('卸载后重启 Claude：阻止删除数据', async t => {
   });
   assert.equal(first.state, 'partial');
   assert.ok(first.remaining);
-  assert.equal(first.items.at(-1).effects.at(-1).code, 'claude-running');
+  assert.ok(first.items.some(item => item.effects.some(effect => effect.code === 'claude-running')));
+  assert.equal(first.items.at(-1).effects.at(-1).code, 'dependency-not-ready');
   assert.ok(await fs.stat(path.join(f.claudeRoot, 'settings.json')));
   f.state.running = false;
   assert.equal((await f.apply({ resume: first.remaining })).state, 'done');
@@ -407,10 +419,10 @@ for (const recreate of [false, true])
     if (recreate) await f.write(path.join(f.claudeRoot, 'settings.json'), 'new external settings');
     f.state.failStateFileRemove = false;
     const resumed = await f.apply({ resume: first.remaining });
-    assert.equal(resumed.state, recreate ? 'failed' : 'done', JSON.stringify(resumed));
+    assert.equal(resumed.state, recreate ? 'partial' : 'done', JSON.stringify(resumed));
     assert.equal(f.calls.filter(call => call.kind === 'npm' && call.target === 'uninstall').length, 1);
     if (recreate) {
-      assert.equal(resumed.items[0].effects.at(-1).code, 'target-changed');
+      assert.equal(resumed.items.find(item => item.id === 'data:claude').effects.at(-1).code, 'target-changed');
       assert.equal(await fs.readFile(path.join(f.claudeRoot, 'settings.json'), 'utf8'), 'new external settings');
       assert.ok(await fs.stat(stateFile));
     } else assert.equal(await exists(stateFile), false);
@@ -434,7 +446,9 @@ test('完整卸载 Claude：拒绝用户根和链接根', async t => {
     });
     const plan = await ccw.plan({ task: 'uninstall', selected: [{ id: 'claude' }], removeData: true });
     assert.equal(plan.items.at(-1).problem, code, JSON.stringify(plan));
-    assert.equal((await ccw.apply(plan.id)).state, 'failed');
+    const failed = await ccw.apply(plan.id);
+    assert.equal(failed.state, 'failed');
+    await ccw.abandon(failed.remaining);
   }
   assert.equal(
     f.calls.some(call => call.kind === 'npm' && call.target === 'uninstall'),
@@ -479,7 +493,7 @@ test('确认 npm 卸载：以实际状态为准', async t => {
   f.state.leaveProgram = true;
   const failed = await f.apply({ task: 'uninstall', selected: [{ id: 'claude' }] });
   assert.equal(failed.state, 'failed');
-  assert.equal(failed.items[0].effects.at(-1).code, 'program-still-installed');
+  assert.equal(failed.items[0].effects.at(-1).code, 'program-removal-unconfirmed');
 });
 
 test('变更程序：阻止卸载', async t => {
@@ -512,7 +526,7 @@ test('重试原生卸载：保护重建入口', async t => {
   await f.write(f.nativeClaude, 'new external entry');
   f.state.failClaudeVersionsTree = false;
   const retry = await f.apply({ resume: first.remaining });
-  assert.equal(retry.state, 'failed');
+  assert.equal(retry.state, 'partial');
   assert.equal(retry.items[0].effects.at(-1).code, 'program-changed');
   assert.equal(f.calls.filter(call => call.kind === 'removeTree' && call.target === f.nativeClaude).length, 1);
 });
@@ -642,7 +656,7 @@ for (const [platform, channel, action, relative, command] of [
   ['win32', 'scoop', 'update', 'apps/officecli/1.0.123/officecli.exe', ['scoop', 'update', 'officecli']],
   ['win32', 'scoop', 'reinstall', 'apps/officecli/1.0.123/officecli.exe', ['scoop', 'update', '--force', 'officecli']],
 ])
-  test(`${channel} OfficeCLI ${action}：复核原范围`, async t => {
+  test(`${channel} OfficeCLI ${action}：无法固定来源时保留原范围`, async t => {
     const f = await fixture(t, platform);
     const binary = path.join(channel === 'scoop' ? path.join(f.home, 'scoop') : f.root, relative);
     await f.write(binary, 'package managed binary');
@@ -655,13 +669,15 @@ for (const [platform, channel, action, relative, command] of [
     if (channel === 'scoop') f.state.scoopPrefix = path.dirname(binary);
     const selected = (await f.ccw.inspect()).items.find(item => item.id.startsWith(`officecli:${channel}:`));
     assert.ok(selected, JSON.stringify(await f.ccw.inspect()));
-    const result = await f.apply({
+    const plan = await f.ccw.plan({
       task: 'install',
       selected: [{ id: selected.id, maintenance: action, fields: { connection: 'mcp' } }],
     });
-    assert.equal(result.state, 'done', JSON.stringify(result));
+    assert.equal(plan.items[0].problem, 'pinned-version-channel-unsupported');
+    assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
     const expected = channel === 'brew' ? [path.join(f.root, 'bin/brew'), ...command.slice(1)] : command;
-    assert.ok(ranExecute(f, expected));
+    assert.equal(ranExecute(f, expected), false);
+    assert.equal(await fs.readFile(binary, 'utf8'), 'package managed binary');
   });
 
 test('卸载原生 OfficeCLI：仅删除已确认文件', async t => {
@@ -719,14 +735,13 @@ test('重试 Claude 卸载：仅复核包登记', async t => {
   await f.seedNpm('claude');
   f.state.registryUnavailable = true;
   const first = await f.apply({ task: 'uninstall', selected: [{ id: 'claude' }] });
-  assert.equal(first.state, 'partial');
+  assert.equal(first.state, 'failed');
   assert.ok(first.remaining);
-  assert.equal(first.items[0].effects.at(-1).code, 'program-removal-unconfirmed');
+  assert.ok(first.items[0].effects.some(effect => effect.code === 'npm-inspection-failed'));
   f.state.registryUnavailable = false;
   const retry = await f.ccw.plan({ resume: first.remaining });
-  assert.ok(retry.items[0].changes.some(change => change.code === 'program-removal-confirm'));
   assert.equal(
-    retry.items[0].changes.some(change => change.code === 'program-uninstall'),
+    retry.items.some(item => item.changes.some(change => change.code === 'program-uninstall')),
     false,
   );
   assert.equal((await f.ccw.apply(retry.id)).state, 'done');
@@ -859,8 +874,8 @@ test('包管理器报错：仅重试卸载复核', async t => {
   f.state.managedFails = true;
   f.state.brewVersionsUnknown = true;
   const first = await f.apply({ task: 'uninstall', selected: [{ id: 'claude' }] });
-  assert.equal(first.state, 'partial');
-  assert.equal(first.items[0].effects.at(-1).code, 'program-removal-unconfirmed');
+  assert.equal(first.state, 'failed');
+  assert.ok(first.items[0].effects.some(effect => effect.code === 'program-removal-unconfirmed'));
   const uncertain = await f.apply({ resume: first.remaining });
   assert.equal(uncertain.state, 'failed');
   assert.equal(uncertain.items[0].effects.at(-1).code, 'program-removal-unconfirmed');
@@ -870,15 +885,15 @@ test('包管理器报错：仅重试卸载复核', async t => {
     f.calls.filter(call => call.kind === 'execute' && call.target === manager && call.args[0] === 'uninstall').length,
     1,
   );
-  assert.equal(
-    f.calls.filter(
+  const inspections = f.calls.filter(
+    call => call.kind === 'execute' && call.args[0] === 'list' && call.args.at(-1) === '--versions',
+  );
+  assert.ok(inspections.length > 0);
+  assert.ok(
+    inspections.every(
       call =>
-        call.kind === 'execute' &&
-        call.target === manager &&
-        call.args[0] === 'list' &&
-        call.args.at(-1) === '--versions',
-    ).length,
-    2,
+        call.target === manager && call.args.includes('--cask') && call.options.env.HOMEBREW_NO_AUTO_UPDATE === '1',
+    ),
   );
 });
 
