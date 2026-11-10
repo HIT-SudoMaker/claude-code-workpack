@@ -80,6 +80,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
         await update(definition, {
           ...retained,
           status: 'confirmed',
+          confirmed: true,
           evidence: assessment.evidence,
           effects: assessment.effects ?? previous.effects,
         });
@@ -95,7 +96,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
         // 已确认目标丢失不允许借由 ready 重新派发。
         await update(
           definition,
-          previous.status === 'confirmed'
+          previous.confirmed
             ? { ...previous, status: 'checking', problem: 'target-changed' }
             : { ...retained, status: 'pending', ...(assessment.dispatch ? { dispatch: assessment.dispatch } : {}) },
         );
@@ -128,6 +129,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
   const recovery = (): Recovery => ({
     id: record!.id,
     phase: record!.phase,
+    intent: record!.intent,
     items: record!.items.map(item => {
       const facts = record!.operations
         .filter(operation => operation.itemId === item.id)
@@ -154,8 +156,16 @@ export function createOperationController(ctx: Context, machine: Machine, handle
     effects: scope.machine,
     async recovery(): Promise<Recovery | undefined> {
       if (busy) throw new Error('operation-in-progress');
-      await load();
-      return record && record.phase !== 'completed' ? structuredClone(recovery()) : undefined;
+      busy = true;
+      try {
+        await load();
+        if (!record || record.phase === 'completed') return undefined;
+        for (const operation of record.operations) await registerAssessment(operation, await assess(operation));
+        await save({ ...record, planId: randomUUID(), phase: 'awaiting-confirmation' });
+        return structuredClone(recovery());
+      } finally {
+        busy = false;
+      }
     },
     async abandon(id: string) {
       if (busy) throw new Error('operation-in-progress');
@@ -195,12 +205,14 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           record.phase !== 'completed' &&
           !(
             editable === record.id &&
+            record.intent.task === input.task &&
             record.phase === 'awaiting-confirmation' &&
             record.operations.every(operation => !fact(operation).attemptId)
           )
         )
           throw new Error('unfinished-operation');
         const prepared = await prepare();
+        for (const key of Object.keys(inputs)) delete inputs[key];
         const operations: OperationDefinition[] = [];
         for (const item of prepared.plan.items) {
           const work = prepared.work.get(item.id);
@@ -319,6 +331,8 @@ export function createOperationController(ctx: Context, machine: Machine, handle
               if (!dependencyReady) continue;
               const assessment = await assess(operation);
               await registerAssessment(operation, assessment);
+              if (assessment.state === 'complete')
+                for (const effect of assessment.effects ?? []) notify({ kind: 'effect', id: operation.itemId, effect });
               attempted.add(operation.id);
               if (terminal(fact(operation))) {
                 advanced = true;
@@ -356,6 +370,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
               });
               for (const effect of outcome.effects ?? []) notify({ kind: 'effect', id: operation.itemId, effect });
               if (outcome.receipt.failure) {
+                if (outcome.receipt.failure === 'credential-required') delete inputs[operation.id];
                 await update(operation, {
                   ...fact(operation),
                   status: outcome.receipt.kind === 'unknown' ? 'checking' : 'failed',
@@ -369,7 +384,20 @@ export function createOperationController(ctx: Context, machine: Machine, handle
                   status: outcome.receipt.kind === 'unknown' ? 'checking' : 'failed',
                   problem: outcome.receipt.failure ?? 'operation-unconfirmed',
                 });
-              else await registerAssessment(operation, verified);
+              else {
+                await registerAssessment(operation, verified);
+                if (verified.state === 'complete')
+                  for (const effect of verified.effects ?? [])
+                    if (
+                      !(outcome.effects ?? []).some(
+                        previous =>
+                          previous.code === effect.code &&
+                          previous.state === effect.state &&
+                          previous.detail === effect.detail,
+                      )
+                    )
+                      notify({ kind: 'effect', id: operation.itemId, effect });
+              }
               advanced = true;
             }
             if (!advanced) break;
@@ -377,6 +405,14 @@ export function createOperationController(ctx: Context, machine: Machine, handle
         } catch (error) {
           if (errorCode(error) === 'cancelled') wasCancelled = true;
           else storageProblem = errorCode(error);
+        }
+        if (!storageProblem) {
+          try {
+            for (const operation of record.operations)
+              if (fact(operation).status === 'confirmed') await registerAssessment(operation, await assess(operation));
+          } catch (error) {
+            storageProblem = errorCode(error);
+          }
         }
         const complete =
           record.items.every(item => !item.problem) && record.operations.every(operation => terminal(fact(operation)));

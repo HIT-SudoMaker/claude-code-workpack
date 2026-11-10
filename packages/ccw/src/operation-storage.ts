@@ -141,9 +141,10 @@ function isReceipt(value: unknown): boolean {
 function isFact(value: unknown): value is OperationFact {
   return (
     isObject(value) &&
-    keys(value, ['status', 'attemptId', 'dispatch', 'receipt', 'evidence', 'problem', 'effects']) &&
+    keys(value, ['status', 'confirmed', 'attemptId', 'dispatch', 'receipt', 'evidence', 'problem', 'effects']) &&
     text(value.status) &&
     statuses.has(value.status) &&
+    optional(value, 'confirmed', field => field === true) &&
     optional(value, 'attemptId', identity) &&
     optional(value, 'dispatch', isJsonObject) &&
     optional(value, 'receipt', isReceipt) &&
