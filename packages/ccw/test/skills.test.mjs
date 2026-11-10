@@ -118,6 +118,11 @@ test('删除已装技能：阻止旧任务恢复', async t => {
   const stopped = await f.ccw.apply(rest.id);
   assert.equal(stopped.items[0].effects.at(-1).code, 'target-changed');
   assert.equal(await exists(completed), false);
+  await assert.rejects(
+    f.ccw.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] }),
+    /unfinished-operation/,
+  );
+  await f.ccw.abandon(stopped.remaining);
   await f.ccw.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
   await assert.rejects(f.ccw.plan({ resume: stopped.remaining }), /plan-unavailable/);
 });
@@ -130,21 +135,19 @@ test('删除已有技能：阻止旧安装计划', async t => {
   assert.equal(plan.items[0].problem, null);
   await fs.rm(directory, { recursive: true });
   const result = await f.ccw.apply(plan.id);
-  assert.equal(result.state, 'failed');
+  assert.equal(result.state, 'partial');
   assert.equal(result.items[0].effects.at(-1).code, 'target-changed');
   assert.equal(await exists(directory), false);
+  assert.equal(await exists(path.join(f.claudeRoot, 'skills/code-review/SKILL.md')), true);
 });
 
-test('继续技能写后确认：不重复部署', async t => {
+test('技能写后短暂读取失败：立即复核且不重复部署', async t => {
   const f = await fixture(t);
   const directory = path.join(f.claudeRoot, 'skills/ssre2-design');
   f.state.failTreeStampOnce = directory;
   const writes = () => f.calls.filter(call => call.kind === 'replaceTree' && call.target === directory).length;
   const first = await f.apply({ task: 'install', selected: [{ id: 'skill:ssre2-design' }] });
-  assert.equal(first.state, 'partial');
-  assert.ok(first.remaining);
-  const retry = await f.apply({ resume: first.remaining });
-  assert.equal(retry.state, 'done', JSON.stringify(retry));
+  assert.equal(first.state, 'done', JSON.stringify(first));
   assert.equal(writes(), 1);
 });
 

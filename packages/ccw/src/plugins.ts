@@ -609,14 +609,17 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
           if (current.files.length === 0 && !current.enabledValue)
             return { state: 'complete', evidence: current, effects: [{ state: 'done', code: 'plugin-removed' }] };
         } else {
+          const reusedFilesMatch =
+            current.records === p.beforeRecords && extensionDigest(current.files) === p.beforeFiles;
           const valid =
             current.files.length > 0 &&
             current.files.every(
               file =>
                 file.stamp !== null &&
-                (p.reuse ||
-                  (file.revision === extensionObject(p.source).revision &&
-                    file.stamp === extensionObject(p.source).stamp)),
+                (p.reuse
+                  ? reusedFilesMatch
+                  : file.revision === extensionObject(p.source).revision &&
+                    file.stamp === extensionObject(p.source).stamp),
             ) &&
             current.enabledValue;
           if (valid && (p.reuse || (fact.receipt?.kind === 'returned' && !fact.receipt.failure))) {

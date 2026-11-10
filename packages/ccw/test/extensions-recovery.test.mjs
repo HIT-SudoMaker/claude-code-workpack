@@ -235,3 +235,64 @@ test('Serena same-byte reinstall with a lost command receipt stays unknown after
   assert.equal(installs, 1);
   assert.equal(metadata, 1);
 });
+
+test('cold Serena install freezes the uv script and resumes initialization in a fresh instance', async t => {
+  const f = await createEnv(t);
+  const uv = path.join(f.home, '.local/bin/uv');
+  const serena = path.join(f.home, '.local/bin/serena');
+  const abort = new AbortController();
+  const counts = { installer: 0, runtime: 0, initialize: 0, metadata: 0, script: 0 };
+  const base = f.machine({
+    execute: async (file, args) => {
+      if (file === 'sh') {
+        counts.installer++;
+        await f.write(uv, 'uv frozen 0.5.0');
+        return ok();
+      }
+      if (file === uv && args[0] === '--version') return ok('uv 0.5.0');
+      if (file === uv && args[1] === 'list')
+        return ok(
+          await fs.stat(serena).then(
+            () => 'serena-agent v0.1.0\n',
+            () => '',
+          ),
+        );
+      if (file === uv && args[1] === 'install') {
+        counts.runtime++;
+        await f.write(serena, 'frozen serena');
+        abort.abort();
+        return ok();
+      }
+      if (file === serena && args[0] === 'init') {
+        counts.initialize++;
+        return ok();
+      }
+      throw new Error(`unexpected ${file} ${args}`);
+    },
+  });
+  const machine = {
+    ...base,
+    fetchText: async url => {
+      if (url.includes('pypi.org')) {
+        counts.metadata++;
+        return JSON.stringify({ info: { version: '0.1.0' } });
+      }
+      counts.script++;
+      return 'APP_VERSION="0.5.0"\n';
+    },
+  };
+  const first = f.ccw(machine, { platform: 'linux' });
+  const preview = await first.plan({ task: 'install', selected: [{ id: 'mcp:serena' }] });
+  assert.equal(preview.items[0].problem, null);
+  const result = await first.apply(preview.id, abort.signal);
+  assert.ok(result.remaining);
+  const second = f.ccw(machine, { platform: 'linux' });
+  const resumed = await second.plan({ resume: result.remaining });
+  assert.equal((await second.apply(resumed.id)).state, 'done');
+  assert.deepEqual(counts, { installer: 1, runtime: 1, initialize: 1, metadata: 1, script: 1 });
+  assert.equal((await f.read(f.stateFile)).mcpServers.serena.command, serena);
+  assert.equal(
+    (await fs.readdir(path.join(f.home, '.ccw'))).some(name => name.startsWith('install-uv-')),
+    false,
+  );
+});
