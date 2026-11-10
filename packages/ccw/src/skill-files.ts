@@ -46,7 +46,6 @@ export function extensionPrepared(operations: readonly OperationDefinition[]): P
   return {
     operations,
     changes: operations.flatMap(operation => operation.changes),
-    writes: [...new Set(operations.flatMap(operation => operation.writes))],
   };
 }
 export function currentSkill(_ctx: Context, name: string, directory: string, before: string): Prepared {
@@ -58,7 +57,6 @@ export function currentSkill(_ctx: Context, name: string, directory: string, bef
       handler: 'skill.keep',
       payload: { directory, stamp: before, name },
       dependsOn: [],
-      writes: [],
       changes: [{ code: 'skill-current', detail: name }],
     },
   ]);
@@ -91,7 +89,6 @@ function sourceOperation(
     itemId,
     handler: 'skill.source',
     dependsOn,
-    writes: [sourcesFile(ctx)],
     changes: [{ code: 'skill-source-repair', detail: target.name }],
     payload: {
       file: sourcesFile(ctx),
@@ -114,7 +111,6 @@ export function prepareSkillFiles(ctx: Context, target: SkillTarget, source: Ski
     itemId,
     handler: 'skill.deploy',
     dependsOn: [],
-    writes: [directory, ...(destination ? [destination] : [])],
     payload: {
       name,
       directory,
@@ -141,7 +137,6 @@ export function disableSkillEntry(ctx: Context, directory: string, before: strin
     itemId,
     handler: 'skill.disable',
     dependsOn: [],
-    writes: [directory, destination],
     payload: { directory, before, destination },
     changes: [
       { code: 'entry-disable', detail: directory },
@@ -156,7 +151,6 @@ export function disableSkillEntry(ctx: Context, directory: string, before: strin
       itemId,
       handler: 'skill.source-remove',
       dependsOn: [disable.id],
-      writes: [sourcesFile(ctx)],
       payload: { file: sourcesFile(ctx), directory },
       changes: [],
     },

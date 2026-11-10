@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { createCcw } from '../dist/ccw.js';
 import { createEnv, exists, ok } from './env.mjs';
 
 async function fixture(t) {
@@ -55,14 +54,7 @@ async function fixture(t) {
       }
     },
   };
-  const ccw = () =>
-    createCcw({
-      machine,
-      home: f.home,
-      claudeRoot: f.claudeRoot,
-      cclineRoot: f.cclineRoot,
-      platform: process.platform,
-    });
+  const ccw = () => f.ccw(machine);
   return {
     ...f,
     machine,

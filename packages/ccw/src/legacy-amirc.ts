@@ -26,7 +26,6 @@ export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> 
       itemId,
       handler: 'mcp.registration',
       dependsOn: [],
-      writes: [ctx.stateFile],
       payload: {
         file: ctx.stateFile,
         name: 'amirc',
@@ -44,7 +43,6 @@ export async function prepareLegacyAmircDetach(ctx: Context): Promise<Prepared> 
       itemId,
       handler: 'amirc.permission-remove',
       dependsOn: [],
-      writes: [ctx.settingsFile],
       payload: { file: ctx.settingsFile, rule },
       changes: [{ code: 'amirc-permissions-remove' }],
     })),

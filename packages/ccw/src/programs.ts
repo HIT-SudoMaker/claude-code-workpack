@@ -227,8 +227,6 @@ export async function prepareProgram(
       },
       { code: 'keep-user-data' },
     ],
-    [],
-    [program.binary],
   );
   const ready = programOperation(
     selection.id,
@@ -448,8 +446,6 @@ async function prepareOfficeNative(
       'program.remove-file',
       { file: target.file, before: target.stamp },
       target.stamp === null ? [] : [{ code: 'program-copy-remove', detail: target.file }],
-      [],
-      [target.file],
     ),
   );
   const deploy = programOperation(
@@ -471,7 +467,6 @@ async function prepareOfficeNative(
       },
     ],
     removals.map(operation => operation.id),
-    [binary],
   );
   const ready = programOperation(
     selection.id,
@@ -530,8 +525,6 @@ async function prepareProgramRemoval(
         'program.remove-file',
         { file, before: await ctx.machine.treeStamp(file), claude: kind === 'claude' },
         [{ code: file === program.binary ? 'program-uninstall' : 'program-copy-remove', detail: file }],
-        [],
-        [file],
       ),
     );
   if (program.channel === 'native' && kind === 'officecli')
@@ -543,8 +536,6 @@ async function prepareProgramRemoval(
           'program.remove-file',
           { file: target.file, before: target.stamp },
           target.stamp === null ? [] : [{ code: 'program-copy-remove', detail: target.file }],
-          [],
-          [target.file],
         ),
       );
   if (!nativeFiles.length)
@@ -555,8 +546,6 @@ async function prepareProgramRemoval(
         'program.remove-package',
         { program, scope: scope.data, before, action: 'uninstall', targetVersion: null, registry: null },
         [{ code: 'program-uninstall', detail: program.channel + ' · ' + program.binary }],
-        [],
-        [program.binary],
       ),
     );
   const ready = programOperation(

@@ -4,7 +4,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { createCcw } from '../dist/ccw.js';
 import { HOME_TITLE } from '../dist/render.js';
 import { runTerminal } from './terminal-test.mjs';
 import {
@@ -262,7 +261,7 @@ async function fixture(t, { platform = process.platform } = {}) {
       ];
     },
   };
-  const ccw = createCcw({ machine, home: f.home, claudeRoot: f.claudeRoot, cclineRoot, platform });
+  const ccw = f.ccw(machine, { cclineRoot, platform });
   const apply = async input => {
     const plan = await ccw.plan(input);
     assert.ok(

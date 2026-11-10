@@ -126,7 +126,7 @@ function isDefinition(value: unknown): value is OperationDefinition {
     identity(value.handler) &&
     isJsonObject(value.payload) &&
     strings(value.dependsOn) &&
-    strings(value.writes) &&
+    optional(value, 'writes', strings) &&
     changes(value.changes) &&
     optional(value, 'requiresInput', strings)
   );
@@ -204,6 +204,17 @@ function isRecord(value: unknown): value is OperationRecord {
     return true;
   };
   return value.operations.every(definition => acyclic(definition.id));
+}
+
+function currentRecord(record: OperationRecord): OperationRecord {
+  return {
+    ...record,
+    operations: record.operations.map(operation => {
+      const definition = { ...operation };
+      if ('writes' in definition) delete definition.writes;
+      return definition;
+    }),
+  };
 }
 
 interface Envelope {
@@ -374,7 +385,7 @@ export async function readOperation(machine: Machine, ctx: StorageContext): Prom
   }
   if (text === null) return undefined;
   try {
-    return await hydrate(machine, ctx, decode(text));
+    return currentRecord(await hydrate(machine, ctx, decode(text)));
   } catch (error) {
     throw invalid(error);
   }
@@ -383,7 +394,7 @@ export async function readOperation(machine: Machine, ctx: StorageContext): Prom
 /** Verify immutable resources before committing the one current-task envelope. */
 export async function writeOperation(machine: Machine, ctx: StorageContext, record: OperationRecord): Promise<void> {
   if (!isRecord(record)) throw invalid();
-  record = structuredClone(record);
+  record = structuredClone(currentRecord(record));
   const file = operationFile(ctx);
   let before: string | null;
   try {
