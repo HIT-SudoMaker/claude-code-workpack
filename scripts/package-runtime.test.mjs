@@ -31,9 +31,8 @@ test('验证独立运行包', async t => {
   });
   for (const [scenario, title] of [
     ['ccline', '安装 ccline'],
-    ['settings', '保存配置与注册'],
+    ['settings', '保存配置与注册并安装随包 AMIRC Skill'],
     ['officecli', '安装与卸载 OfficeCLI'],
-    ['amirc', '安装随包 AMIRC Skill'],
   ]) {
     await t.test(title, () => {
       const cwd = path.join(sandbox, scenario);

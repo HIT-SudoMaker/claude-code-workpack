@@ -5,6 +5,8 @@ import path from 'node:path';
 import { createCcw } from '../dist/ccw.js';
 import { createMachine } from '../dist/machine.js';
 
+export { releaseContract } from './office-release.mjs';
+
 /** 构造命令/npm 成功结果：code 0、failed false、stdout 默认空串 */
 export const ok = (stdout = '') => ({ code: 0, stdout, failed: false });
 /** 构造命令/npm 失败结果：code 1、空 stdout、failed false */
@@ -142,30 +144,6 @@ export function versionProbe({ binary, node = false, output = 'ccline 2.0.1', be
     return ok(respond());
   };
 }
-/** 构造 GitHub release 合同 fetchText：latest 摘要、SHA256SUMS、tag ref 三端点合一；network 记录 URL，also 兜底其余端点 */
-export function releaseContract({ tag, asset, digest, revision, network = null, also = null }) {
-  const release = `https://github.com/iOfficeAI/OfficeCLI/releases/download/${tag}/`;
-  const fetchText = async url => {
-    if (network) network.push(url);
-    if (url === 'https://api.github.com/repos/iOfficeAI/OfficeCLI/releases/latest')
-      return JSON.stringify({
-        draft: false,
-        prerelease: false,
-        tag_name: tag,
-        assets: [
-          { name: asset, browser_download_url: release + asset, digest: `sha256:${digest}` },
-          { name: 'SHA256SUMS', browser_download_url: release + 'SHA256SUMS' },
-        ],
-      });
-    if (url === release + 'SHA256SUMS') return `${digest}  ${asset}\n`;
-    if (url === `https://api.github.com/repos/iOfficeAI/OfficeCLI/git/ref/tags/${tag}`)
-      return JSON.stringify({ ref: `refs/tags/${tag}`, object: { type: 'commit', sha: revision } });
-    if (also) return also(url);
-    throw new Error(`unexpected fetch: ${url}`);
-  };
-  return { fetchText, release };
-}
-
 export async function createEnv(t, { layout = 'home', seed = {} } = {}) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-env-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -218,7 +196,7 @@ export async function createEnv(t, { layout = 'home', seed = {} } = {}) {
   }
 
   const ccw = (machine, opts = {}) =>
-    createCcw({ machine, home, claudeRoot, cclineRoot, platform: opts.platform ?? process.platform });
+    createCcw({ machine, home, claudeRoot, cclineRoot, ...opts, platform: opts.platform ?? process.platform });
 
   return {
     root,

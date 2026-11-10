@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { createCcw } from '../dist/ccw.js';
 import { createEnv, exists, ok, revision } from './env.mjs';
 
 /** 技能域世界：git 修订单源、来源载荷应答与 replaceTree/treeStamp 写入旋钮，只装技能安装所需能力 */
@@ -66,13 +65,7 @@ async function fixture(t) {
       return base.treeStamp(...args);
     },
   };
-  const ccw = createCcw({
-    machine,
-    home: f.home,
-    claudeRoot: f.claudeRoot,
-    cclineRoot: f.cclineRoot,
-    platform: process.platform,
-  });
+  const ccw = f.ccw(machine);
   const apply = async input => {
     const plan = await ccw.plan(input);
     assert.ok(

@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+
+import { releaseContract } from '../packages/ccw/test/office-release.mjs';
 const runtime = path.resolve(process.argv[2]);
 const scenario = process.argv[3];
 const { createCcw } = await import(pathToFileURL(path.join(runtime, 'packages/ccw/dist/ccw.js')).href);
@@ -27,7 +29,7 @@ const officeBinary =
   process.platform === 'win32'
     ? path.join(home, 'AppData/Local/OfficeCli/officecli.exe')
     : path.join(home, '.local/bin/officecli');
-const officeBase = 'https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.123/';
+const officeRelease = releaseContract({ tag: 'v1.0.123', asset: officeAsset, digest: officeDigest });
 const originalMachine = createMachine();
 const machine = {
   ...createMachine(),
@@ -73,23 +75,10 @@ const machine = {
     userPathConfigured = true;
   },
   async fetchBytes(url) {
-    assert.equal(url, officeBase + officeAsset);
+    assert.equal(url, officeRelease.release + officeAsset);
     return officeBytes;
   },
-  async fetchText(url) {
-    if (url.endsWith('/releases/latest'))
-      return JSON.stringify({
-        tag_name: 'v1.0.123',
-        draft: false,
-        prerelease: false,
-        assets: [
-          { name: officeAsset, browser_download_url: officeBase + officeAsset, digest: 'sha256:' + officeDigest },
-          { name: 'SHA256SUMS', browser_download_url: officeBase + 'SHA256SUMS' },
-        ],
-      });
-    assert.equal(url, officeBase + 'SHA256SUMS');
-    return officeDigest + '  ' + officeAsset;
-  },
+  fetchText: officeRelease.fetchText,
   async execute(executable, args, options) {
     if (executable === binary) {
       assert.deepEqual(args, ['--version']);
@@ -125,6 +114,13 @@ async function settings() {
   assert.match(
     await fs.readFile(path.join(claudeRoot, 'skills/amirc-research/SKILL.md'), 'utf8'),
     /name: amirc-research/,
+  );
+  assert.equal(
+    await fs.stat(path.join(runtime, 'packages/amirc_academic_mcp')).then(
+      () => true,
+      () => false,
+    ),
+    false,
   );
 }
 const scenarios = {
@@ -184,16 +180,6 @@ const scenarios = {
     assert.equal(
       JSON.parse(await fs.readFile(path.join(claudeRoot, '.claude.json'), 'utf8')).mcpServers.officecli,
       undefined,
-    );
-  },
-  async amirc() {
-    await settings();
-    assert.equal(
-      await fs.stat(path.join(runtime, 'packages/amirc_academic_mcp')).then(
-        () => true,
-        () => false,
-      ),
-      false,
     );
   },
 };

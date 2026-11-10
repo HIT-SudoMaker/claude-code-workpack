@@ -88,7 +88,7 @@ async function fixture(
       return base.read(target);
     },
   });
-  const ccw = createCcw({ machine, home: f.home, claudeRoot: f.claudeRoot, cclineRoot, platform });
+  const ccw = f.ccw(machine, { cclineRoot, platform });
   const plan = async () => {
     const prepared = await ccw.plan({ task: 'uninstall', selected: [{ id: 'ccline' }] });
     assert.equal(prepared.items[0].problem, null, JSON.stringify(prepared));

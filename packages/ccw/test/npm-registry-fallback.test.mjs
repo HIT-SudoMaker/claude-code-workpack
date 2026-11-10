@@ -147,16 +147,7 @@ test('安装 OfficeCLI：使用 GitHub 载荷', async t => {
       return [{ path: 'SKILL.md', data: Buffer.from('---\nname: officecli\n---\nOfficeCLI commands') }];
     },
   };
-  // env 的 ccw 不转发 arch/localAppData，此处按原装配直接构造
-  const ccw = createCcw({
-    machine,
-    home: f.home,
-    claudeRoot: f.claudeRoot,
-    cclineRoot: f.cclineRoot,
-    platform: 'win32',
-    arch: 'x64',
-    localAppData,
-  });
+  const ccw = f.ccw(machine, { platform: 'win32', arch: 'x64', localAppData });
 
   const plan = await ccw.plan({ task: 'install', selected: [{ id: 'officecli' }] });
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
