@@ -221,7 +221,7 @@ export function createCcw(options: CcwOptions): Ccw {
             let changes: readonly Change[] = [];
             try {
               const operation = await prepareOperation();
-              changes = operation.changes;
+              changes = operation.operations.flatMap(definition => definition.changes);
               work.set(id, operation);
             } catch (error) {
               problem = errorCode(error);

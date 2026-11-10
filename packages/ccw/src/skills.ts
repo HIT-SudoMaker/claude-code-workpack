@@ -13,7 +13,6 @@ import {
   repairSkillSource,
   skillFilesStamp,
   skillFileHandlers,
-  extensionPrepared,
 } from './skill-files.js';
 import { sourcesFile } from './storage.js';
 
@@ -270,9 +269,11 @@ async function prepareSkillSet(ctx: Context, name: string, selection: Selection)
       ),
     );
   }
-  return extensionPrepared(
-    operations.flatMap(prepared => prepared.operations).map(operation => ({ ...operation, itemId: selection.id })),
-  );
+  return {
+    operations: operations
+      .flatMap(prepared => prepared.operations)
+      .map(operation => ({ ...operation, itemId: selection.id })),
+  };
 }
 
 export async function prepareSkill(
@@ -290,7 +291,7 @@ export async function prepareSkill(
   if (action === 'detach') {
     if (before === null) throw new Error('no-connection');
     const prepared = disableSkillEntry(ctx, directory, before, selection.id);
-    return extensionPrepared(prepared.operations.map(operation => ({ ...operation, itemId: selection.id })));
+    return { operations: prepared.operations.map(operation => ({ ...operation, itemId: selection.id })) };
   }
 
   if (

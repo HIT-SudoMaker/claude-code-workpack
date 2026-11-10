@@ -23,7 +23,7 @@ import {
   samePath,
 } from './program-channels.js';
 import type { Program, ProgramKind } from './program-channels.js';
-import { programOperation, programPrepared } from './program-operations.js';
+import { programOperation } from './program-operations.js';
 export { programHandlers } from './program-operations.js';
 import { installScratch } from './storage.js';
 
@@ -237,7 +237,7 @@ export async function prepareProgram(
     [command.id],
   );
   return {
-    ...programPrepared(action === 'login' ? [command] : [command, ready]),
+    operations: action === 'login' ? [command] : [command, ready],
     targetVersion,
     ...(targetRegistry ? { targetRegistry } : {}),
   };
@@ -324,7 +324,7 @@ async function prepareClaudeInstall(
       alternatives: [target.npmOperation, ...(ctx.platform === 'win32' ? [target.cmdOperation] : [])],
     }),
   );
-  return { ...programPrepared(operations), targetVersion: release.value, targetRegistry: release.registry };
+  return { operations, targetVersion: release.value, targetRegistry: release.registry };
 }
 
 function officeAsset(ctx: Context) {
@@ -484,7 +484,7 @@ async function prepareOfficeNative(
     [{ code: 'program-user-path', detail: path.dirname(binary) }, { code: 'keep-user-data' }],
     [ready.id],
   );
-  return { ...programPrepared([...removals, deploy, ready, userPath]), targetVersion, targetBinary: binary };
+  return { operations: [...removals, deploy, ready, userPath], targetVersion, targetBinary: binary };
 }
 
 /** Claude 变更前的进程复核：枚举失败保留未知，不臆断未运行 */
@@ -563,7 +563,7 @@ async function prepareProgramRemoval(
     shouldPreserveData ? [{ code: 'keep-user-data' }] : [],
     operations.map(operation => operation.id),
   );
-  return { ...programPrepared([...operations, ready]), targetVersion: null };
+  return { operations: [...operations, ready], targetVersion: null };
 }
 
 /** 三段语义化版本比较：正值为左更新；ccline 的降级门共用 */

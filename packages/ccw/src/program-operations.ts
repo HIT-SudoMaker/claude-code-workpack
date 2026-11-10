@@ -49,9 +49,6 @@ export function programOperation(
 ): OperationDefinition {
   return { id: `${itemId}/${name}`, itemId, handler, payload: jsonObject(payload), changes, dependsOn };
 }
-export function programPrepared(operations: readonly OperationDefinition[]): Prepared {
-  return { operations, changes: operations.flatMap(operation => operation.changes) };
-}
 export function composeProgramOperations(
   prepared: Prepared,
   itemId: string,
@@ -75,7 +72,7 @@ export function composeProgramOperations(
     dependsOn: [...operation.dependsOn.map(id => ids.get(id) ?? id), ...prerequisites],
   }));
   return {
-    ...programPrepared(operations),
+    operations,
     ...(prepared.inputs
       ? {
           inputs: Object.fromEntries(

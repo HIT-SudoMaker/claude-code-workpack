@@ -3,7 +3,7 @@ export { createSettingsDomain, ENABLED_PLUGINS_KEY } from './settings.js';
 import { knownTitle } from './titles.js';
 import type { Context, Domain, Inspection, Prepared, Selection } from './model.js';
 import { prepareProgram, programs, programHandlers } from './programs.js';
-import { composeProgramOperations, programOperation, programPrepared } from './program-operations.js';
+import { composeProgramOperations, programOperation } from './program-operations.js';
 
 export function createClaudeDomain(ctx: Context): Domain {
   return {
@@ -46,15 +46,17 @@ async function prepareClaudeProgram(ctx: Context, selection: Selection): Promise
     throw new Error('program-changed');
   const operation =
     action === 'install' && program && !program.isMissing
-      ? programPrepared([
-          programOperation(
-            id,
-            'program-ready',
-            'program.ready',
-            { kind, binary: program.binary, before: programStamp, version: program.version, keep: true },
-            [{ code: 'program-kept' }],
-          ),
-        ])
+      ? {
+          operations: [
+            programOperation(
+              id,
+              'program-ready',
+              'program.ready',
+              { kind, binary: program.binary, before: programStamp, version: program.version, keep: true },
+              [{ code: 'program-kept' }],
+            ),
+          ],
+        }
       : await prepareProgram(ctx, kind, selection, program);
   if ((action !== 'install' && action !== 'reinstall') || (action === 'install' && program && !program.isMissing))
     return operation;
@@ -64,5 +66,5 @@ async function prepareClaudeProgram(ctx: Context, selection: Selection): Promise
     'defaults',
     [id + '/program-ready'],
   );
-  return programPrepared([...operation.operations, ...defaults.operations]);
+  return { operations: [...operation.operations, ...defaults.operations] };
 }

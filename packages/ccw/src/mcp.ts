@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { knownTitle } from './titles.js';
-import { applyFrozenJson, assessFrozenJson, jsonField } from './frozen-json.js';
+import { applyFrozenJson, assessFrozenJson, jsonField, jsonFingerprint as extensionDigest } from './frozen-json.js';
 import { mcpSpecs, officeIntegration } from './management-catalog.js';
 import { errorCode, isObject } from './machine.js';
 import {
@@ -29,7 +29,7 @@ import type {
   JsonObject,
 } from './model.js';
 import { hasLegacyAmircPermissions, prepareLegacyAmircDetach, legacyAmircHandlers } from './legacy-amirc.js';
-import { extensionDigest, extensionString, extensionObject, extensionPrepared } from './skill-files.js';
+import { extensionString, extensionObject } from './skill-files.js';
 import { installScratch } from './storage.js';
 
 const MCP_PROTOCOLS: Readonly<Record<string, readonly string[]>> = {
@@ -189,23 +189,25 @@ export async function prepareMcp(
   const itemId = selection.id;
   if (action === 'detach') {
     if (before[name] === undefined) throw new Error('no-connection');
-    return extensionPrepared([
-      registrationOperation(ctx, itemId, name, extensionDigest(before[name]), null, [], 'remove'),
-    ]);
+    return {
+      operations: [registrationOperation(ctx, itemId, name, extensionDigest(before[name]), null, [], 'remove')],
+    };
   }
   if (!/^[\w.:-]+$/.test(name)) throw new Error('invalid-mcp-name');
   if (!Object.hasOwn(mcpSpecs, name) && options.registration === undefined) throw new Error('not-in-update-catalog');
   if (action === 'install' && validRegistration(before[name]) && Object.keys(selection.fields ?? {}).length === 0)
-    return extensionPrepared([
-      {
-        id: `${itemId}/keep`,
-        itemId,
-        handler: 'mcp.keep',
-        payload: { name, expected: extensionDigest(before[name]) },
-        dependsOn: [],
-        changes: [{ code: 'registration-kept', detail: name }],
-      },
-    ]);
+    return {
+      operations: [
+        {
+          id: `${itemId}/keep`,
+          itemId,
+          handler: 'mcp.keep',
+          payload: { name, expected: extensionDigest(before[name]) },
+          dependsOn: [],
+          changes: [{ code: 'registration-kept', detail: name }],
+        },
+      ],
+    };
   const value = isObject(before[name]) ? before[name] : {};
   if (
     name === 'serena' &&
@@ -354,12 +356,14 @@ export async function prepareMcp(
         operations[index] = { ...operation, payload: { ...operation.payload, supersededBy: write.id } };
     }
   }
-  const result = extensionPrepared(operations);
-  return credentialMode === 'headers-input'
-    ? { ...result, inputs: { [`${itemId}/registration-save`]: { headers: JSON.stringify(value.headers) } } }
-    : credentialMode === 'input'
-      ? { ...result, inputs: { [`${itemId}/registration-save`]: { secret: selection.fields!.secret! } } }
-      : result;
+  return {
+    operations,
+    ...(credentialMode === 'headers-input'
+      ? { inputs: { [`${itemId}/registration-save`]: { headers: JSON.stringify(value.headers) } } }
+      : credentialMode === 'input'
+        ? { inputs: { [`${itemId}/registration-save`]: { secret: selection.fields!.secret! } } }
+        : {}),
+  };
 }
 
 function registrationOperation(
