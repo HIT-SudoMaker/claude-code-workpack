@@ -13,6 +13,23 @@ export const fail = () => ({ code: 1, stdout: '', failed: false });
 export const wait = (_title, work) => work(new AbortController().signal);
 /** 测试共享的固定 git 修订单（40 位十六进制） */
 export const revision = '0123456789abcdef0123456789abcdef01234567';
+/** 完整市场快照及相对插件载荷，供 Git/Claude CLI 边界 fixture 使用。 */
+export function pluginMarketplaceFiles(
+  names = ['code-simplifier', 'frontend-design', 'github', 'mcp-server-dev', 'skill-creator'],
+) {
+  return [
+    {
+      path: '.claude-plugin/marketplace.json',
+      data: Buffer.from(
+        JSON.stringify({
+          name: 'claude-plugins-official',
+          plugins: names.map(name => ({ name, source: `./plugins/${name}` })),
+        }),
+      ),
+    },
+    ...names.map(name => ({ path: `plugins/${name}/.claude-plugin/plugin.json`, data: Buffer.from('{}') })),
+  ];
+}
 /** 测试共享的无归属环境注记：不携带 commit、PR 与会话链接 */
 export const attribution = { commit: '', pr: '', sessionUrl: false };
 /** 判定路径存在性：stat 成功即存在 */

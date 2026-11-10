@@ -6,6 +6,20 @@ import fs from 'node:fs/promises';
 import { createEnv } from './env.mjs';
 import { createCcw } from '../dist/ccw.js';
 
+test('旧进程遗留 JSON 锁不阻止新实例恢复已批准配置', async t => {
+  const f = await createEnv(t, { seed: { settings: { language: 'English', custom: true } } });
+  const machine = f.machine();
+  await f.ccw(machine).plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
+  await f.write(`${f.settingsFile}.ccw-lock`, '');
+  const restarted = f.ccw(machine);
+  const recovery = await restarted.recovery();
+  const plan = await restarted.plan({ resume: recovery.id });
+  assert.equal((await restarted.apply(plan.id)).state, 'done');
+  const settings = await f.read(f.settingsFile);
+  assert.equal(settings.language, '中文');
+  assert.equal(settings.custom, true);
+});
+
 test('重建实例发现冻结的设置计划，确认前不修改目标', async t => {
   const f = await createEnv(t, { seed: { settings: { language: 'English', custom: { keep: true } } } });
   const machine = f.machine();

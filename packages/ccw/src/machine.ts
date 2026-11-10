@@ -273,8 +273,6 @@ async function prepareParent(file: string) {
 
 async function editJson(file: string, edit: (value: Record<string, unknown>) => void) {
   await prepareParent(file);
-  const lockPath = `${file}.ccw-lock`;
-  const lock = await fs.open(lockPath, 'wx', 0o600);
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
     const before = await read(file);
@@ -287,8 +285,6 @@ async function editJson(file: string, edit: (value: Record<string, unknown>) => 
     await fs.rename(temporary, file);
   } finally {
     await fs.rm(temporary, { force: true });
-    await lock.close();
-    await fs.unlink(lockPath);
   }
 }
 

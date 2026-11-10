@@ -7,7 +7,7 @@ import { createClaudeDomain, createSettingsDomain } from './claude-config.js';
 import { createCleanupDomain, prepareClaudeDataRemoval } from './cleanup.js';
 import { createMcpDomain } from './mcp.js';
 import { createPluginsDomain } from './plugins.js';
-import { createSkillsDomain } from './skills.js';
+import { createSkillsDomain, overlappingSkillSelections } from './skills.js';
 import { errorCode } from './machine.js';
 import { CLAUDE_DATA_ID, cancelled, context, defaultInstallAction, kindOf, restOf } from './model.js';
 import type {
@@ -260,6 +260,11 @@ export function createCcw(options: CcwOptions): Ccw {
             }),
           );
           for (const result of workers) if (result.status === 'rejected') throw result.reason;
+          for (const id of overlappingSkillSelections(preparationContext, sorted, work)) {
+            const index = items.findIndex(item => item.id === id);
+            items[index] = { ...items[index]!, changes: [], problem: 'overlapping-selection' };
+            work.delete(id);
+          }
           if (shouldRemoveData) {
             await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
               preparation.getStore()?.report('inspect');

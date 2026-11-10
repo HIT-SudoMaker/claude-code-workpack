@@ -111,11 +111,7 @@ export interface Context extends Omit<CcwOptions, 'machine'> {
 export interface Prepared {
   readonly writes?: readonly string[];
   readonly changes: readonly Change[];
-  readonly run?: (report: (effect: Effect) => void, signal?: AbortSignal) => Promise<void>;
-  readonly remaining?: () => Prepared | undefined;
-  readonly verify?: () => Promise<void>;
-  /** 迁移后的域只交付冻结描述；临时兼容 run 随领域迁移删除。 */
-  readonly operations?: readonly OperationDefinition[];
+  readonly operations: readonly OperationDefinition[];
   /** 仅在当前进程保留的输入；绝不写入任务记录。 */
   readonly inputs?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 }
@@ -200,49 +196,6 @@ export interface Domain {
   inspect(): Promise<Inspection>;
   prepare(selection: Selection, describe?: Describe): Promise<Prepared>;
   readonly handlers?: Readonly<Record<string, OperationHandler>>;
-}
-
-/** 顺序消费本次有限步骤；完成步骤只复核，继续不重新解析来源 */
-export function sequence(operations: readonly Prepared[]): Prepared {
-  let index = 0;
-  let active: Prepared | undefined;
-  const completed: Prepared[] = [];
-  const operation: Prepared = {
-    ...(operations.every(value => value.writes !== undefined)
-      ? { writes: [...new Set(operations.flatMap(value => value.writes ?? []))] }
-      : {}),
-    get changes() {
-      return [...(active ? [active] : operations.slice(index, index + 1)), ...operations.slice(index + 1)].flatMap(
-        value => value.changes,
-      );
-    },
-    async run(report, signal) {
-      for (const value of completed) await value.verify?.();
-      while (index < operations.length) {
-        cancelled(signal);
-        const next = active ?? operations[index];
-        if (!next) break;
-        try {
-          await next.run?.(report, signal);
-        } catch (error) {
-          active = next.remaining ? next.remaining() : next;
-          if (!active) {
-            completed.push(next);
-            index++;
-          }
-          throw error;
-        }
-        completed.push(next);
-        index++;
-        active = undefined;
-      }
-    },
-    remaining: () => (index < operations.length ? operation : undefined),
-    async verify() {
-      for (const value of completed) await value.verify?.();
-    },
-  };
-  return operation;
 }
 
 export function context(options: CcwOptions): Context {
@@ -363,57 +316,6 @@ export function cancelled(signal?: AbortSignal) {
 /** 断言值未变化；差异抛 target-changed */
 export function unchanged(value: unknown, expected: unknown) {
   if (!isDeepStrictEqual(value, expected)) throw new Error('target-changed');
-}
-
-/** 删除冻结的字段；写入后回读失败时继续确认，保留并发新增的其他字段 */
-export function removeFields(
-  ctx: Context,
-  file: string,
-  before: Record<string, unknown>,
-  changes: readonly Change[],
-  effect: Effect,
-  parent?: string,
-): Prepared {
-  let hasAttemptedWrite = false;
-  let isWritten = false;
-  let isComplete = false;
-  const absent = (values: Record<string, unknown>) => Object.keys(before).every(key => values[key] === undefined);
-  const read = async () => {
-    const document = await json(ctx.machine, file);
-    return parent === undefined ? document : object(document[parent]);
-  };
-  const verify = async () => {
-    if (!absent(await read())) throw new Error('target-changed');
-  };
-  const operation: Prepared = {
-    writes: [file],
-    get changes() {
-      return isWritten ? [{ code: 'removal-confirm' }] : changes;
-    },
-    async run(report, signal) {
-      cancelled(signal);
-      if (
-        Object.values(before).some(value => value !== undefined) &&
-        !isWritten &&
-        (!hasAttemptedWrite || !absent(await read()))
-      ) {
-        await ctx.effects.editJson(file, document => {
-          const values = parent === undefined ? document : object(document[parent]);
-          for (const [key, value] of Object.entries(before)) unchanged(values[key], value);
-          for (const key of Object.keys(before)) delete values[key];
-          if (parent !== undefined) document[parent] = values;
-          hasAttemptedWrite = true;
-        });
-        isWritten = true;
-      }
-      await verify();
-      isComplete = true;
-      report(effect);
-    },
-    remaining: () => (isComplete ? undefined : operation),
-    verify,
-  };
-  return operation;
 }
 
 /** 合并冻结字段；提交后通知，再回读确认 */

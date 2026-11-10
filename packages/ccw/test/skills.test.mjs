@@ -94,6 +94,26 @@ test('安装技能：填充空目录', async t => {
   assert.ok((await f.ccw.inspect()).items.some(item => item.id === 'skill:tdd'));
 });
 
+test('公共计划阻止技能套件与成员更新范围重叠，仍执行独立配置', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.apply({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] })).state, 'done');
+  const directory = path.join(f.claudeRoot, 'skills/tdd');
+  const before = await f.machine.treeStamp(directory);
+  const plan = await f.ccw.plan({
+    task: 'install',
+    selected: [
+      { id: 'skill-set:mattpocock' },
+      { id: 'skill:tdd', maintenance: 'update' },
+      { id: 'settings', fields: { language: '中文' } },
+    ],
+  });
+  assert.equal(plan.items.find(item => item.id === 'skill:tdd').problem, 'overlapping-selection');
+  const result = await f.ccw.apply(plan.id);
+  assert.equal(result.items.find(item => item.id === 'skill:tdd').state, 'failed');
+  assert.equal(result.items.find(item => item.id === 'settings').state, 'done');
+  assert.equal(await f.machine.treeStamp(directory), before);
+});
+
 test('重复安装技能：保护本地修改', async t => {
   const f = await fixture(t);
   const directory = path.join(f.claudeRoot, 'skills/tdd');
@@ -125,6 +145,18 @@ test('删除已装技能：阻止旧任务恢复', async t => {
   await f.ccw.abandon(stopped.remaining);
   await f.ccw.plan({ task: 'install', selected: [{ id: 'settings', fields: { language: '中文' } }] });
   await assert.rejects(f.ccw.plan({ resume: stopped.remaining }), /plan-unavailable/);
+});
+
+test('技能套件保留不同成员的所有失败原因', async t => {
+  const f = await fixture(t);
+  f.state.failReplaceTree = 'code-review';
+  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'skill-set:mattpocock' }] });
+  const first = await f.ccw.apply(plan.id);
+  await fs.rm(path.join(f.claudeRoot, 'skills/tdd'), { recursive: true });
+  const resumed = await f.ccw.plan({ resume: first.remaining });
+  const result = await f.ccw.apply(resumed.id);
+  assert.ok(result.items[0].effects.some(effect => effect.code === 'target-changed'));
+  assert.ok(result.items[0].effects.some(effect => effect.code === 'fixture-write-failed'));
 });
 
 test('删除已有技能：阻止旧安装计划', async t => {
