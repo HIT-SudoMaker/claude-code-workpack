@@ -4,6 +4,51 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { createEnv, ok, revision } from './env.mjs';
 
+test('Claude 登录与启用已有插件可共同确认，插件不会等待不存在的程序步骤', async t => {
+  const f = await createEnv(t);
+  const name = 'github@claude-plugins-official';
+  const claude = path.join(f.home, '.local/bin/claude');
+  const pluginPath = path.join(f.claudeRoot, 'plugins/cache/github');
+  await f.write(claude, 'native claude binary');
+  await f.write(path.join(f.home, '.local/share/claude/versions/2.1.311'), 'native claude binary');
+  await f.write(path.join(pluginPath, 'plugin.json'), '{}');
+  await f.json(f.settingsFile, { enabledPlugins: { [name]: false } });
+  await f.json(path.join(f.claudeRoot, 'plugins/known_marketplaces.json'), {
+    'claude-plugins-official': { source: { repo: 'anthropics/claude-plugins-official' } },
+  });
+  await f.json(path.join(f.claudeRoot, 'plugins/installed_plugins.json'), {
+    plugins: { [name]: [{ scope: 'user', installPath: pluginPath }] },
+  });
+  let enables = 0;
+  const machine = f.machine({
+    locate: async name => (name === 'claude' ? [claude] : []),
+    processes: async () => [],
+    npm: async () => ok('{}'),
+    execute: async (_file, args, _options, base) => {
+      if (args[0] === '--version') return ok('2.1.311 (Claude Code)');
+      if (args[0] === 'auth') return ok(args[1] === 'status' ? '{"loggedIn":true}' : '');
+      assert.deepEqual(args, ['plugin', 'enable', name, '--scope', 'user']);
+      enables++;
+      await base.editJson(f.settingsFile, settings => {
+        settings.enabledPlugins[name] = true;
+      });
+      return ok();
+    },
+  });
+  const ccw = f.ccw(machine, { platform: 'linux' });
+  const plan = await ccw.plan({
+    task: 'install',
+    selected: [{ id: 'claude', maintenance: 'login' }, { id: `plugin:${name}` }],
+  });
+  assert.ok(
+    plan.items.every(item => !item.problem),
+    JSON.stringify(plan),
+  );
+  assert.equal((await ccw.apply(plan.id)).state, 'done');
+  assert.equal(enables, 1);
+  assert.equal((await f.read(f.settingsFile)).enabledPlugins[name], true);
+});
+
 test('未派发技能及其等待前置步骤：重启恢复展示待执行', async t => {
   const f = await createEnv(t);
   const machine = {
@@ -270,6 +315,46 @@ test('Serena same-byte reinstall with a lost command receipt stays unknown after
   assert.equal(installs, 1);
   assert.equal(metadata, 1);
 });
+
+for (const [label, firstResult, retry] of [
+  ['returned nonzero', { code: 1, failed: false, stdout: '' }, true],
+  ['timeout', { code: 1, failed: true, stdout: '' }, false],
+  ['missing exit status', { code: null, failed: false, stdout: '' }, false],
+])
+  test(`Serena ${label}：新实例仅重试已知失败的命令`, async t => {
+    const f = await createEnv(t);
+    const uv = path.join(f.home, '.local/bin/uv.exe');
+    const serena = path.join(f.home, '.local/bin/serena.exe');
+    await f.write(uv, 'uv binary');
+    await f.write(serena, 'same serena bytes');
+    await f.json(f.stateFile, { mcpServers: { serena: { command: serena, args: ['start-mcp-server'] } } });
+    let installs = 0;
+    const machine = {
+      ...f.machine({
+        locate: async name => (name === 'uv' ? [uv] : []),
+        execute: async (file, args) => {
+          if (file === serena && args[0] === 'init') return ok();
+          assert.equal(file, uv);
+          if (args[1] === 'dir') return ok(path.dirname(serena));
+          if (args[1] === 'list') return ok('serena-agent v0.1.0\n');
+          if (args[1] === 'install') return ++installs === 1 ? firstResult : ok();
+          throw new Error('unexpected-command');
+        },
+      }),
+      fetchText: async () => JSON.stringify({ info: { version: '0.1.0' } }),
+    };
+    const first = f.ccw(machine, { platform: 'win32' });
+    const preview = await first.plan({ task: 'install', selected: [{ id: 'mcp:serena', maintenance: 'reinstall' }] });
+    assert.equal(preview.items[0].problem, null);
+    const result = await first.apply(preview.id);
+    assert.ok(result.remaining);
+    const restarted = f.ccw(machine, { platform: 'win32' });
+    const resumed = await restarted.plan({ resume: result.remaining });
+    const done = await restarted.apply(resumed.id);
+    assert.equal(installs, retry ? 2 : 1);
+    assert.equal(done.state === 'done', retry);
+    if (!retry) assert.ok(done.items[0].effects.some(effect => effect.code === 'program-installation-unconfirmed'));
+  });
 
 test('cold Serena install freezes the uv script and resumes initialization in a fresh instance', async t => {
   const f = await createEnv(t);

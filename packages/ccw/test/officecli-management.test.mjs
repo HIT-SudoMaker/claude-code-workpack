@@ -6,7 +6,7 @@ import { test } from 'node:test';
 
 import { describeItem } from '../dist/render.js';
 import { createCcw } from '../dist/ccw.js';
-import { createEnv, exists, fail, ok, releaseContract } from './env.mjs';
+import { npmConfig, createEnv, exists, fail, ok, releaseContract } from './env.mjs';
 
 const packageName = '@officecli/officecli';
 const withNpmView = npm => async (args, options) =>
@@ -22,6 +22,7 @@ async function fixture(t, { npm, read, execute, fetchText, source } = {}) {
   const skill = path.join(f.claudeRoot, 'skills', 'officecli');
   const state = { npm: false, locations: [], failUninstall: false };
   const npmHandler = async args => {
+    if (args[0] === 'config') return npmConfig(args);
     if (args[0] === 'root') return ok(npmRoot);
     if (args[0] === 'ls')
       return ok(

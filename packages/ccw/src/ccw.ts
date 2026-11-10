@@ -266,7 +266,10 @@ export function createCcw(options: CcwOptions): Ccw {
             work.delete(id);
           }
           const claudePrerequisites = sorted
-            .filter(selection => kindOf(selection.id) === 'claude' && selection.action !== 'uninstall')
+            .filter(
+              selection =>
+                kindOf(selection.id) === 'claude' && ['install', 'update', 'reinstall'].includes(selection.action),
+            )
             .map(selection => `${selection.id}/program-ready`);
           for (const [id, prepared] of work) {
             const needsClaude = (operation: Prepared['operations'][number]) =>

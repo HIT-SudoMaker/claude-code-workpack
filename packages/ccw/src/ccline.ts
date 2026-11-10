@@ -7,7 +7,7 @@ import { parse } from 'smol-toml';
 import { knownTitle } from './titles.js';
 import { ENABLED_PLUGINS_KEY } from './claude-config.js';
 import { errorCode, isObject, READ_COMMAND_TIMEOUT_MS, succeeded } from './machine.js';
-import { cancelled, json } from './model.js';
+import { cancelled, commandReceipt, json } from './model.js';
 import type {
   Action,
   Change,
@@ -425,10 +425,7 @@ export function createCcline(options: Context): Domain {
             );
         const result = await effects.npm(args);
         const failure = p.removed ? 'npm-uninstall-failed' : 'npm-install-failed';
-        const receipt: NonNullable<OperationFact['receipt']> =
-          result.failed || result.code === null
-            ? { kind: 'unknown', failure }
-            : { kind: 'returned', failure: succeeded(result) ? null : failure };
+        const receipt = commandReceipt(result, failure);
         const completed =
           !p.removed && succeeded(result) ? [{ state: 'done' as const, code: 'package-command-completed' }] : [];
         try {

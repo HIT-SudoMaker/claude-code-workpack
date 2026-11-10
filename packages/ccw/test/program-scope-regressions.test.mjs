@@ -4,7 +4,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
-import { createEnv, exists, ok, pluginMarketplaceFiles, revision } from './env.mjs';
+import { npmConfig, createEnv, exists, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 const packageName = '@anthropic-ai/claude-code';
 
@@ -43,6 +43,7 @@ async function fixture(t, platform = 'win32') {
     processes: async () => [],
     npm: async args => {
       if (state.npmReplaced) throw new Error('npm-changed');
+      if (args[0] === 'config') return npmConfig(args);
       const prefix = args.find(value => value.startsWith('--prefix='))?.slice('--prefix='.length);
       const selectedRoot =
         prefix === undefined

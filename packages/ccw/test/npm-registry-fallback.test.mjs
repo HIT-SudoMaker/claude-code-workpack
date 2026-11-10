@@ -102,12 +102,12 @@ test('回退 npm 镜像并冻结安装来源', async t => {
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null, MIRROR],
+    [OFFICIAL, MIRROR],
   );
   assert.equal((await ccw.apply(plan.id)).state, 'done');
   assert.ok(npmOf(f, 'install').some(call => registryOf(call.args) === MIRROR));
   assert.equal(
-    f.calls.some(call => call.kind === 'npm' && call.target === 'config'),
+    f.calls.some(call => call.kind === 'npm' && call.target === 'config' && call.args[1] !== 'get'),
     false,
     'CCW 不得改写用户的 npm registry 配置',
   );
@@ -216,7 +216,7 @@ test('回退官方 npm 来源：限时单次安装', async t => {
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
   assert.deepEqual(
     npmOf(f, 'view').map(call => registryOf(call.args)),
-    [null, MIRROR],
+    [OFFICIAL, MIRROR],
   );
   assert.deepEqual(fetches, [{ url: `${OFFICIAL}/@anthropic-ai%2Fclaude-code/stable`, options: { timeoutMs: 5_000 } }]);
   assert.equal((await ccw.apply(plan.id)).state, 'done');

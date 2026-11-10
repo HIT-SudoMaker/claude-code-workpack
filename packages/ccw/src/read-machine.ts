@@ -82,6 +82,12 @@ function isObservationCommand(file: string, args: readonly string[]): boolean {
 }
 
 function isNpmObservation(args: readonly string[]): boolean {
+  if (args[0] === 'config')
+    return (
+      args.length === 3 &&
+      args[1] === 'get' &&
+      (args[2] === 'registry' || /^@[a-z0-9._-]+:registry$/i.test(args[2] ?? ''))
+    );
   return (
     (args[0] === 'view' || args[0] === 'ls' || args[0] === 'root') &&
     !args.some(arg => arg === '--' || /^--(?:globalconfig|userconfig|script-shell|cache|logfile)(?:=|$)/.test(arg))

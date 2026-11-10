@@ -32,11 +32,18 @@ const originalMachine = createMachine();
 const machine = {
   ...createMachine(),
   async npm(args) {
+    if (args[0] === 'config') {
+      assert.deepEqual(args.slice(0, 2), ['config', 'get']);
+      assert.ok(args.length === 3 && ['registry', '@cometix:registry'].includes(args[2]));
+      return { code: 0, failed: false, stdout: args[2] === 'registry' ? 'https://registry.npmjs.org' : 'undefined' };
+    }
     const prefix = args.find(arg => arg.startsWith('--prefix='))?.slice('--prefix='.length);
     if (prefix !== undefined) assert.equal(prefix, npmPrefix);
     if (args[0] === 'root') return { code: 0, failed: false, stdout: npmRoot };
     if (args[0] === 'install') {
       assert.equal(prefix, npmPrefix);
+      assert.ok(args.includes('--registry=https://registry.npmjs.org'));
+      assert.ok(args.includes('--@cometix:registry=https://registry.npmjs.org'));
       await fs.mkdir(npmRoot, { recursive: true });
       await fs.mkdir(cclineRoot, { recursive: true });
       await fs.writeFile(binary, 'isolated fixture');

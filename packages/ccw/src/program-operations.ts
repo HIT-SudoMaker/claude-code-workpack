@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { errorCode, isObject, succeeded } from './machine.js';
 import type { CommandResult } from './machine.js';
-import { cancelled, claudeEnvironment, claudeRunning } from './model.js';
+import { cancelled, claudeEnvironment, claudeRunning, commandReceipt } from './model.js';
 import type {
   Assessment,
   Change,
@@ -97,8 +97,6 @@ const complete = (evidence: JsonObject, effects?: readonly Effect[]): Assessment
 const unknown = (problem = 'program-installation-unconfirmed'): Assessment => ({ state: 'unknown', problem });
 const blocked = (problem: string): Assessment => ({ state: 'blocked', problem });
 const returned = (failure: string | null = null): OperationFact['receipt'] & {} => ({ kind: 'returned', failure });
-const receipt = (result: CommandResult, failure: string): NonNullable<OperationFact['receipt']> =>
-  result.failed || result.code === null ? { kind: 'unknown', failure } : returned(succeeded(result) ? null : failure);
 const issued = (fact: OperationFact) => fact.attemptId !== undefined;
 const success = (fact: OperationFact) => fact.receipt?.kind === 'returned' && fact.receipt.failure === null;
 function isJson(value: unknown): value is Json {
@@ -247,7 +245,7 @@ async function outcome(
   let result: NonNullable<OperationFact['receipt']>;
   try {
     const response = await effect();
-    result = response === undefined ? returned() : receipt(response, failure);
+    result = response === undefined ? returned() : commandReceipt(response, failure);
   } catch (error) {
     result = { kind: 'unknown', failure: errorCode(error) };
   }

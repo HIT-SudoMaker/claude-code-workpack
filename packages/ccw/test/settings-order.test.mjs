@@ -5,7 +5,7 @@ import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
 import { createMachine } from '../dist/machine.js';
-import { createEnv, fail, ok, pluginMarketplaceFiles, revision } from './env.mjs';
+import { npmConfig, createEnv, fail, ok, pluginMarketplaceFiles, revision } from './env.mjs';
 
 async function fixture(t, { before = {}, platform = 'win32', inheritedKeys = [], hasProgram = false } = {}) {
   const f = await createEnv(t, { layout: 'root', seed: { settings: before } });
@@ -764,6 +764,7 @@ test('保存 Claude 配置失败：保留就绪程序', async t => {
   const base = createMachine({}, f.root);
   const programMachine = f.machine({
     npm: async args => {
+      if (args[0] === 'config') return npmConfig(args);
       const last = args.at(-1);
       if (args[0] === 'root') return ok(npmRoot);
       if (args[0] === 'ls')

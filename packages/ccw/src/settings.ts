@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { knownTitle } from './titles.js';
 import { isObject } from './machine.js';
-import { apiConfigurationProblem, json, object, success } from './model.js';
+import { apiConfigurationProblem, commandReceipt, json, object, success } from './model.js';
 import type {
   Context,
   Domain,
@@ -448,7 +448,7 @@ function settingsHandlers(ctx: Context): Readonly<Record<string, OperationHandle
       },
       async execute() {
         const result = await claudeCommand(ctx, ['auth', 'login'], true);
-        return { receipt: { kind: 'returned', failure: result.failed || result.code !== 0 ? 'login-failed' : null } };
+        return { receipt: commandReceipt(result, 'login-failed') };
       },
     },
   };
