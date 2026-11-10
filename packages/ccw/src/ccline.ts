@@ -7,8 +7,22 @@ import { parse } from 'smol-toml';
 import { knownTitle } from './titles.js';
 import { ENABLED_PLUGINS_KEY } from './claude-config.js';
 import { errorCode, isObject, READ_COMMAND_TIMEOUT_MS, succeeded } from './machine.js';
-import { cancelled, json, removeFields, sequence } from './model.js';
-import type { Action, Context, Inspection, Item, Prepared, Selection } from './model.js';
+import { cancelled, json } from './model.js';
+import type {
+  Action,
+  Change,
+  Context,
+  Domain,
+  Inspection,
+  Item,
+  Prepared,
+  Selection,
+  JsonObject,
+  Json,
+  OperationDefinition,
+  OperationFact,
+  OperationHandler,
+} from './model.js';
 import {
   isExactVersion,
   NPM_ENABLE_SCRIPTS,
@@ -18,7 +32,8 @@ import {
 } from './npm-registry.js';
 import type { NpmRegistry } from './npm-registry.js';
 import { compareVersions } from './programs.js';
-import { freezeNpmScope, npmVersion, samePath } from './program-channels.js';
+import { freezeNpmScope, npmVersion, samePath, verifyNpmScope } from './program-channels.js';
+import type { FrozenNpmScope } from './program-channels.js';
 
 interface Observation {
   readonly version: string | null;
@@ -27,6 +42,98 @@ interface Observation {
   readonly fields: Record<string, unknown>;
   readonly hasCompanionPlugin: boolean;
   readonly npmProblem: string | null;
+}
+interface ConnectionPayload {
+  readonly selected: readonly string[];
+  readonly before: Record<string, unknown>;
+  readonly after: Record<string, unknown>;
+  readonly homeBefore: unknown;
+  readonly homeAfter: unknown;
+  readonly configureHome: boolean;
+  readonly shouldConnect: boolean;
+  readonly successor: string | null;
+}
+interface PackagePayload {
+  readonly scope: FrozenNpmScope | null;
+  readonly before: string | null;
+  readonly target: string | null;
+  readonly binary: string | null;
+  readonly action: string;
+  readonly registry: NpmRegistry;
+  readonly mutate: boolean;
+  readonly removed: boolean;
+}
+const nullableString = (value: unknown): value is string | null => value === null || typeof value === 'string';
+const strings = (value: unknown): value is readonly string[] =>
+  Array.isArray(value) && value.every(entry => typeof entry === 'string');
+function isScope(value: unknown): value is FrozenNpmScope {
+  return (
+    isObject(value) &&
+    typeof value.npmRoot === 'string' &&
+    typeof value.canonical === 'string' &&
+    strings(value.args) &&
+    isObject(value.identity) &&
+    typeof value.identity.entry === 'string' &&
+    typeof value.identity.binary === 'string' &&
+    typeof value.identity.stamp === 'string'
+  );
+}
+function scopeOf(definition: OperationDefinition): FrozenNpmScope | null {
+  const value = definition.payload.scope;
+  if (value === null || isScope(value)) return value;
+  throw new Error('operation-record-invalid');
+}
+function connectionPayload(definition: OperationDefinition): ConnectionPayload {
+  const value = definition.payload;
+  const valid = (value: unknown): value is ConnectionPayload =>
+    isObject(value) &&
+    strings(value.selected) &&
+    isObject(value.before) &&
+    isObject(value.after) &&
+    typeof value.configureHome === 'boolean' &&
+    typeof value.shouldConnect === 'boolean' &&
+    nullableString(value.successor) &&
+    Object.hasOwn(value, 'homeBefore') &&
+    Object.hasOwn(value, 'homeAfter');
+  if (!valid(value)) throw new Error('operation-record-invalid');
+  return value;
+}
+function packagePayload(definition: OperationDefinition): PackagePayload {
+  const value = definition.payload;
+  const valid = (value: unknown): value is PackagePayload =>
+    isObject(value) &&
+    (value.scope === null || isScope(value.scope)) &&
+    nullableString(value.before) &&
+    nullableString(value.target) &&
+    nullableString(value.binary) &&
+    typeof value.action === 'string' &&
+    nullableString(value.registry) &&
+    typeof value.mutate === 'boolean' &&
+    typeof value.removed === 'boolean';
+  if (!valid(value)) throw new Error('operation-record-invalid');
+  return value;
+}
+function textField(payload: JsonObject, field: string): string {
+  const value = payload[field];
+  if (typeof value !== 'string') throw new Error('operation-record-invalid');
+  return value;
+}
+function jsonValue(value: unknown): Json {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  )
+    return value;
+  if (Array.isArray(value)) return value.map(jsonValue);
+  if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, jsonValue(child)]));
+  throw new Error('operation-record-invalid');
+}
+function serial(value: unknown): JsonObject {
+  const encoded: unknown = JSON.parse(JSON.stringify(value));
+  if (!isObject(encoded)) throw new Error('operation-record-invalid');
+  return Object.fromEntries(Object.entries(encoded).map(([key, child]) => [key, jsonValue(child)]));
 }
 
 const PACKAGE = '@cometix/ccline';
@@ -38,14 +145,12 @@ const CCLINE_IDENTITY = /^(?:ccline|ccometixline) \d+\.\d+\.\d+(?:[-+][\w.-]+)?\
 const CCLINE_BINARY_VERSION = /^(?:ccline|ccometixline) (2\.\d+\.\d+)\s*$/i;
 
 /** 准备 CCometixLine 变更；计划消费与执行互斥由调用方 CCW 统一管理 */
-export function createCcline(options: Context) {
+export function createCcline(options: Context): Domain {
   const { machine, effects } = options;
   /** ccline 固定落点：不受 CCLINE_HOME 影响 */
   const defaultCclineDirectory = path.join(options.home, '.claude', 'ccline');
   const binaryFile = path.join(defaultCclineDirectory, options.platform === 'win32' ? 'ccline.exe' : 'ccline');
   const settingsFile = options.settingsFile;
-  // 保留重装中断后的接入模板，供重新准备恢复用户设置
-  let resumeTemplates: Record<string, unknown> | undefined;
 
   function cclineDirectory(fields: Record<string, unknown>) {
     const configured = fields.cclineHome;
@@ -110,80 +215,6 @@ export function createCcline(options: Context) {
     if (!isObject(config) || config.version !== 2) throw new Error('appearance-migration-required');
   }
 
-  function connectionChange(observed: Observation, shouldConnect: boolean, templates?: Record<string, unknown>) {
-    const selected = shouldConnect
-      ? ['statusLine', ...(isCcline(templates?.subagentStatusLine) ? ['subagentStatusLine'] : [])]
-      : FIELDS.filter(field => isCcline(observed.fields[field]));
-    const before = Object.fromEntries(selected.map(field => [field, observed.fields[field]]));
-    const cclineHome = observed.fields.cclineHome;
-    const appearanceRoot = shouldConnect ? cclineDirectory(observed.fields) : undefined;
-    const shouldConfigureHome =
-      appearanceRoot !== undefined && !samePath(options, appearanceRoot, defaultCclineDirectory);
-    const values = Object.fromEntries(
-      selected.map(field => {
-        const template = templates?.[field];
-        const previous = isObject(template) ? template : isObject(before[field]) ? before[field] : {};
-        return [
-          field,
-          shouldConnect
-            ? {
-                ...previous,
-                type: 'command',
-                command: 'ccline',
-                padding: typeof previous.padding === 'number' ? previous.padding : 0,
-              }
-            : undefined,
-        ];
-      }),
-    );
-    let isWritten = false;
-    const verify = async () => {
-      if (!selected.length) return;
-      const value = await json(machine, settingsFile);
-      if (
-        selected.some(field =>
-          shouldConnect ? !isDeepStrictEqual(value[field], values[field]) : isCcline(value[field]),
-        )
-      )
-        throw new Error('connection-not-applied');
-      if (
-        shouldConnect &&
-        !isDeepStrictEqual(
-          isObject(value.env) ? value.env.CCLINE_HOME : undefined,
-          shouldConfigureHome ? appearanceRoot : cclineHome,
-        )
-      )
-        throw new Error('connection-changed');
-    };
-    return {
-      get isWritten() {
-        return isWritten;
-      },
-      verify,
-      async run(written: (hasChanged: boolean) => void) {
-        if (!isWritten) {
-          if (selected.length)
-            await effects.editJson(settingsFile, settings => {
-              if (shouldConnect) {
-                const environment = settings.env === undefined ? {} : settings.env;
-                if (!isObject(environment)) throw new Error('invalid-settings');
-                if (!isDeepStrictEqual(environment.CCLINE_HOME, cclineHome)) throw new Error('connection-changed');
-                if (shouldConfigureHome) settings.env = { ...environment, CCLINE_HOME: appearanceRoot };
-              }
-              for (const field of selected) {
-                if (!isDeepStrictEqual(settings[field], before[field])) throw new Error('connection-changed');
-                if (shouldConnect) settings[field] = values[field];
-                else delete settings[field];
-              }
-            });
-          isWritten = true;
-          written(selected.length > 0);
-        }
-        await verify();
-      },
-    };
-  }
-
   async function binaryAtHome() {
     const canonical = await machine.realpath(binaryFile);
     return canonical !== null && samePath(options, canonical, binaryFile);
@@ -198,6 +229,340 @@ export function createCcline(options: Context) {
       return false;
     }
   }
+
+  const define = (
+    suffix: string,
+    handler: string,
+    payload: JsonObject,
+    changes: readonly Change[] = [],
+    dependsOn: readonly string[] = [],
+  ): OperationDefinition => ({
+    id: 'ccline/' + suffix,
+    itemId: 'ccline',
+    handler,
+    payload,
+    changes,
+    dependsOn,
+    writes:
+      handler === 'ccline.connection'
+        ? [settingsFile]
+        : typeof payload.file === 'string'
+          ? [payload.file]
+          : [binaryFile],
+  });
+  const fieldsAt = async () => (await observe(false, false)).fields;
+  function connectionDefinition(
+    observed: Observation,
+    shouldConnect: boolean,
+    templates: Record<string, unknown>,
+    suffix: string,
+    dependsOn: readonly string[],
+    successor: string | null = null,
+    changes: readonly Change[] = [],
+  ) {
+    const selected = shouldConnect
+      ? ['statusLine', ...(isCcline(templates.subagentStatusLine) ? ['subagentStatusLine'] : [])]
+      : FIELDS.filter(field => isCcline(observed.fields[field]));
+    const before = Object.fromEntries(
+      selected.filter(field => observed.fields[field] !== undefined).map(field => [field, observed.fields[field]]),
+    );
+    const after = shouldConnect
+      ? Object.fromEntries(
+          selected.map(field => {
+            const previous = isObject(templates[field]) ? templates[field] : {};
+            return [
+              field,
+              {
+                ...previous,
+                type: 'command',
+                command: 'ccline',
+                padding: typeof previous.padding === 'number' ? previous.padding : 0,
+              },
+            ];
+          }),
+        )
+      : {};
+    const homeBefore = observed.fields.cclineHome ?? null;
+    const configureHome = shouldConnect && !samePath(options, cclineDirectory(templates), defaultCclineDirectory);
+    const homeAfter = configureHome ? cclineDirectory(templates) : homeBefore;
+    return define(
+      suffix,
+      'ccline.connection',
+      serial({
+        selected,
+        before,
+        after,
+        homeBefore,
+        homeAfter,
+        configureHome,
+        shouldConnect,
+        successor,
+      }),
+      changes,
+      dependsOn,
+    );
+  }
+  const knownFailure = (fact: OperationFact) => fact.receipt?.kind === 'returned' && fact.receipt.failure !== null;
+  const pendingOrFailed = (fact: OperationFact) => !fact.attemptId || knownFailure(fact);
+  const handlers: Readonly<Record<string, OperationHandler>> = {
+    'ccline.connection': {
+      async assess(definition, fact, facts) {
+        const p = connectionPayload(definition);
+        const current = await fieldsAt();
+        if (!p.shouldConnect && p.successor && fact.confirmed && facts[p.successor]?.attemptId)
+          return { state: 'complete', evidence: { superseded: true } };
+        const matched =
+          p.selected.every(
+            field =>
+              isDeepStrictEqual(current[field], p.after[field]) ||
+              (!p.shouldConnect && fact.confirmed && !isCcline(current[field])),
+          ) &&
+          (!p.shouldConnect || isDeepStrictEqual(current.cclineHome ?? null, p.homeAfter));
+        if (matched)
+          return {
+            state: 'complete',
+            evidence: { matched: true },
+            effects: [
+              {
+                state: p.selected.length ? 'done' : 'kept',
+                code: p.shouldConnect ? 'connected' : p.selected.length ? 'disconnected' : 'no-connection',
+              },
+            ],
+          };
+        if (
+          fact.confirmed ||
+          !p.selected.every(field => isDeepStrictEqual(current[field], p.before[field])) ||
+          (p.shouldConnect && !isDeepStrictEqual(current.cclineHome ?? null, p.homeBefore))
+        )
+          return { state: 'unknown', problem: 'connection-changed' };
+        return { state: 'ready' };
+      },
+      async execute(definition) {
+        const p = connectionPayload(definition);
+        await effects.editJson(settingsFile, settings => {
+          for (const field of p.selected) {
+            if (!isDeepStrictEqual(settings[field], p.before[field])) throw new Error('connection-changed');
+            if (p.shouldConnect) settings[field] = p.after[field];
+            else delete settings[field];
+          }
+          if (p.shouldConnect) {
+            const env = settings.env === undefined ? {} : settings.env;
+            if (!isObject(env)) throw new Error('invalid-settings');
+            if (!isDeepStrictEqual(env.CCLINE_HOME ?? null, p.homeBefore)) throw new Error('connection-changed');
+            if (p.configureHome) settings.env = { ...env, CCLINE_HOME: p.homeAfter };
+          }
+        });
+        return { receipt: { kind: 'returned', failure: null } };
+      },
+    },
+    'ccline.package': {
+      async assess(definition, fact) {
+        const p = packagePayload(definition);
+        if (p.scope) await verifyNpmScope(options, p.scope);
+        let version: string | null;
+        let binary: string | null;
+        try {
+          version = await packageVersion(p.scope?.npmRoot);
+          binary = await machine.fingerprint(binaryFile);
+        } catch (error) {
+          throw new Error(p.removed ? 'program-removal-unconfirmed' : 'program-installation-unconfirmed', {
+            cause: error,
+          });
+        }
+        if (p.removed && version === null)
+          return {
+            state: 'complete',
+            evidence: { absent: true },
+            effects: [{ state: 'done', code: 'package-removed', detail: PACKAGE }],
+          };
+        if (!p.removed && !p.mutate) {
+          if (version !== p.target || binary !== p.binary) throw new Error('program-changed');
+          return { state: 'complete', evidence: { binary, reused: true } };
+        }
+        if (!p.removed && fact.receipt?.kind === 'returned' && fact.receipt.failure === null) {
+          if (fact.evidence?.binary === undefined)
+            return { state: 'unknown', problem: 'program-installation-unconfirmed' };
+          if (binary !== fact.evidence.binary) throw new Error('program-changed');
+          if (version !== p.target || binary === null) throw new Error('program-not-ready');
+          return {
+            state: 'complete',
+            evidence: { binary },
+            effects: [{ state: 'done', code: 'package-command-completed' }],
+          };
+        }
+        if (fact.confirmed) return { state: 'unknown', problem: 'program-changed' };
+        if (version !== p.before || binary !== p.binary)
+          return { state: 'unknown', problem: p.removed ? 'program-changed' : 'program-installation-unconfirmed' };
+        if (!pendingOrFailed(fact))
+          return {
+            state: 'unknown',
+            problem: p.removed ? 'program-removal-unconfirmed' : 'program-installation-unconfirmed',
+          };
+        return { state: 'ready', dispatch: { binary, version } };
+      },
+      async execute(definition, _fact, _inputs, signal) {
+        const p = packagePayload(definition);
+        cancelled(signal);
+        if (p.scope) await verifyNpmScope(options, p.scope);
+        if (
+          (await packageVersion(p.scope?.npmRoot)) !== p.before ||
+          (await machine.fingerprint(binaryFile)) !== p.binary
+        )
+          throw new Error('program-changed');
+        const args = p.removed
+          ? npmUninstallArgs(['uninstall', '-g', ...(p.scope?.args ?? []), '--ignore-scripts', PACKAGE])
+          : npmInstallArgs(
+              [
+                'install',
+                '-g',
+                ...(p.scope?.args ?? []),
+                ...(p.action === 'reinstall' ? ['--force'] : []),
+                ...NPM_ENABLE_SCRIPTS,
+                PACKAGE + '@' + p.target,
+              ],
+              p.registry,
+            );
+        const result = await effects.npm(args);
+        const failure = p.removed ? 'npm-uninstall-failed' : 'npm-install-failed';
+        const receipt: NonNullable<OperationFact['receipt']> =
+          result.failed || result.code === null
+            ? { kind: 'unknown', failure }
+            : { kind: 'returned', failure: succeeded(result) ? null : failure };
+        const completed =
+          !p.removed && succeeded(result) ? [{ state: 'done' as const, code: 'package-command-completed' }] : [];
+        try {
+          return { receipt, evidence: { binary: await machine.fingerprint(binaryFile) }, effects: completed };
+        } catch {
+          return { receipt, effects: completed };
+        }
+      },
+    },
+    'ccline.appearance': {
+      async assess(definition, fact) {
+        if (definition.payload.preserve)
+          return {
+            state: 'complete',
+            evidence: { preserved: true },
+            effects: [{ state: 'kept', code: 'appearance-kept' }],
+          };
+        const p = definition.payload;
+        const file = textField(p, 'file');
+        const after = textField(p, 'after');
+        const current = await machine.read(file);
+        if (current === after)
+          return {
+            state: 'complete',
+            evidence: { matched: true },
+            effects: [
+              {
+                state: p.before === null ? 'done' : 'kept',
+                code: p.before === null ? 'appearance-copied' : 'appearance-kept',
+              },
+            ],
+          };
+        if (fact.confirmed || current !== p.before) return { state: 'unknown', problem: 'appearance-changed' };
+        return { state: 'ready' };
+      },
+      async execute(definition) {
+        const p = definition.payload;
+        if (!(await effects.initialize(textField(p, 'file'), textField(p, 'after'))))
+          throw new Error('appearance-changed');
+        return { receipt: { kind: 'returned', failure: null } };
+      },
+    },
+    'ccline.binary-remove': {
+      async assess(definition, fact) {
+        const current = await machine.fingerprint(binaryFile);
+        if (current === null)
+          return {
+            state: 'complete',
+            evidence: { absent: true },
+            effects: [{ state: 'done', code: 'program-removed', detail: binaryFile }],
+          };
+        if (fact.confirmed || current !== definition.payload.binary || !(await binaryAtHome()))
+          return { state: 'unknown', problem: 'program-changed' };
+        if (!pendingOrFailed(fact)) return { state: 'unknown', problem: 'program-removal-unconfirmed' };
+        return { state: 'ready' };
+      },
+      async execute(definition) {
+        if (!(await binaryAtHome())) throw new Error('program-changed');
+        await effects.remove(binaryFile, textField(definition.payload, 'binary'));
+        return { receipt: { kind: 'returned', failure: null } };
+      },
+    },
+    'ccline.uninstall-guard': {
+      async assess(definition, fact, facts) {
+        const p = definition.payload;
+        if (fact.confirmed && (facts['ccline/package']?.attemptId || facts['ccline/binary-remove']?.attemptId))
+          return { state: 'complete', evidence: { superseded: true } };
+        const scope = scopeOf(definition);
+        if (scope) await verifyNpmScope(options, scope);
+        if (scope && (await packageVersion(scope.npmRoot)) !== p.version) throw new Error('program-changed');
+        if (p.hasFileObservation && (await machine.fingerprint(binaryFile)) !== p.binary)
+          throw new Error('program-changed');
+        return {
+          state: 'complete',
+          evidence: { matched: true },
+          effects: [
+            { state: 'kept', code: 'appearance-kept' },
+            { state: 'kept', code: 'keep-user-data' },
+            ...(p.binary !== null && !p.removeBinary
+              ? [{ state: 'kept' as const, code: 'unrecognized-program-kept', detail: binaryFile }]
+              : []),
+          ],
+        };
+      },
+      execute: () => Promise.reject(new Error('read-only-operation')),
+    },
+    'ccline.program-ready': {
+      async assess(definition, _fact, facts) {
+        const p = definition.payload;
+        const scope = scopeOf(definition);
+        if (scope) await verifyNpmScope(options, scope);
+        const binary = await machine.fingerprint(binaryFile);
+        if (p.removed) {
+          if (scope && (await packageVersion(scope.npmRoot)) !== null) throw new Error('program-still-installed');
+          if (p.removeBinary && binary !== null) throw new Error('program-changed');
+          const current = await fieldsAt();
+          if (FIELDS.some(field => isCcline(current[field]))) throw new Error('connection-changed');
+          if (p.problem !== null && p.problem !== 'npm-not-found') throw new Error('program-removal-unconfirmed');
+          const copies = [];
+          for (const file of await machine.locate('ccline'))
+            if ((await machine.realpath(file)) !== null) copies.push(file);
+          return {
+            state: 'complete',
+            evidence: { absent: true },
+            effects: [
+              { state: 'kept', code: 'appearance-kept' },
+              { state: 'kept', code: 'keep-user-data' },
+              ...(p.problem === 'npm-not-found' ? [{ state: 'kept' as const, code: 'npm-not-found' }] : []),
+              ...(p.binary !== null && !p.removeBinary
+                ? [{ state: 'kept' as const, code: 'unrecognized-program-kept', detail: binaryFile }]
+                : []),
+              ...(p.binary === null && p.version === null
+                ? [{ state: 'kept' as const, code: 'program-not-installed' }]
+                : []),
+              ...(copies.length
+                ? [{ state: 'kept' as const, code: 'program-other-copies-kept', detail: copies.join('\n') }]
+                : []),
+              ...(p.companion
+                ? [{ state: 'kept' as const, code: 'ccline-companion-kept', detail: COMPANION_PLUGIN }]
+                : []),
+            ],
+          };
+        }
+        const expected = scope ? facts['ccline/package']?.evidence?.binary : p.binary;
+        if (binary === null || binary !== expected) throw new Error('program-changed');
+        if (scope && (await packageVersion(scope.npmRoot)) !== p.target) throw new Error('program-not-ready');
+        const version = await machine.execute(binaryFile, ['--version'], { timeoutMs: READ_COMMAND_TIMEOUT_MS });
+        const found = CCLINE_BINARY_VERSION.exec(version.stdout.trim())?.[1];
+        if (!succeeded(version) || found === undefined || (scope && found !== p.target))
+          throw new Error('binary-version-mismatch');
+        return { state: 'complete', evidence: { binary }, effects: [{ state: 'done', code: 'program-ready' }] };
+      },
+      execute: () => Promise.reject(new Error('read-only-operation')),
+    },
+  };
 
   async function prepareUninstall(): Promise<Prepared> {
     let observed: Observation;
@@ -216,170 +581,96 @@ export function createCcline(options: Context) {
       throw new Error(
         programProblem ?? (observed.binary === null ? 'program-not-installed' : 'manual-program-preserved'),
       );
-    const npmScope = observed.version === null ? null : await freezeNpmScope(options);
-    const disconnection = connectionChange(observed, false);
-    let isDetached = false;
-    // 尝试证据与删除进度是正交事实：npm 命令可能连带删除二进制，包确认删除后因果证据仍被消费
-    let hasAttemptedPackageRemoval = false;
-    let isPackageRemoved = observed.version === null;
-    let hasAttemptedBinaryRemoval = false;
-    let isBinaryRemoved = !shouldRemoveBinary;
-    let isComplete = false;
-    const changes = () => [
-      ...(!isDetached && FIELDS.some(field => isCcline(observed.fields[field]))
-        ? [{ code: 'ccline-disconnect-before-uninstall', detail: settingsFile }]
-        : []),
-      ...(!isPackageRemoved ? [{ code: 'program-uninstall', detail: `CCometixLine · npm · ${observed.version}` }] : []),
-      ...(!isBinaryRemoved
-        ? [{ code: 'program-uninstall', detail: binaryFile }]
-        : !shouldRemoveBinary && observed.binary !== null
-          ? [{ code: 'unrecognized-program-kept', detail: binaryFile }]
-          : []),
-      ...(programProblem !== null
-        ? [
-            {
-              code: programProblem === 'npm-not-found' ? 'npm-not-found' : 'program-removal-unconfirmed',
-              detail: programProblem,
-            },
-          ]
-        : observed.version === null && !shouldRemoveBinary
-          ? [{ code: 'program-not-installed' }]
-          : []),
-      { code: 'keep-user-data' },
-      { code: 'appearance-kept' },
-      ...(observed.hasCompanionPlugin ? [{ code: 'ccline-companion-kept', detail: COMPANION_PLUGIN }] : []),
+    const scope = observed.version === null ? null : (await freezeNpmScope(options)).data;
+    const operations: OperationDefinition[] = [
+      define(
+        'uninstall-guard',
+        'ccline.uninstall-guard',
+        serial({
+          scope,
+          version: observed.version,
+          binary: observed.binary,
+          hasFileObservation,
+          removeBinary: shouldRemoveBinary,
+        }),
+      ),
+      connectionDefinition(
+        observed,
+        false,
+        {},
+        'detach',
+        ['ccline/uninstall-guard'],
+        null,
+        FIELDS.some(field => isCcline(observed.fields[field]))
+          ? [{ code: 'ccline-disconnect-before-uninstall', detail: settingsFile }]
+          : [],
+      ),
     ];
-    async function verifyPackage(expected: string | null) {
-      await npmScope?.verify();
-      if ((await packageVersion(npmScope?.npmRoot)) !== expected) throw new Error('program-changed');
-    }
-    async function verifyConnection() {
-      const current = await observe(false, false);
-      for (const field of FIELDS) {
-        if (
-          isDetached
-            ? isCcline(current.fields[field])
-            : isCcline(observed.fields[field])
-              ? !isDeepStrictEqual(current.fields[field], observed.fields[field])
-              : isCcline(current.fields[field])
-        )
-          throw new Error('connection-changed');
-      }
-    }
-    async function verifyRemoved() {
-      await verifyConnection();
-      if (observed.version !== null) await verifyPackage(null);
-      if (shouldRemoveBinary && (await machine.fingerprint(binaryFile)) !== null) throw new Error('program-changed');
-    }
-    const operation: Prepared = {
-      get changes() {
-        return changes();
-      },
-      async run(report, signal) {
-        cancelled(signal);
-        await verifyConnection();
-        if (hasAttemptedPackageRemoval && !isPackageRemoved) {
-          await npmScope?.verify();
-          const current = await packageVersion(npmScope?.npmRoot);
-          if (current === null) {
-            isPackageRemoved = true;
-            report({ state: 'done', code: 'package-removed', detail: PACKAGE });
-          } else if (current !== observed.version) throw new Error('program-changed');
-        }
-        if (!isPackageRemoved) await verifyPackage(observed.version);
-        else if (observed.version !== null) await verifyPackage(null);
-        if (hasFileObservation) {
-          const current = await machine.fingerprint(binaryFile);
-          if (
-            (hasAttemptedPackageRemoval || hasAttemptedBinaryRemoval) &&
-            shouldRemoveBinary &&
-            !isBinaryRemoved &&
-            current === null
-          ) {
-            isBinaryRemoved = true;
-            report({ state: 'done', code: 'program-removed', detail: binaryFile });
-          } else if (current !== (isBinaryRemoved && shouldRemoveBinary ? null : observed.binary))
-            throw new Error('program-changed');
-          if (shouldRemoveBinary && !isBinaryRemoved && !(await binaryAtHome())) throw new Error('program-changed');
-        }
-        if (!isDetached) {
-          await disconnection.run(hasChanged => {
-            isDetached = true;
-            resumeTemplates = undefined;
-            report({ state: hasChanged ? 'done' : 'kept', code: hasChanged ? 'disconnected' : 'no-connection' });
-          });
-        }
-        cancelled(signal);
-        if (!isPackageRemoved) {
-          await verifyConnection();
-          if (
-            (await machine.fingerprint(binaryFile)) !== observed.binary ||
-            (shouldRemoveBinary && !(await binaryAtHome()))
-          )
-            throw new Error('program-changed');
-          hasAttemptedPackageRemoval = true;
-          const result = await effects.npm(
-            npmUninstallArgs(['uninstall', '-g', ...(npmScope?.args ?? []), '--ignore-scripts', PACKAGE]),
-          );
-          let after: string | null;
-          try {
-            await npmScope?.verify();
-            after = await packageVersion(npmScope?.npmRoot);
-          } catch (error) {
-            throw new Error('program-removal-unconfirmed', { cause: error });
-          }
-          if (after !== null) throw new Error(succeeded(result) ? 'program-still-installed' : 'npm-uninstall-failed');
-          isPackageRemoved = true;
-          report({ state: 'done', code: 'package-removed', detail: PACKAGE });
-          if (shouldRemoveBinary && (await machine.fingerprint(binaryFile)) === null) {
-            isBinaryRemoved = true;
-            report({ state: 'done', code: 'program-removed', detail: binaryFile });
-          }
-        }
-        cancelled(signal);
-        if (!isBinaryRemoved) {
-          await verifyConnection();
-          if (observed.binary === null) throw new Error('program-changed');
-          hasAttemptedBinaryRemoval = true;
-          try {
-            await effects.remove(binaryFile, observed.binary);
-          } catch (error) {
-            if ((await machine.fingerprint(binaryFile)) !== null) throw error;
-          }
-          if ((await machine.fingerprint(binaryFile)) !== null) throw new Error('program-removal-unconfirmed');
-          isBinaryRemoved = true;
-          report({ state: 'done', code: 'program-removed', detail: binaryFile });
-        }
-        cancelled(signal);
-        await verifyRemoved();
-        if (programProblem === 'npm-not-found') report({ state: 'kept', code: 'npm-not-found' });
-        else if (
-          programProblem === null &&
-          observed.version === null &&
-          !shouldRemoveBinary &&
-          observed.binary === null
-        )
-          report({ state: 'kept', code: 'program-not-installed' });
-        if (observed.binary !== null && !shouldRemoveBinary)
-          report({ state: 'kept', code: 'unrecognized-program-kept', detail: binaryFile });
-        const copies = [];
-        for (const file of await machine.locate('ccline'))
-          if ((await machine.realpath(file)) !== null) copies.push(file);
-        if (copies.length) report({ state: 'kept', code: 'program-other-copies-kept', detail: copies.join('\n') });
-        report({ state: 'kept', code: 'appearance-kept' });
-        report({ state: 'kept', code: 'keep-user-data' });
-        isComplete = true;
-        if (programProblem !== null && programProblem !== 'npm-not-found') {
-          report({ state: 'failed', code: 'program-removal-unconfirmed', detail: programProblem });
-          throw new Error('program-removal-unconfirmed');
-        }
-      },
-      remaining: () => (isComplete ? undefined : operation),
-      verify: verifyRemoved,
-    };
-    return operation;
+    if (scope)
+      operations.push(
+        define(
+          'package',
+          'ccline.package',
+          serial({
+            scope,
+            before: observed.version,
+            target: null,
+            binary: observed.binary,
+            action: 'uninstall',
+            registry: null,
+            mutate: true,
+            removed: true,
+          }),
+          [{ code: 'program-uninstall', detail: 'CCometixLine · npm · ' + observed.version }],
+          ['ccline/detach'],
+        ),
+      );
+    if (shouldRemoveBinary)
+      operations.push(
+        define(
+          'binary-remove',
+          'ccline.binary-remove',
+          { binary: observed.binary },
+          [{ code: 'program-uninstall', detail: binaryFile }],
+          [scope ? 'ccline/package' : 'ccline/detach'],
+        ),
+      );
+    operations.push(
+      define(
+        'program-ready',
+        'ccline.program-ready',
+        serial({
+          scope,
+          removed: true,
+          removeBinary: shouldRemoveBinary,
+          binary: observed.binary,
+          version: observed.version,
+          problem: programProblem,
+          companion: observed.hasCompanionPlugin,
+        }),
+        [
+          ...(!shouldRemoveBinary && observed.binary !== null
+            ? [{ code: 'unrecognized-program-kept', detail: binaryFile }]
+            : []),
+          ...(programProblem !== null
+            ? [
+                {
+                  code: programProblem === 'npm-not-found' ? 'npm-not-found' : 'program-removal-unconfirmed',
+                  detail: programProblem,
+                },
+              ]
+            : observed.version === null && !shouldRemoveBinary
+              ? [{ code: 'program-not-installed' }]
+              : []),
+          { code: 'keep-user-data' },
+          { code: 'appearance-kept' },
+          ...(observed.hasCompanionPlugin ? [{ code: 'ccline-companion-kept', detail: COMPANION_PLUGIN }] : []),
+        ],
+        operations.map(value => value.id),
+      ),
+    );
+    return { operations, changes: operations.flatMap(value => value.changes) };
   }
-
   async function inspectItem(): Promise<Item> {
     // 全量探测失败才降级只读探测
     let observed: Observation | null = null;
@@ -438,51 +729,40 @@ export function createCcline(options: Context) {
   }
 
   return {
+    handlers,
     async inspect(): Promise<Inspection> {
       return { items: [await inspectItem()], problems: [] };
     },
+
     async prepare(selection: Selection): Promise<Prepared> {
       if (selection.id !== 'ccline') throw new Error('unknown-selection');
       let action = selection.action;
       if (action === 'uninstall') return prepareUninstall();
       if (action === 'install' && (await machine.fingerprint(binaryFile)) !== null) action = 'connect';
-      if (
-        action !== 'install' &&
-        action !== 'connect' &&
-        action !== 'update' &&
-        action !== 'reinstall' &&
-        action !== 'detach'
-      )
+      if (!['install', 'connect', 'update', 'reinstall', 'detach'].includes(action))
         throw new Error('action-unavailable');
-      let release = '2.0.1';
-      let releaseRegistry: NpmRegistry = null;
       const observed = await observe(action !== 'detach' && action !== 'connect', action !== 'detach');
       if (observed.npmProblem !== null) throw new Error(observed.npmProblem);
-      if (action === 'detach' && !FIELDS.some(field => isCcline(observed.fields[field])))
-        throw new Error('no-connection');
       if (action === 'detach') {
-        resumeTemplates = undefined;
-        return removeFields(
-          options,
-          settingsFile,
-          Object.fromEntries(
-            FIELDS.filter(field => isCcline(observed.fields[field])).map(field => [field, observed.fields[field]]),
-          ),
-          [{ code: 'ccline-detach', detail: settingsFile }, { code: 'appearance-kept' }],
-          { state: 'done', code: 'disconnected' },
-        );
+        if (!FIELDS.some(field => isCcline(observed.fields[field]))) throw new Error('no-connection');
+        const operation = connectionDefinition(observed, false, {}, 'detach', [], null, [
+          { code: 'ccline-detach', detail: settingsFile },
+          { code: 'appearance-kept' },
+        ]);
+        return { operations: [operation], changes: operation.changes };
       }
-      const npmScope = action === 'connect' ? null : await freezeNpmScope(options);
-      if (npmScope !== null && (await packageVersion(npmScope.npmRoot)) !== observed.version)
-        throw new Error('program-changed');
+      const scope = action === 'connect' ? null : (await freezeNpmScope(options)).data;
+      if (scope && (await packageVersion(scope.npmRoot)) !== observed.version) throw new Error('program-changed');
+      let release = '2.0.1';
+      let registry: NpmRegistry = null;
       if (action !== 'connect') {
-        const resolved = await resolveNpmView(machine, `${PACKAGE}@latest`, 'version', value =>
+        const resolved = await resolveNpmView(machine, PACKAGE + '@latest', 'version', value =>
           isExactVersion(value) ? value : null,
         );
         if (resolved === null) throw new Error('source-unavailable');
         release = resolved.value;
+        registry = resolved.registry;
         if (!/^2\.\d+\.\d+$/.test(release)) throw new Error('unsupported-ccline-release');
-        releaseRegistry = resolved.registry;
         noDowngrade(observed.version, release);
       }
       if (observed.appearance !== null) validateAppearance(observed.appearance);
@@ -490,166 +770,116 @@ export function createCcline(options: Context) {
       if ((action === 'install' || action === 'reinstall') && observed.binary !== null && observed.version === null)
         throw new Error('manual-program-preserved');
       if (action === 'connect' && observed.binary === null) throw new Error('program-not-ready');
-      const shouldRestoreSubagent =
-        isCcline(resumeTemplates?.subagentStatusLine) ||
-        (action === 'reinstall' && isCcline(observed.fields.subagentStatusLine));
-      const connectionTemplates = {
-        ...resumeTemplates,
-        ...Object.fromEntries(Object.entries(observed.fields).filter(([, value]) => value !== undefined)),
-      };
-      const disconnection = action === 'reinstall' ? connectionChange(observed, false) : undefined;
-      let isCommandCompleted = false;
-      let commandStamp: string | null | undefined;
-      let programStamp = observed.binary;
-      const program: Prepared = {
-        get changes() {
-          return [
-            action === 'connect'
-              ? { code: 'ccline-program-kept', detail: binaryFile }
-              : isCommandCompleted
-                ? { code: 'program-installation-confirm', detail: binaryFile }
-                : { code: action === 'update' ? 'ccline-program-update' : 'ccline-program-prepare', detail: release },
-            ...(disconnection && !disconnection.isWritten
-              ? [{ code: 'ccline-reinstall-connection', detail: settingsFile }]
-              : []),
-          ];
-        },
-        async run(report, signal) {
-          cancelled(signal);
-          await npmScope?.verify();
-          if (isCommandCompleted) {
-            if (commandStamp === undefined) throw new Error('program-installation-unconfirmed');
-            if ((await machine.fingerprint(binaryFile)) !== commandStamp) throw new Error('program-changed');
-          } else if (
-            (action !== 'connect' && (await packageVersion(npmScope?.npmRoot)) !== observed.version) ||
-            (await machine.fingerprint(binaryFile)) !== observed.binary
-          )
-            throw new Error('program-changed');
-          if (!isCommandCompleted && disconnection)
-            await disconnection.run(hasChanged => {
-              resumeTemplates = connectionTemplates;
-              for (const field of FIELDS) if (isCcline(observed.fields[field])) observed.fields[field] = undefined;
-              report({ state: hasChanged ? 'done' : 'kept', code: hasChanged ? 'disconnected' : 'no-connection' });
-            });
-          cancelled(signal);
-          if (
-            !isCommandCompleted &&
-            action !== 'connect' &&
-            (action === 'reinstall' || action === 'update' || observed.version !== release || observed.binary === null)
-          ) {
-            const args = npmInstallArgs(
-              [
-                'install',
-                '-g',
-                ...(npmScope?.args ?? []),
-                ...(action === 'reinstall' ? ['--force'] : []),
-                ...NPM_ENABLE_SCRIPTS,
-                `${PACKAGE}@${release}`,
-              ],
-              releaseRegistry,
-            );
-            const installed = await effects.npm(args);
-            if (!succeeded(installed)) throw new Error('npm-install-failed');
-            isCommandCompleted = true;
-            report({ state: 'done', code: 'package-command-completed' });
-            try {
-              commandStamp = await machine.fingerprint(binaryFile);
-            } catch (error) {
-              throw new Error('program-installation-unconfirmed', { cause: error });
-            }
-          }
-          await npmScope?.verify();
-          if (
-            (action !== 'connect' && (await packageVersion(npmScope?.npmRoot)) !== release) ||
-            (await machine.fingerprint(binaryFile)) === null
-          )
-            throw new Error('program-not-ready');
-          const versionSignal = signal?.aborted ? undefined : signal;
-          const version = await machine.execute(binaryFile, ['--version'], {
-            timeoutMs: READ_COMMAND_TIMEOUT_MS,
-            ...(versionSignal ? { signal: versionSignal } : {}),
-          });
-          if (versionSignal?.aborted) cancelled(signal);
-          const binaryVersion = CCLINE_BINARY_VERSION.exec(version.stdout.trim())?.[1];
-          if (!succeeded(version) || binaryVersion === undefined || (action !== 'connect' && binaryVersion !== release))
-            throw new Error('binary-version-mismatch');
-          programStamp = await machine.fingerprint(binaryFile);
-          report({ state: 'done', code: 'program-ready' });
-        },
-        async verify() {
-          await npmScope?.verify();
-          if ((await machine.fingerprint(binaryFile)) !== programStamp) throw new Error('program-changed');
-        },
-      };
-      const operations: Prepared[] = [program];
-      if (action === 'update')
-        operations.push({
-          changes: [{ code: 'ccline-settings-kept' }],
-          run: report => Promise.resolve(report({ state: 'kept', code: 'appearance-kept' })),
-        });
-      else {
-        const styleFile = path.join(cclineDirectory(observed.fields), 'config.toml');
-        let appearanceText = observed.appearance;
-        let isAppearanceWritten = false;
-        const verifyAppearance = async () => {
-          if ((await machine.read(styleFile)) !== appearanceText) throw new Error('appearance-changed');
-        };
-        operations.push({
-          changes: [
-            observed.appearance === null ? { code: 'appearance-copy', detail: styleFile } : { code: 'appearance-kept' },
-          ],
-          async run(report) {
-            const existing = await machine.read(styleFile);
-            if (existing !== (isAppearanceWritten ? appearanceText : observed.appearance))
-              throw new Error('appearance-changed');
-            if (existing === null) {
-              const asset = await machine.read(ASSET);
-              if (asset === null) throw new Error('asset-missing');
-              validateAppearance(asset);
-              if (!(await effects.initialize(styleFile, asset))) throw new Error('appearance-changed');
-              isAppearanceWritten = true;
-              appearanceText = asset;
-              report({ state: 'done', code: 'appearance-copied' });
-            } else if (!isAppearanceWritten) report({ state: 'kept', code: 'appearance-kept' });
-            await verifyAppearance();
-          },
-          verify: verifyAppearance,
-        });
-        let connection: ReturnType<typeof connectionChange> | undefined;
-        operations.push({
-          changes: [
-            ...(shouldRestoreSubagent ? [{ code: 'ccline-subagent-restore', detail: settingsFile }] : []),
+      const templates = observed.fields;
+      const detachedFields = { ...observed.fields };
+      if (action === 'reinstall')
+        for (const field of FIELDS) if (isCcline(detachedFields[field])) delete detachedFields[field];
+      const operations: OperationDefinition[] = [];
+      const programChanges: Change[] = [
+        action === 'connect'
+          ? { code: 'ccline-program-kept', detail: binaryFile }
+          : { code: action === 'update' ? 'ccline-program-update' : 'ccline-program-prepare', detail: release },
+        ...(action === 'reinstall' ? [{ code: 'ccline-reinstall-connection', detail: settingsFile }] : []),
+      ];
+      if (action === 'reinstall')
+        operations.push(connectionDefinition(observed, false, {}, 'detach', [], 'ccline/connection'));
+      if (scope)
+        operations.push(
+          define(
+            'package',
+            'ccline.package',
+            serial({
+              scope,
+              before: observed.version,
+              target: release,
+              binary: observed.binary,
+              action,
+              registry,
+              removed: false,
+              mutate:
+                action === 'reinstall' ||
+                action === 'update' ||
+                observed.version !== release ||
+                observed.binary === null,
+            }),
+            programChanges,
+            action === 'reinstall' ? ['ccline/detach'] : [],
+          ),
+        );
+      operations.push(
+        define(
+          'program-ready',
+          'ccline.program-ready',
+          serial({
+            scope,
+            removed: false,
+            binary: observed.binary,
+            target: release,
+          }),
+          action === 'connect' ? programChanges : [],
+          scope ? ['ccline/package'] : [],
+        ),
+      );
+      if (action === 'update') {
+        operations.push(
+          define(
+            'appearance',
+            'ccline.appearance',
             {
-              code:
-                observed.fields.statusLine !== undefined && !isCcline(observed.fields.statusLine)
-                  ? 'ccline-statusline-replace'
-                  : 'ccline-connect',
-              detail: settingsFile,
+              file: path.join(cclineDirectory(observed.fields), 'config.toml'),
+              before: observed.appearance,
+              after: observed.appearance,
+              preserve: true,
             },
-            ...(!samePath(options, cclineDirectory(observed.fields), defaultCclineDirectory)
-              ? [{ code: 'ccline-root-configure', detail: cclineDirectory(observed.fields) }]
-              : []),
-          ],
-          async run(report) {
-            connection ??= connectionChange(observed, true, connectionTemplates);
-            await connection.run(() => report({ state: 'done', code: 'connected' }));
-            resumeTemplates = undefined;
-          },
-          async verify() {
-            await connection?.verify();
-          },
-        });
+            [{ code: 'ccline-settings-kept' }],
+            ['ccline/program-ready'],
+          ),
+        );
+      } else {
+        const styleFile = path.join(cclineDirectory(observed.fields), 'config.toml');
+        const appearanceText = observed.appearance ?? (await machine.read(ASSET));
+        if (appearanceText === null) throw new Error('asset-missing');
+        validateAppearance(appearanceText);
+        operations.push(
+          define(
+            'appearance',
+            'ccline.appearance',
+            { file: styleFile, before: observed.appearance, after: appearanceText },
+            [
+              observed.appearance === null
+                ? { code: 'appearance-copy', detail: styleFile }
+                : { code: 'appearance-kept' },
+            ],
+            ['ccline/program-ready'],
+          ),
+        );
+        operations.push(
+          connectionDefinition(
+            { ...observed, fields: detachedFields },
+            true,
+            templates,
+            'connection',
+            ['ccline/program-ready', 'ccline/appearance'],
+            null,
+            [
+              ...(isCcline(templates.subagentStatusLine) && action === 'reinstall'
+                ? [{ code: 'ccline-subagent-restore', detail: settingsFile }]
+                : []),
+              {
+                code:
+                  observed.fields.statusLine !== undefined && !isCcline(observed.fields.statusLine)
+                    ? 'ccline-statusline-replace'
+                    : 'ccline-connect',
+                detail: settingsFile,
+              },
+              ...(!samePath(options, cclineDirectory(templates), defaultCclineDirectory)
+                ? [{ code: 'ccline-root-configure', detail: cclineDirectory(templates) }]
+                : []),
+            ],
+          ),
+        );
       }
-      const steps = sequence(operations);
-      const operation: Prepared = {
-        ...steps,
-        get changes() {
-          return steps.changes;
-        },
-        remaining: () =>
-          isCommandCompleted && commandStamp === undefined ? undefined : steps.remaining?.() ? operation : undefined,
-      };
-      return operation;
+      return { operations, changes: operations.flatMap(value => value.changes) };
     },
   };
 }

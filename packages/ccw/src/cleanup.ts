@@ -1,14 +1,23 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { DATA_CATEGORY_KEYS, knownTitle } from './titles.js';
 import type { DataCategory } from './titles.js';
-import { errorCode } from './machine.js';
+import { errorCode, isObject } from './machine.js';
 import { cancelled, claudeRunning, normalizePath, restOf } from './model.js';
-import type { Change, Context, Domain, Item, Prepared } from './model.js';
+import type {
+  Change,
+  Context,
+  Domain,
+  Item,
+  Prepared,
+  OperationDefinition,
+  OperationFact,
+  OperationHandler,
+  JsonObject,
+} from './model.js';
 
 const CATEGORIES = DATA_CATEGORY_KEYS;
-/** 删除循环内周期复核 Claude 进程：删除可能跨越进程启动 */
-const PROCESS_RECHECK_INTERVAL_MS = 1_000;
 type Category = DataCategory;
 
 /** 清理结果仍有保留（新增、再生或共享链接）时标题须警示：清理承诺删除所选数据，保留是异常；
@@ -167,6 +176,7 @@ async function candidates(ctx: Context, selected?: Category): Promise<Record<Cat
 /** 创建清理域渠道：检查数组归一为聚合，余段即数据类别，clean 是唯一动作 */
 export function createCleanupDomain(ctx: Context): Domain {
   return {
+    handlers: cleanupHandlers(ctx),
     async inspect() {
       return { items: await inspectCleanup(ctx), problems: [] };
     },
@@ -194,94 +204,254 @@ async function inspectCleanup(ctx: Context): Promise<Item[]> {
   });
 }
 
+interface RemovalTarget {
+  readonly file: string;
+  readonly kind: 'file' | 'directory';
+}
+interface RemovalPayload extends RemovalTarget {
+  readonly wholeRoot: boolean;
+  readonly present: boolean;
+  readonly stamp: string | null;
+}
+function removalPayload(definition: OperationDefinition): RemovalPayload {
+  const value = definition.payload;
+  const valid = (value: unknown): value is RemovalPayload =>
+    isObject(value) &&
+    typeof value.file === 'string' &&
+    (value.kind === 'file' || value.kind === 'directory') &&
+    typeof value.wholeRoot === 'boolean' &&
+    typeof value.present === 'boolean' &&
+    (value.stamp === null || typeof value.stamp === 'string');
+  if (!valid(value)) throw new Error('operation-record-invalid');
+  return value;
+}
+function textField(payload: JsonObject, key: string): string {
+  const value = payload[key];
+  if (typeof value !== 'string') throw new Error('operation-record-invalid');
+  return value;
+}
+const targetId = (file: string) => createHash('sha256').update(file).digest('hex').slice(0, 20);
+const operation = (
+  itemId: string,
+  suffix: string,
+  handler: string,
+  payload: JsonObject,
+  changes: readonly Change[] = [],
+  dependsOn: readonly string[] = [],
+): OperationDefinition => ({
+  id: itemId + '/' + suffix,
+  itemId,
+  handler,
+  payload,
+  changes,
+  dependsOn,
+  writes: typeof payload.file === 'string' ? [payload.file] : [],
+});
+
+/** Scope and target kind are checked on every assessment, including after a restart. */
+async function checkTarget(ctx: Context, target: RemovalTarget) {
+  const normalize = (file: string) => normalizePath(ctx.platform, file);
+  if (!path.isAbsolute(target.file)) throw new Error('invalid-data-root');
+  if (ctx.platform === 'win32' && /^[\\/]{2}/.test(target.file)) throw new Error('cleanup-network-root');
+  const parent = path.dirname(target.file);
+  const canonicalParent = await ctx.machine.realpath(parent);
+  const canonical = await ctx.machine.realpath(target.file);
+  if (
+    (canonicalParent !== null && normalize(canonicalParent) !== normalize(parent)) ||
+    (canonical !== null && normalize(canonical) !== normalize(target.file))
+  )
+    throw new Error('linked-parent');
+  const entry = (await ctx.machine.entries(parent)).find(
+    value => normalize(path.join(parent, value.name)) === normalize(target.file),
+  );
+  if (entry && entry.kind !== target.kind) throw new Error('cleanup-type-changed');
+  return entry !== undefined;
+}
+async function checkProcess(ctx: Context, wholeRoot = false, signal?: AbortSignal) {
+  cancelled(signal);
+  const running = await claudeRunning(ctx.machine, signal);
+  cancelled(signal);
+  if (running !== false)
+    throw new Error(wholeRoot ? (running ? 'claude-running' : 'process-state-unconfirmed') : 'claude-may-be-running');
+}
+const canRetryRemoval = (fact: OperationFact) =>
+  !fact.attemptId || (fact.receipt?.kind === 'returned' && fact.receipt.failure !== null);
+
+function cleanupHandlers(ctx: Context): Readonly<Record<string, OperationHandler>> {
+  return {
+    'cleanup.remove': {
+      async assess(definition, fact) {
+        const { file, kind, wholeRoot, present, stamp } = removalPayload(definition);
+        await checkTarget(ctx, { file, kind });
+        const current = await ctx.machine.treeStamp(file);
+        if ((fact.confirmed || fact.evidence?.absent === true) && current !== null) {
+          if (wholeRoot) return { state: 'unknown', problem: 'target-changed' };
+          return {
+            state: 'complete',
+            evidence: { preserved: true },
+            effects: [{ state: 'kept', code: RESIDUE_REGENERATED, detail: file }],
+          };
+        }
+        if (current === null)
+          return {
+            state: 'complete',
+            evidence: { absent: true },
+            effects: [
+              {
+                state: fact.attemptId ? 'done' : 'kept',
+                code: fact.attemptId ? (wholeRoot ? 'claude-data-removed' : 'data-file-removed') : 'data-file-absent',
+                detail: file,
+              },
+            ],
+          };
+        if (!present) return { state: 'unknown', problem: 'target-changed' };
+        const expected = fact.dispatch?.stamp ?? stamp;
+        if (expected !== null && current !== expected) return { state: 'unknown', problem: 'target-changed' };
+        await checkProcess(ctx, wholeRoot);
+        if (!canRetryRemoval(fact)) return { state: 'unknown', problem: 'removal-unconfirmed' };
+        return { state: 'ready', dispatch: { stamp: current } };
+      },
+      async execute(definition, fact, _inputs, signal) {
+        const { file, kind, wholeRoot } = removalPayload(definition);
+        await checkProcess(ctx, wholeRoot, signal);
+        await checkTarget(ctx, { file, kind });
+        const stamp = fact.dispatch?.stamp;
+        if (typeof stamp !== 'string') throw new Error('target-changed');
+        try {
+          if (wholeRoot && kind === 'file') await ctx.effects.remove(file, stamp);
+          else await ctx.effects.removeTree(file, stamp);
+          return {
+            receipt: { kind: 'returned', failure: null },
+            evidence: { absent: true },
+            effects: [{ state: 'done', code: wholeRoot ? 'claude-data-removed' : 'data-file-removed', detail: file }],
+          };
+        } catch (error) {
+          return { receipt: { kind: 'unknown', failure: errorCode(error) } };
+        }
+      },
+    },
+    'cleanup.empty-directory': {
+      async assess(definition, fact) {
+        const file = textField(definition.payload, 'file');
+        const exists = await checkTarget(ctx, { file, kind: 'directory' });
+        if (!exists || fact.confirmed) return { state: 'complete', evidence: { absent: !exists } };
+        if ((await ctx.machine.entries(file)).length) return { state: 'complete', evidence: { preserved: true } };
+        await checkProcess(ctx);
+        if (!canRetryRemoval(fact)) return { state: 'unknown', problem: 'removal-unconfirmed' };
+        return { state: 'ready' };
+      },
+      async execute(definition, _fact, _inputs, signal) {
+        await checkProcess(ctx, false, signal);
+        await checkTarget(ctx, { file: textField(definition.payload, 'file'), kind: 'directory' });
+        await ctx.effects.removeEmptyDirectory(textField(definition.payload, 'file'));
+        return { receipt: { kind: 'returned', failure: null } };
+      },
+    },
+    'cleanup.verify': {
+      async assess(definition) {
+        const category = textField(definition.payload, 'category');
+        if (!isCategory(category)) throw new Error('operation-record-invalid');
+        await checkProcess(ctx);
+        const inventory = (await candidates(ctx, category))[category];
+        if (inventory.problems.length) throw new Error('cleanup-inspection-incomplete');
+        return {
+          state: 'complete',
+          evidence: { checked: true },
+          effects: [
+            { state: 'done', code: 'data-selected-cleared', detail: textField(definition.payload, 'size') },
+            ...inventory.preserved.map(value => ({ state: 'kept' as const, ...value })),
+            ...(inventory.files.length
+              ? [{ state: 'kept' as const, code: RESIDUE_REGENERATED, detail: size(inventory.files) }]
+              : []),
+            ...(definition.payload.empty ? [{ state: 'kept' as const, code: 'no-data' }] : []),
+          ],
+        };
+      },
+      execute: () => Promise.reject(new Error('read-only-operation')),
+    },
+    'cleanup.claude-verify': {
+      async assess(definition) {
+        await checkProcess(ctx, true);
+        const targets = definition.payload.targets;
+        if (!Array.isArray(targets) || !targets.every(value => typeof value === 'string'))
+          throw new Error('operation-record-invalid');
+        for (const file of targets) if ((await ctx.machine.treeStamp(file)) !== null) throw new Error('target-changed');
+        return {
+          state: 'complete',
+          evidence: { absent: true },
+          effects: [{ state: 'done', code: 'claude-data-cleared' }],
+        };
+      },
+      execute: () => Promise.reject(new Error('read-only-operation')),
+    },
+  };
+}
+
 async function prepareCleanup(ctx: Context, category: string): Promise<Prepared> {
   if (!isCategory(category)) throw new Error('invalid-data-category');
   const inventory = (await candidates(ctx, category))[category];
   if (inventory.problems.length) throw new Error('cleanup-inspection-incomplete');
   const files: Candidate[] = [];
-  const { directories } = inventory;
   for (const file of inventory.files) {
     const stamp = await ctx.machine.fingerprint(file.file);
     if (stamp !== null) files.push({ ...file, stamp });
   }
-  let index = 0;
-  let directoryIndex = 0;
-  let isComplete = false;
-  const removed: Candidate[] = [];
-  const operation: Prepared = {
-    get changes() {
-      return [
-        { code: 'data-delete', detail: `${knownTitle(`data:${category}`)} · ${size(files.slice(index))}` },
-        { code: 'data-clean-root', detail: ctx.claudeRoot },
-        { code: 'no-recovery' },
-        { code: 'keep-settings-credentials' },
-        ...(category === 'runtime' ? [{ code: 'data-runtime-impact' }] : []),
-        ...inventory.preserved,
-        ...(directories.length > directoryIndex
-          ? [{ code: 'data-empty-directories', detail: `${directories.length - directoryIndex}` }]
-          : []),
-      ];
-    },
-    async run(report, signal) {
-      let checkedAtMs = 0;
-      const checkProcess = async () => {
-        cancelled(signal);
-        const isClaudeRunning = await claudeRunning(ctx.machine, signal);
-        cancelled(signal);
-        if (isClaudeRunning !== false) throw new Error('claude-may-be-running');
-        checkedAtMs = performance.now();
-      };
-      await checkProcess();
-      while (index < files.length) {
-        cancelled(signal);
-        if (performance.now() - checkedAtMs >= PROCESS_RECHECK_INTERVAL_MS) await checkProcess();
-        const file = files[index];
-        if (!file) break;
-        if ((await ctx.machine.treeStamp(file.file, signal)) === null) {
-          index++;
-          report({ state: 'kept', code: 'data-file-absent', detail: file.file });
-          continue;
-        }
-        try {
-          await ctx.effects.removeTree(file.file, file.stamp);
-        } catch (error) {
-          if ((await ctx.machine.treeStamp(file.file, signal)) !== null) throw error;
-        }
-        removed.push(file);
-        index++;
-        report({ state: 'done', code: 'data-file-removed', detail: file.file });
-      }
-      while (directoryIndex < directories.length) {
-        cancelled(signal);
-        if (performance.now() - checkedAtMs >= PROCESS_RECHECK_INTERVAL_MS) await checkProcess();
-        const directory = directories[directoryIndex];
-        if (!directory) break;
-        await ctx.effects.removeEmptyDirectory(directory);
-        directoryIndex++;
-      }
-      cancelled(signal);
-      const remaining = (await candidates(ctx, category))[category];
-      if (remaining.problems.length) {
-        for (const problem of remaining.problems) report({ state: 'kept', ...problem });
-        throw new Error('cleanup-inspection-incomplete');
-      }
-      await checkProcess();
-      isComplete = true;
-      report({ state: 'done', code: 'data-selected-cleared', detail: size(removed) });
-      for (const preserved of remaining.preserved) report({ state: 'kept', ...preserved });
-      if (remaining.files.length) report({ state: 'kept', code: RESIDUE_REGENERATED, detail: size(remaining.files) });
-      if (files.length === 0 && directories.length === 0) report({ state: 'kept', code: 'no-data' });
-    },
-    remaining: () => (isComplete ? undefined : operation),
-  };
-  return operation;
+  const itemId = 'data:' + category;
+  const changes: Change[] = [
+    { code: 'data-delete', detail: knownTitle(itemId) + ' · ' + size(files) },
+    { code: 'data-clean-root', detail: ctx.claudeRoot },
+    { code: 'no-recovery' },
+    { code: 'keep-settings-credentials' },
+    ...(category === 'runtime' ? [{ code: 'data-runtime-impact' }] : []),
+    ...inventory.preserved,
+    ...(inventory.directories.length
+      ? [{ code: 'data-empty-directories', detail: String(inventory.directories.length) }]
+      : []),
+  ];
+  const operations = files.map(file =>
+    operation(itemId, 'file-' + targetId(file.file), 'cleanup.remove', {
+      file: file.file,
+      kind: 'file',
+      stamp: file.stamp,
+      present: true,
+      wholeRoot: false,
+    }),
+  );
+  for (const file of inventory.directories)
+    operations.push(
+      operation(
+        itemId,
+        'directory-' + targetId(file),
+        'cleanup.empty-directory',
+        { file },
+        [],
+        operations
+          .filter(value => typeof value.payload.file === 'string' && value.payload.file.startsWith(file + path.sep))
+          .map(value => value.id),
+      ),
+    );
+  operations.push(
+    operation(
+      itemId,
+      'verified',
+      'cleanup.verify',
+      {
+        category,
+        size: size(files),
+        empty: files.length === 0 && inventory.directories.length === 0,
+      },
+      changes,
+      operations.map(value => value.id),
+    ),
+  );
+  return { changes, operations };
 }
 
-/** 删除明确选择的整个配置根；首次删除读取当前内容，继续只处理原目标并保护已删路径的重建 */
-export async function prepareClaudeDataRemoval(ctx: Context, verifyPrograms: () => Promise<void>): Promise<Prepared> {
+/** Dependencies are the frozen absence checks for every selected Claude program. */
+export async function prepareClaudeDataRemoval(ctx: Context, dependencies: readonly string[]): Promise<Prepared> {
   const normalize = (file: string) => normalizePath(ctx.platform, file);
   const contains = (directory: string, file: string) =>
-    normalize(file) === normalize(directory) || normalize(file).startsWith(`${normalize(directory)}${path.sep}`);
+    normalize(file) === normalize(directory) || normalize(file).startsWith(normalize(directory) + path.sep);
   if (
     contains(ctx.claudeRoot, ctx.home) ||
     contains(ctx.claudeRoot, ctx.storage) ||
@@ -293,112 +463,39 @@ export async function prepareClaudeDataRemoval(ctx: Context, verifyPrograms: () 
     normalize(ctx.stateFile) !== normalize(path.join(ctx.home, '.claude.json'))
   )
     throw new Error('invalid-data-root');
-  const targets = [
-    { file: ctx.claudeRoot, kind: 'directory' as const },
+  const targets: RemovalTarget[] = [
+    { file: ctx.claudeRoot, kind: 'directory' },
     ...(!contains(ctx.claudeRoot, ctx.stateFile) ? [{ file: ctx.stateFile, kind: 'file' as const }] : []),
   ];
-  const checkTarget = async (target: (typeof targets)[number]) => {
-    if (!path.isAbsolute(target.file)) throw new Error('invalid-data-root');
-    if (ctx.platform === 'win32' && /^[\\/]{2}/.test(target.file)) throw new Error('cleanup-network-root');
-    const parent = await ctx.machine.realpath(path.dirname(target.file));
-    const real = await ctx.machine.realpath(target.file);
-    if (
-      (parent !== null && normalize(parent) !== normalize(path.dirname(target.file))) ||
-      (real !== null && normalize(real) !== normalize(target.file))
-    )
-      throw new Error('linked-parent');
-    const entry = (await ctx.machine.entries(path.dirname(target.file))).find(
-      value => normalize(path.join(path.dirname(target.file), value.name)) === normalize(target.file),
+  await checkProcess(ctx, true);
+  const operations: OperationDefinition[] = [];
+  for (const target of targets)
+    operations.push(
+      operation(
+        'data:claude',
+        targetId(target.file),
+        'cleanup.remove',
+        {
+          ...target,
+          present: await checkTarget(ctx, target),
+          wholeRoot: true,
+          stamp: null,
+        },
+        [{ code: target.kind === 'directory' ? 'claude-data-remove' : 'claude-state-remove', detail: target.file }],
+        [...dependencies, ...operations.map(value => value.id)],
+      ),
     );
-    if (entry && entry.kind !== target.kind) throw new Error('cleanup-type-changed');
-    return entry !== undefined;
-  };
-  const pending: {
-    file: string;
-    kind: 'directory' | 'file';
-    hasExisted: boolean;
-    hasAttemptedRemoval: boolean;
-    stamp: string | null;
-    isDone: boolean;
-  }[] = await Promise.all(
-    targets.map(async target => ({
-      ...target,
-      hasExisted: await checkTarget(target),
-      hasAttemptedRemoval: false,
-      stamp: null,
-      isDone: false,
-    })),
+  operations.push(
+    operation(
+      'data:claude',
+      'verified',
+      'cleanup.claude-verify',
+      {
+        targets: targets.map(target => target.file),
+      },
+      [{ code: 'claude-data-impact' }, { code: 'no-recovery' }],
+      operations.map(value => value.id),
+    ),
   );
-  let isComplete = false;
-  const checkProcess = async (signal?: AbortSignal) => {
-    cancelled(signal);
-    const isClaudeRunning = await claudeRunning(ctx.machine, signal);
-    cancelled(signal);
-    if (isClaudeRunning !== false) throw new Error(isClaudeRunning ? 'claude-running' : 'process-state-unconfirmed');
-  };
-  await checkProcess();
-  const verify = async () => {
-    for (const target of pending)
-      if ((await ctx.machine.treeStamp(target.file)) !== null) throw new Error('target-changed');
-  };
-  const operation: Prepared = {
-    get changes() {
-      return [
-        ...pending
-          .filter(target => !target.isDone)
-          .map(target => ({
-            code: target.kind === 'directory' ? 'claude-data-remove' : 'claude-state-remove',
-            detail: target.file,
-          })),
-        { code: 'claude-data-impact' },
-        { code: 'no-recovery' },
-      ];
-    },
-    async run(report, signal) {
-      await checkProcess(signal);
-      await verifyPrograms();
-      for (const target of pending) {
-        const isPresent = await checkTarget(target);
-        if (isPresent && (target.isDone || !target.hasExisted)) throw new Error('target-changed');
-      }
-      for (const target of pending) {
-        if (target.isDone) continue;
-        await checkProcess(signal);
-        await checkTarget(target);
-        const current = await (
-          target.kind === 'file'
-            ? ctx.machine.fingerprint(target.file, signal)
-            : ctx.machine.treeStamp(target.file, signal)
-        ).catch(error => {
-          cancelled(signal);
-          throw error;
-        });
-        if (current !== null) {
-          if (!target.hasExisted) throw new Error('target-changed');
-          if (target.hasAttemptedRemoval && current !== target.stamp) throw new Error('target-changed');
-          target.stamp = current;
-          target.hasAttemptedRemoval = true;
-          await checkProcess(signal);
-          try {
-            if (target.kind === 'file') await ctx.effects.remove(target.file, current);
-            else await ctx.effects.removeTree(target.file, current);
-          } catch (error) {
-            if ((await ctx.machine.treeStamp(target.file, signal)) !== null) throw error;
-          }
-        }
-        target.isDone = true;
-        report({
-          state: current === null ? 'kept' : 'done',
-          code: current === null ? 'data-file-absent' : 'claude-data-removed',
-          detail: target.file,
-        });
-      }
-      await verify();
-      isComplete = true;
-      report({ state: 'done', code: 'claude-data-cleared' });
-    },
-    remaining: () => (isComplete ? undefined : operation),
-    verify,
-  };
-  return operation;
+  return { operations, changes: operations.flatMap(value => value.changes) };
 }

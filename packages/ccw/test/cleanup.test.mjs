@@ -193,7 +193,7 @@ test('取消清理：仅重试剩余文件', async t => {
   assert.match(describeResult(result), /清理完成（有保留）/);
 });
 
-test('重试清理：跳过已删除文件', async t => {
+test('删除结果未知：只核对且不重复删除', async t => {
   const f = await fixture(t);
   await f.write('debug/a.log');
   await f.write('debug/b.log');
@@ -202,7 +202,13 @@ test('重试清理：跳过已删除文件', async t => {
   const first = await f.ccw.apply(plan.id);
   const resumed = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(resumed.id);
-  assert.equal(result.state, 'done');
+  assert.equal(result.state, 'partial');
+  assert.equal(f.state.removeTreeCalls, 2);
+  assert.equal(await f.exists('debug/a.log'), false);
+  assert.equal(await f.exists('debug/b.log'), true);
+  assert.ok(!result.items[0].effects.some(effect => effect.code === 'data-selected-cleared'));
+  await f.ccw.abandon(result.remaining);
+  assert.equal((await f.ccw.apply((await f.plan(['data:cache'])).id)).state, 'done');
   assert.equal(f.state.removeTreeCalls, 3);
 });
 
@@ -245,6 +251,28 @@ test('删除确认失败：重试仅复核', async t => {
   assert.equal(f.state.removeTreeCalls, 1);
 });
 
+test('重建操作实例：删除回执丢失后只核对冻结文件', async t => {
+  const f = await fixture(t);
+  await f.write('debug/a.log');
+  f.state.failRemoveRead = true;
+  const first = await f.ccw.apply((await f.plan(['data:cache'])).id);
+  assert.ok(first.remaining);
+  f.state.failRemoveRead = false;
+  f.state.treeStampFails = false;
+  await f.write('debug/new.log', 'user data after interruption');
+  const restarted = (f.ccw = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  }));
+  const recovered = await restarted.plan({ resume: first.remaining });
+  assert.equal((await restarted.apply(recovered.id)).state, 'done');
+  assert.equal(f.state.removeTreeCalls, 1);
+  assert.equal(await f.exists('debug/new.log'), true);
+});
+
 test('最终复核失败：跳过已完成清理', async t => {
   const f = await fixture(t);
   await f.write('debug/nested/a.log');
@@ -264,13 +292,15 @@ test('最终复核失败：跳过已完成清理', async t => {
 test('清理后重启 Claude：阻止完成确认', async t => {
   const f = await fixture(t);
   await f.write('jobs/a.json');
-  let checks = 0;
-  f.state.onCheck = async () => ++checks >= 2;
+  f.state.onRemoveTree = async () => {
+    f.state.running = true;
+  };
   const plan = await f.plan(['data:runtime']);
   const first = await f.ccw.apply(plan.id);
   assert.equal(first.state, 'partial');
   assert.ok(first.remaining);
-  f.state.onCheck = async () => false;
+  f.state.running = false;
+  f.state.onRemoveTree = null;
   const resumed = await f.ccw.plan({ resume: first.remaining });
   assert.equal((await f.ccw.apply(resumed.id)).state, 'done');
 });
@@ -422,8 +452,10 @@ test('变更清理目标：阻止旧计划删除', async t => {
   await f.write('debug/a.log', 'old');
   let plan = await f.plan(['data:cache']);
   f.state.running = true;
-  assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
+  const first = await f.ccw.apply(plan.id);
+  assert.equal(first.state, 'failed');
   f.state.running = false;
+  await f.ccw.abandon(first.remaining);
   plan = await f.plan(['data:cache']);
   await fs.writeFile(file, 'new');
   assert.equal((await f.ccw.apply(plan.id)).state, 'failed');

@@ -121,6 +121,88 @@ test('检查 CCometixLine：报告外观异常', async t => {
   assert.equal(plan.items[0].problem, item.problem);
 });
 
+test('重建操作实例：保留安装事实并只续办接入', async t => {
+  const f = await fixture(t);
+  f.faults.editJson.set(f.file, new Error('connection-write-failed'));
+  const first = await f.ccw.apply((await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] })).id);
+  assert.ok(first.remaining);
+  assert.equal(npmOf(f, 'install').length, 1);
+  const metadataReads = npmOf(f, 'view').length;
+  f.faults.editJson.delete(f.file);
+  const restarted = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  });
+  const resumed = await restarted.plan({ resume: first.remaining });
+  assert.equal((await restarted.apply(resumed.id)).state, 'done');
+  assert.equal(npmOf(f, 'install').length, 1);
+  assert.equal(npmOf(f, 'view').length, metadataReads);
+  assert.equal((await f.readSettings()).statusLine.command, 'ccline');
+});
+
+test('重建操作实例：重装沿用冻结的双状态栏模板', async t => {
+  const statusLine = { type: 'command', command: 'ccline', padding: 4, refreshInterval: 8 };
+  const subagentStatusLine = { type: 'command', command: 'ccline', padding: 6, extra: 'keep' };
+  const f = await fixture(t, { installed: true, style: fixtureStyle, settings: { statusLine, subagentStatusLine } });
+  f.state.fail = 'install';
+  const first = await f.apply({ task: 'install', selected: [{ id: 'ccline', maintenance: 'reinstall' }] });
+  assert.equal((await f.readSettings()).subagentStatusLine, undefined);
+  f.state.fail = null;
+  const restarted = createCcw({
+    machine: f.machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  });
+  const resumed = await restarted.plan({ resume: first.remaining });
+  assert.equal((await restarted.apply(resumed.id)).state, 'done');
+  assert.deepEqual(await f.readSettings(), { statusLine, subagentStatusLine });
+  assert.equal(npmOf(f, 'install').length, 2);
+});
+
+test('同字节重装回执丢失：重启后保持待核对且不重复派发', async t => {
+  const f = await fixture(t, {
+    installed: true,
+    style: fixtureStyle,
+    settings: { statusLine: { type: 'command', command: 'ccline', padding: 4 } },
+  });
+  const machine = {
+    ...f.machine,
+    async npm(args, options) {
+      const result = await f.machine.npm(args, options);
+      if (args[0] === 'install') throw new Error('receipt-lost');
+      return result;
+    },
+  };
+  const firstCcw = createCcw({
+    machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  });
+  const first = await firstCcw.apply(
+    (await firstCcw.plan({ task: 'install', selected: [{ id: 'ccline', maintenance: 'reinstall' }] })).id,
+  );
+  assert.ok(first.remaining);
+  const restarted = createCcw({
+    machine,
+    home: f.home,
+    claudeRoot: f.claudeRoot,
+    cclineRoot: f.cclineRoot,
+    platform: process.platform,
+  });
+  const resumed = await restarted.plan({ resume: first.remaining });
+  assert.ok(resumed.items[0].changes.some(change => change.code === 'operation-result-check'));
+  assert.equal((await restarted.apply(resumed.id)).state, 'partial');
+  assert.equal(npmOf(f, 'install').length, 1);
+  assert.equal((await f.readSettings()).statusLine, undefined);
+});
+
 for (const platform of ['win32', 'darwin', 'linux']) {
   test(`${platform} 安装 CCometixLine：复制默认外观`, async t => {
     const f = await fixture(t, { platform, settings: { env: { KEEP: 'test' }, language: 'zh' } });
@@ -168,10 +250,7 @@ for (const customRoot of [false, true])
     assert.ok(first.remaining);
     assert.equal((await f.readSettings()).statusLine.command, 'ccline');
     const next = await f.ccw.plan({ resume: first.remaining });
-    assert.deepEqual(
-      next.items[0].changes.map(change => change.code),
-      ['ccline-connect', ...(customRoot ? ['ccline-root-configure'] : [])],
-    );
+    assert.deepEqual(next.items, []);
     assert.equal((await f.ccw.apply(next.id)).state, 'done');
     assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.file).length, 1);
     if (customRoot) assert.equal((await f.readSettings()).env.CCLINE_HOME, f.cclineRoot);
@@ -188,7 +267,7 @@ test('继续 CCometixLine 外观：复用已写文件', async t => {
   const next = await f.ccw.plan({ resume: first.remaining });
   assert.deepEqual(
     next.items[0].changes.map(change => change.code),
-    ['appearance-copy', 'ccline-connect'],
+    ['ccline-connect'],
   );
   assert.equal((await f.ccw.apply(next.id)).state, 'done');
   assert.equal((await f.readSettings()).statusLine.command, 'ccline');
@@ -202,7 +281,7 @@ test('复核 CCometixLine 接入：保留外部替换', async t => {
   const replacement = { type: 'command', command: 'user-statusline' };
   await fs.writeFile(f.file, JSON.stringify({ statusLine: replacement }));
   const next = await f.ccw.plan({ resume: first.remaining });
-  assert.equal((await f.ccw.apply(next.id)).state, 'failed');
+  assert.equal((await f.ccw.apply(next.id)).state, 'partial');
   assert.deepEqual((await f.readSettings()).statusLine, replacement);
   assert.equal(f.calls.filter(call => call.kind === 'editJson' && call.target === f.file).length, 1);
 });
@@ -214,7 +293,7 @@ test('复核 CCometixLine 外观：保留外部替换', async t => {
   const first = await f.ccw.apply(plan.id);
   await fs.writeFile(f.styleFile, fixtureStyle);
   const next = await f.ccw.plan({ resume: first.remaining });
-  assert.equal((await f.ccw.apply(next.id)).state, 'failed');
+  assert.equal((await f.ccw.apply(next.id)).state, 'partial');
   assert.equal(await fs.readFile(f.styleFile, 'utf8'), fixtureStyle);
   assert.equal((await f.readSettings()).statusLine, undefined);
 });
@@ -335,7 +414,11 @@ for (const [action, label] of [
     });
     assert.ok(first.remaining);
     const next = await f.ccw.plan({ resume: first.remaining });
-    assert.ok(next.items[0].changes.some(change => change.code === 'program-installation-confirm'));
+    assert.ok(
+      !next.items
+        .flatMap(item => item.changes)
+        .some(change => ['ccline-program-prepare', 'ccline-program-update'].includes(change.code)),
+    );
     assert.equal((await f.ccw.apply(next.id)).state, 'done');
     assert.equal(npmOf(f, 'install').length, 1);
   });
@@ -367,7 +450,7 @@ test('继续 CCometixLine 复核：保护外部替换', async t => {
   await fs.writeFile(f.binary, 'externally replaced binary');
   const next = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(next.id);
-  assert.equal(result.state, 'failed');
+  assert.equal(result.state, 'partial');
   assert.equal(result.items[0].effects.at(-1).code, 'program-changed');
   assert.equal(npmOf(f, 'install').length, 1);
 });
@@ -377,7 +460,7 @@ test('继续 CCometixLine 复核：拒绝前缀漂移', async t => {
   f.state.npmRoot = path.join(f.root, 'other/node_modules');
   const next = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(next.id);
-  assert.equal(result.state, 'failed');
+  assert.equal(result.state, 'partial');
   assert.equal(result.items[0].effects.at(-1).code, 'program-scope-unconfirmed');
   assert.equal(npmOf(f, 'install').length, 1);
 });
@@ -388,7 +471,7 @@ test('保存 CCometixLine 安装快照失败：停止旧计划', async t => {
   const first = await f.apply({ task: 'install', selected: [{ id: 'ccline', maintenance: 'reinstall' }] });
   assert.equal(first.state, 'partial');
   assert.equal(first.items[0].effects.at(-1).code, 'program-installation-unconfirmed');
-  assert.equal(first.remaining, undefined);
+  assert.ok(first.remaining);
   assert.equal((await f.readSettings()).statusLine, undefined);
   assert.equal(npmOf(f, 'install').length, 1);
 });
@@ -547,16 +630,17 @@ test('取消 CCometixLine：保留已完成步骤', async t => {
   const controller = new AbortController();
   controller.abort();
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  assert.equal((await f.ccw.apply(plan.id, controller.signal)).state, 'cancelled');
+  const first = await f.ccw.apply(plan.id, controller.signal);
+  assert.equal(first.state, 'cancelled');
   assert.equal(f.state.version, null);
   const nextController = new AbortController();
   f.state.onCommand = async args => {
     if (args[0] === 'install') nextController.abort();
   };
-  const next = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
+  const next = await f.ccw.plan({ resume: first.remaining });
   const result = await f.ccw.apply(next.id, nextController.signal);
   assert.equal(result.state, 'cancelled');
-  assert.ok(result.items[0].effects.some(item => item.code === 'program-ready'));
+  assert.ok(result.items[0].effects.some(item => item.code === 'package-command-completed'));
   assert.deepEqual(await f.readSettings(), {});
 });
 
@@ -694,12 +778,12 @@ test('取消 CCometixLine 重装：保留恢复设置', async t => {
   assert.deepEqual(await f.readSettings(), {});
   assert.equal(npmOf(f, 'install').length, 0);
   await f.ccw.inspect();
-  const abandoned = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  const next = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
+  await assert.rejects(f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] }), /unfinished-operation/);
+  const next = await f.ccw.plan({ resume: result.remaining });
   assert.ok(
     next.items[0].changes.some(change => change.code === 'ccline-subagent-restore' && change.detail === f.file),
   );
-  assert.equal((await f.ccw.apply(abandoned.id)).items[0].effects[0].code, 'plan-unavailable');
+  assert.equal((await f.ccw.apply(first.id)).items[0].effects[0].code, 'plan-unavailable');
   assert.equal((await f.ccw.apply(next.id)).state, 'done');
   assert.deepEqual(await f.readSettings(), { statusLine, subagentStatusLine });
 });

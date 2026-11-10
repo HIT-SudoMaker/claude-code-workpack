@@ -64,6 +64,13 @@ export function createOperationController(ctx: Context, machine: Machine, handle
   const sameContext = () => JSON.stringify(record?.intent.context) === JSON.stringify(identity);
   const assess = async (definition: OperationDefinition): Promise<Assessment> => {
     if (!sameContext()) return { state: 'unknown', problem: 'operation-context-changed' };
+    const previous = fact(definition);
+    if (
+      !previous.attemptId &&
+      !previous.confirmed &&
+      !definition.dependsOn.every(id => record!.facts[id]?.status === 'confirmed')
+    )
+      return { state: 'blocked', problem: 'dependency-not-ready' };
     const handler = handlers.get(definition.handler);
     if (!handler) return { state: 'blocked', problem: 'repreview-required' };
     try {
@@ -113,9 +120,27 @@ export function createOperationController(ctx: Context, machine: Machine, handle
   };
   const currentPlan = (): Plan => ({
     id: record!.planId,
-    items: record!.items.filter(item => {
+    items: record!.items.flatMap(item => {
       const operations = record!.operations.filter(operation => operation.itemId === item.id);
-      return !operations.length || operations.some(operation => !terminal(fact(operation)));
+      const pending = operations.filter(operation => !terminal(fact(operation)));
+      if (operations.length && !pending.length) return [];
+      return [
+        {
+          ...item,
+          changes: operations.length
+            ? pending.flatMap(operation =>
+                fact(operation).status === 'issued' || fact(operation).status === 'checking'
+                  ? [
+                      {
+                        code: 'operation-result-check',
+                        ...(operation.changes[0]?.detail ? { detail: operation.changes[0].detail } : {}),
+                      },
+                    ]
+                  : operation.changes,
+              )
+            : item.changes,
+        },
+      ];
     }),
     problem: record!.items.length ? null : 'empty-selection',
   });
@@ -315,7 +340,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
         if (!record || record.phase !== 'awaiting-confirmation' || record.planId !== planId || approval !== planId)
           return invalid('plan-unavailable');
         approval = undefined;
-        const plan = currentPlan();
+        const plan: Plan = { ...currentPlan(), items: record.items };
         await save({ ...record, phase: 'executing' });
         const attempted = new Set<string>();
         let storageProblem: string | undefined;
@@ -413,6 +438,7 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           if (errorCode(error) === 'cancelled') wasCancelled = true;
           else storageProblem = errorCode(error);
         }
+        wasCancelled ||= signal?.aborted === true;
         if (!storageProblem) {
           try {
             for (const operation of record.operations)
@@ -433,8 +459,8 @@ export function createOperationController(ctx: Context, machine: Machine, handle
           const problem =
             storageProblem ??
             item.problem ??
-            facts.find(value => value.problem)?.problem ??
-            (!done ? (wasCancelled ? 'cancelled' : 'dependency-not-ready') : undefined);
+            (wasCancelled ? 'cancelled' : facts.find(value => value.problem)?.problem) ??
+            (!done ? 'dependency-not-ready' : undefined);
           if (problem && !effects.some(effect => effect.code === problem))
             effects.push({ state: wasCancelled ? 'skipped' : 'failed', code: problem });
           const result: ItemResult = {
