@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { knownTitle } from './titles.js';
+import { applyFrozenJson, assessFrozenJson, jsonField } from './frozen-json.js';
 import { ENABLED_PLUGINS_KEY } from './settings.js';
 import { marketplaceSources, pluginSpecs } from './management-catalog.js';
 import { errorCode, isGitRevision, isObject, treeFilesStamp } from './machine.js';
@@ -201,13 +202,7 @@ async function inspectPlugins(ctx: Context): Promise<Inspection> {
   return { items, problems: problems.map(code => ({ code, detail: 'plugins' })) };
 }
 
-interface PluginPatch {
-  readonly path: readonly string[];
-  readonly before: string;
-  readonly value: Json;
-  readonly remove: boolean;
-}
-function pluginPatches(value: unknown): readonly PluginPatch[] {
+function pluginPatches(value: unknown) {
   return extensionObjects(value).map(patch => {
     if (
       !Array.isArray(patch.path) ||
@@ -215,18 +210,10 @@ function pluginPatches(value: unknown): readonly PluginPatch[] {
       !Object.hasOwn(patch, 'value')
     )
       throw new Error('operation-record-invalid');
-    return {
-      path: patch.path,
-      before: extensionString(patch.before),
-      value: patch.value ?? null,
-      remove: patch.remove === true,
-    };
+    const value = patch.remove === true ? undefined : (patch.value ?? null);
+    const after = extensionDigest(value);
+    return { path: patch.path, before: [extensionString(patch.before), after], after, value };
   });
-}
-function at(document: Record<string, unknown>, parts: readonly string[]): unknown {
-  let value: unknown = document;
-  for (const part of parts) value = object(value)[part];
-  return value;
 }
 function patchOperation(
   itemId: string,
@@ -241,7 +228,10 @@ function patchOperation(
     id: `${itemId}/${suffix}`,
     itemId,
     handler: 'plugin.fields',
-    payload: { file, patches: values.map(value => ({ ...value, before: extensionDigest(at(document, value.path)) })) },
+    payload: {
+      file,
+      patches: values.map(value => ({ ...value, before: extensionDigest(jsonField(document, value.path)) })),
+    },
     dependsOn,
     writes: [file],
     changes,
@@ -594,29 +584,17 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
         const superseded =
           typeof definition.payload.supersededBy === 'string' &&
           facts[definition.payload.supersededBy]?.status === 'confirmed';
-        if (
-          patches.every(
-            patch =>
-              extensionDigest(at(current, patch.path)) === extensionDigest(patch.remove ? undefined : patch.value) ||
-              (superseded && patch.path.at(-1) === 'ref' && extensionDigest(at(current, patch.path)) === patch.before),
-          )
-        )
-          return {
-            state: 'complete',
-            evidence: { matched: true },
-            effects: definition.id.endsWith('/disable') ? [{ state: 'done', code: 'plugin-disabled' }] : [],
-          };
-        if (
-          fact.confirmed ||
-          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
-          patches.some(
-            patch =>
-              extensionDigest(at(current, patch.path)) !== patch.before &&
-              extensionDigest(at(current, patch.path)) !== extensionDigest(patch.remove ? undefined : patch.value),
-          )
-        )
-          return { state: 'unknown', problem: 'target-changed' };
-        return { state: 'ready' };
+        const fields = patches.map(patch => ({
+          ...patch,
+          after: superseded && patch.path.at(-1) === 'ref' ? patch.before : patch.after,
+        }));
+        const assessment = assessFrozenJson(current, fields, fact);
+        return assessment.state === 'complete'
+          ? {
+              ...assessment,
+              effects: definition.id.endsWith('/disable') ? [{ state: 'done', code: 'plugin-disabled' }] : [],
+            }
+          : assessment;
       },
       async execute(definition) {
         const patches = pluginPatches(definition.payload.patches);
@@ -628,19 +606,7 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
             definition.payload.records,
           );
         await ctx.effects.editJson(extensionString(definition.payload.file), document => {
-          for (const patch of patches) {
-            const current = extensionDigest(at(document, patch.path));
-            if (current !== patch.before && current !== extensionDigest(patch.remove ? undefined : patch.value))
-              throw new Error('target-changed');
-            let parent = document;
-            for (const part of patch.path.slice(0, -1)) {
-              const child = object(parent[part]);
-              parent[part] = child;
-              parent = child;
-            }
-            if (patch.remove) delete parent[patch.path.at(-1)!];
-            else parent[patch.path.at(-1)!] = patch.value;
-          }
+          applyFrozenJson(document, patches);
         });
         return { receipt: { kind: 'returned', failure: null }, evidence: { matched: true } };
       },
@@ -746,30 +712,31 @@ function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>
     },
     'plugin.credential': {
       async assess(definition, fact) {
-        const current = extensionDigest(
-          object((await json(ctx.machine, ctx.settingsFile)).env).GITHUB_PERSONAL_ACCESS_TOKEN,
+        const assessment = assessFrozenJson(
+          await json(ctx.machine, ctx.settingsFile),
+          [
+            {
+              path: ['env', 'GITHUB_PERSONAL_ACCESS_TOKEN'],
+              before: extensionString(definition.payload.before),
+              after: extensionString(definition.payload.after),
+            },
+          ],
+          fact,
         );
-        if (current === definition.payload.after)
-          return {
-            state: 'complete',
-            evidence: { matched: true },
-            effects: [{ state: 'done', code: 'github-credential-saved' }],
-          };
-        if (
-          fact.confirmed ||
-          (fact.receipt?.kind === 'returned' && fact.receipt.failure === null) ||
-          current !== definition.payload.before
-        )
-          return { state: 'unknown', problem: 'target-changed' };
-        return { state: 'ready' };
+        return assessment.state === 'complete'
+          ? { ...assessment, effects: [{ state: 'done', code: 'github-credential-saved' }] }
+          : assessment;
       },
       async execute(definition, _fact, inputs) {
         unchanged(extensionDigest(inputs.secret), definition.payload.after);
         await ctx.effects.editJson(ctx.settingsFile, document => {
-          const env = object(document.env);
-          unchanged(extensionDigest(env.GITHUB_PERSONAL_ACCESS_TOKEN), definition.payload.before);
-          env.GITHUB_PERSONAL_ACCESS_TOKEN = inputs.secret;
-          document.env = env;
+          applyFrozenJson(document, [
+            {
+              path: ['env', 'GITHUB_PERSONAL_ACCESS_TOKEN'],
+              before: extensionString(definition.payload.before),
+              value: inputs.secret,
+            },
+          ]);
         });
         return { receipt: { kind: 'returned', failure: null }, evidence: { matched: true } };
       },

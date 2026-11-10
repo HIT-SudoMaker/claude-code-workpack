@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { knownTitle } from './titles.js';
 import { isObject } from './machine.js';
 import { apiConfigurationProblem, commandReceipt, json, object, success } from './model.js';
@@ -13,6 +12,7 @@ import type {
   OperationHandler,
 } from './model.js';
 import { claudeCommand } from './programs.js';
+import { applyFrozenJson, assessFrozenJson, jsonField, jsonFingerprint as digest } from './frozen-json.js';
 
 export function createSettingsDomain(ctx: Context): Domain {
   return {
@@ -348,12 +348,6 @@ function patchesOf(definition: OperationDefinition): readonly SettingsPatch[] {
   if (!Array.isArray(patches) || !patches.every(isPatch)) throw new Error('operation-record-invalid');
   return patches;
 }
-const digest = (value: unknown) => createHash('sha256').update(JSON.stringify({ value })).digest('hex');
-function valueAt(document: Record<string, unknown>, parts: readonly string[]): unknown {
-  let current: unknown = document;
-  for (const part of parts) current = object(current)[part];
-  return current;
-}
 function loginDefinition(itemId: string, dependsOn: readonly string[]): OperationDefinition {
   return {
     id: itemId + '/login',
@@ -376,7 +370,7 @@ function settingsHandlers(ctx: Context): Readonly<Record<string, OperationHandle
           patches
             .filter(patch => patch.mode === 'default')
             .map(patch => {
-              const value = valueAt(current, patch.path);
+              const value = jsonField(current, patch.path);
               return [
                 patch.path.join('/'),
                 value === undefined && !(patch.path[0] === 'attribution' && current.includeCoAuthoredBy === true)
@@ -386,51 +380,50 @@ function settingsHandlers(ctx: Context): Readonly<Record<string, OperationHandle
             }),
         );
         const expectedDefaults = object(fact.dispatch?.defaults ?? defaults);
-        if (
-          patches.every(
-            patch =>
-              digest(valueAt(current, patch.path)) ===
-              (patch.mode === 'default' ? expectedDefaults[patch.path.join('/')] : patch.after),
-          )
-        )
+        const assessment = assessFrozenJson(
+          current,
+          patches.map(patch => ({
+            path: patch.path,
+            before: patch.mode === 'default' ? digest(jsonField(current, patch.path)) : patch.before,
+            after: patch.mode === 'default' ? String(expectedDefaults[patch.path.join('/')]) : patch.after,
+          })),
+          fact,
+        );
+        if (assessment.state === 'complete')
           return {
-            state: 'complete',
-            evidence: { matched: true },
+            ...assessment,
             effects: [{ state: 'done', code: 'settings-saved' }],
           };
-        if (fact.confirmed || (fact.receipt?.kind === 'returned' && fact.receipt.failure === null))
-          return { state: 'unknown', problem: 'target-changed' };
-        if (patches.every(patch => patch.mode === 'default' || digest(valueAt(current, patch.path)) === patch.before))
-          return { state: 'ready', dispatch: { defaults } };
-        return { state: 'unknown', problem: 'target-changed' };
+        return assessment.state === 'ready' ? { ...assessment, dispatch: { defaults } } : assessment;
       },
       async execute(definition, fact, inputs) {
         const patches = patchesOf(definition);
         await ctx.effects.editJson(ctx.settingsFile, current => {
-          for (const patch of patches) {
+          const fields = patches.map(patch => {
+            const currentValue = jsonField(current, patch.path);
             if (patch.mode === 'default') {
-              const value = valueAt(current, patch.path);
               const expected = object(fact.dispatch?.defaults)[patch.path.join('/')];
-              if (value !== undefined || (patch.path[0] === 'attribution' && current.includeCoAuthoredBy === true)) {
-                if (digest(value) !== expected) throw new Error('target-changed');
-                continue;
-              }
-              if (expected !== patch.after) throw new Error('target-changed');
-            } else if (digest(valueAt(current, patch.path)) !== patch.before) throw new Error('target-changed');
-            let parent = current;
-            for (const part of patch.path.slice(0, -1)) {
-              const child = object(parent[part]);
-              parent[part] = child;
-              parent = child;
+              const eligible =
+                currentValue === undefined &&
+                !(patch.path[0] === 'attribution' && current.includeCoAuthoredBy === true);
+              if (eligible && expected !== patch.after) throw new Error('target-changed');
+              return {
+                path: patch.path,
+                before: eligible ? patch.before : String(expected),
+                after: String(expected),
+                value: eligible ? patch.value : currentValue,
+              };
             }
-            const key = patch.path.at(-1)!;
-            if (patch.mode === 'absent') delete parent[key];
-            else if (patch.mode === 'credential') {
-              const credential = inputs.secret ?? parent[key];
-              if (digest(credential) !== patch.after) throw new Error('credential-required');
-              parent[key] = credential;
-            } else parent[key] = patch.value;
-          }
+            const value =
+              patch.mode === 'absent'
+                ? undefined
+                : patch.mode === 'credential'
+                  ? (inputs.secret ?? currentValue)
+                  : patch.value;
+            if (patch.mode === 'credential' && digest(value) !== patch.after) throw new Error('credential-required');
+            return { path: patch.path, before: patch.before, after: patch.after, value };
+          });
+          applyFrozenJson(current, fields);
           if (current.env !== undefined) orderFields(object(current.env), envFields);
           orderFields(current, rootFields);
         });
