@@ -51,6 +51,34 @@ async function fixture(t, { configuredView = 'ok', mirrorView = 'ok', install = 
   return { ...f, ccw: f.ccw(machine) };
 }
 
+async function officeNpmFixture(t, view) {
+  const f = await createEnv(t, { seed: { settings: {}, state: {} } });
+  const npmRoot = path.join(f.root, 'npm', 'node_modules');
+  const binary = path.join(npmRoot, '@officecli', 'officecli', 'vendor', 'officecli.exe');
+  await f.write(binary, 'OfficeCLI 1.0.123 fixture');
+  const world = npmWorld({
+    package: '@officecli/officecli',
+    npmRoot,
+    version: '1.0.123',
+    installVersion: '1.0.160',
+    binary,
+    binaryContent: 'OfficeCLI 1.0.160 fixture',
+    lsOnRequest: true,
+    view,
+  });
+  const machine = {
+    ...f.machine({
+      processes: async () => [],
+      npm: world.npm,
+      execute: versionProbe({ binary, output: () => `OfficeCLI ${world.state.version}` }),
+    }),
+    async fetchText(url) {
+      throw new Error(`unexpected direct metadata fetch: ${url}`);
+    },
+  };
+  return { ...f, binary, machine };
+}
+
 test('安装 CCometixLine：复用镜像与查询期限', async t => {
   const f = await fixture(t, { configuredView: 'fail' });
   const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
@@ -87,74 +115,54 @@ test('安装 CCometixLine：复用镜像与查询期限', async t => {
   assert.ok(npmOf(f, 'ls').every(call => call.options?.timeoutMs === 5_000));
 });
 
-test('安装 CCometixLine：沿用有效配置源', async t => {
-  const f = await fixture(t);
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  assert.deepEqual(
-    npmOf(f, 'view').map(call => registryOf(call.args)),
-    [OFFICIAL],
-  );
-  assert.equal((await f.ccw.apply(plan.id)).state, 'done');
-  const installs = npmOf(f, 'install');
-  assert.equal(installs.length, 1);
-  assert.equal(registryOf(installs[0].args), OFFICIAL);
-});
-
-test('配置源版本无效：查询镜像', async t => {
-  const f = await fixture(t, { configuredView: 'invalid' });
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  assert.deepEqual(
-    npmOf(f, 'view').map(call => registryOf(call.args)),
-    [OFFICIAL, MIRROR],
-  );
-  assert.equal((await f.ccw.apply(plan.id)).state, 'done');
-  assert.equal(registryOf(f.calls.find(call => call.kind === 'npm' && call.target === 'install').args), MIRROR);
-});
-
-test('拒绝不兼容的 CCometixLine 主版本', async t => {
-  const f = await fixture(t, { configuredView: 'unsupported' });
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  assert.equal(plan.items[0]?.problem, 'unsupported-ccline-release');
-  assert.deepEqual(
-    npmOf(f, 'view').map(call => registryOf(call.args)),
-    [OFFICIAL],
-  );
-  assert.equal(
-    f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
-    false,
-  );
-});
-
-test('npm 来源均失败：阻止 CCometixLine 安装', async t => {
-  const f = await fixture(t, { configuredView: 'fail', mirrorView: 'fail' });
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  assert.notEqual(plan.items[0]?.problem, null);
-  assert.deepEqual(
-    npmOf(f, 'view').map(call => registryOf(call.args)),
-    [OFFICIAL, MIRROR],
-  );
-  assert.equal(
-    f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
-    false,
-  );
-  assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
-  assert.equal(
-    f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
-    false,
-  );
-});
-
-test('镜像安装失败：禁止换源重装', async t => {
-  const f = await fixture(t, { configuredView: 'fail', install: 'fail' });
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
-  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  assert.notEqual((await f.ccw.apply(plan.id)).state, 'done');
-  const installs = npmOf(f, 'install');
-  assert.equal(installs.length, 1);
-  assert.equal(registryOf(installs[0].args), MIRROR);
-});
+for (const { title, options, views, problem = null, state = 'done', installs = [] } of [
+  { title: '安装 CCometixLine：沿用有效配置源', views: [OFFICIAL], installs: [OFFICIAL] },
+  {
+    title: '配置源版本无效：查询镜像',
+    options: { configuredView: 'invalid' },
+    views: [OFFICIAL, MIRROR],
+    installs: [MIRROR],
+  },
+  {
+    title: '拒绝不兼容的 CCometixLine 主版本',
+    options: { configuredView: 'unsupported' },
+    views: [OFFICIAL],
+    problem: 'unsupported-ccline-release',
+    state: null,
+  },
+  {
+    title: 'npm 来源均失败：阻止 CCometixLine 安装',
+    options: { configuredView: 'fail', mirrorView: 'fail' },
+    views: [OFFICIAL, MIRROR],
+    problem: 'source-unavailable',
+    state: 'failed',
+  },
+  {
+    title: '镜像安装失败：禁止换源重装',
+    options: { configuredView: 'fail', install: 'fail' },
+    views: [OFFICIAL, MIRROR],
+    state: 'not-done',
+    installs: [MIRROR],
+  },
+])
+  test(title, async t => {
+    const f = await fixture(t, options);
+    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
+    assert.equal(plan.items[0]?.problem, problem, JSON.stringify(plan));
+    assert.deepEqual(
+      npmOf(f, 'view').map(call => registryOf(call.args)),
+      views,
+    );
+    assert.equal(npmOf(f, 'install').length, 0);
+    if (state === null) return;
+    const result = await f.ccw.apply(plan.id);
+    if (state === 'not-done') assert.notEqual(result.state, 'done');
+    else assert.equal(result.state, state);
+    assert.deepEqual(
+      npmOf(f, 'install').map(call => registryOf(call.args)),
+      installs,
+    );
+  });
 
 test('卸载 CCometixLine：限时读取 npm 记录', async t => {
   const f = await fixture(t, { installed: true });
@@ -170,33 +178,9 @@ test('卸载 CCometixLine：限时读取 npm 记录', async t => {
 });
 
 test('更新 OfficeCLI：复用 npm 镜像', async t => {
-  const f = await createEnv(t, { seed: { settings: {}, state: {} } });
-  const npmRoot = path.join(f.root, 'npm', 'node_modules');
-  const binary = path.join(npmRoot, '@officecli', 'officecli', 'vendor', 'officecli.exe');
-  await f.write(binary, 'OfficeCLI 1.0.123 fixture');
-
-  const world = npmWorld({
-    package: '@officecli/officecli',
-    npmRoot,
-    version: '1.0.123',
-    installVersion: '1.0.160',
-    binary,
-    binaryContent: 'OfficeCLI 1.0.160 fixture',
-    lsOnRequest: true,
-    view: args => (registryOf(args) === MIRROR ? ok(JSON.stringify('1.0.160')) : fail()),
-  });
-  const machine = {
-    ...f.machine({
-      processes: async () => [],
-      npm: world.npm,
-      execute: versionProbe({ binary, output: () => `OfficeCLI ${world.state.version}` }),
-    }),
-    async fetchText(url) {
-      throw new Error(`unexpected network fetch: ${url}`);
-    },
-  };
-  const ccw = f.ccw(machine, { platform: 'win32' });
-  const id = `officecli:npm:${binary}`;
+  const f = await officeNpmFixture(t, args => (registryOf(args) === MIRROR ? ok(JSON.stringify('1.0.160')) : fail()));
+  const ccw = f.ccw(f.machine, { platform: 'win32' });
+  const id = `officecli:npm:${f.binary}`;
   const plan = await ccw.plan({
     task: 'install',
     selected: [{ id, maintenance: 'update', fields: { connection: 'mcp' } }],
@@ -219,32 +203,14 @@ test('更新 OfficeCLI：复用 npm 镜像', async t => {
 });
 
 test('更新 OfficeCLI 技能：固定镜像提交', async t => {
-  const f = await createEnv(t, { seed: { settings: {}, state: {} } });
-  const skill = path.join(f.claudeRoot, 'skills', 'officecli');
-  const npmRoot = path.join(f.root, 'npm', 'node_modules');
-  const binary = path.join(npmRoot, '@officecli', 'officecli', 'vendor', 'officecli.exe');
   const oldRevision = '1111111111111111111111111111111111111111';
   const nextRevision = '2222222222222222222222222222222222222222';
-  await f.write(binary, 'OfficeCLI 1.0.123 fixture');
+  const f = await officeNpmFixture(t, args =>
+    registryOf(args) !== MIRROR ? fail() : ok(JSON.stringify(args.includes('gitHead') ? nextRevision : '1.0.160')),
+  );
+  const skill = path.join(f.claudeRoot, 'skills', 'officecli');
   await f.write(path.join(skill, 'SKILL.md'), '---\nname: officecli\n---\nold skill');
-
-  const world = npmWorld({
-    package: '@officecli/officecli',
-    npmRoot,
-    version: '1.0.123',
-    installVersion: '1.0.160',
-    binary,
-    binaryContent: 'OfficeCLI 1.0.160 fixture',
-    lsOnRequest: true,
-    view: args =>
-      registryOf(args) !== MIRROR ? fail() : ok(JSON.stringify(args.includes('gitHead') ? nextRevision : '1.0.160')),
-  });
-  const base = f.machine({
-    processes: async () => [],
-    npm: world.npm,
-    execute: versionProbe({ binary, output: () => `OfficeCLI ${world.state.version}` }),
-  });
-  const stamp = await base.treeStamp(skill);
+  const stamp = await f.machine.treeStamp(skill);
   const metadataFile = path.join(f.home, '.ccw', 'sources.json');
   await f.write(
     metadataFile,
@@ -252,7 +218,7 @@ test('更新 OfficeCLI 技能：固定镜像提交', async t => {
   );
   const sourceCalls = () => f.calls.filter(call => call.kind === 'source').length;
   const machine = {
-    ...base,
+    ...f.machine,
     async source(repository, revision, folder) {
       f.calls.push({ kind: 'source', target: repository, args: [revision, folder] });
       assert.equal(repository, 'https://github.com/iOfficeAI/OfficeCLI');
@@ -260,12 +226,9 @@ test('更新 OfficeCLI 技能：固定镜像提交', async t => {
       assert.equal(folder, 'skills/officecli');
       return [{ path: 'SKILL.md', data: Buffer.from('---\nname: officecli\n---\nnew skill') }];
     },
-    async fetchText(url) {
-      throw new Error(`unexpected direct metadata fetch: ${url}`);
-    },
   };
   const ccw = f.ccw(machine, { platform: 'win32' });
-  const id = `officecli:npm:${binary}`;
+  const id = `officecli:npm:${f.binary}`;
   const plan = await ccw.plan({
     task: 'install',
     selected: [{ id, maintenance: 'update', fields: { connection: 'skill' } }],

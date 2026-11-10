@@ -87,7 +87,7 @@ async function fixture(
       return base.read(target);
     },
   });
-  const ccw = createCcw({ machine, home: f.home, claudeRoot: f.claudeRoot, cclineRoot, platform });
+  const ccw = f.ccw(machine, { cclineRoot, platform });
   return {
     ...f,
     cclineRoot,

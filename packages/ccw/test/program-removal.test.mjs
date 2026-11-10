@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import { createCcw } from '../dist/ccw.js';
-import { npmConfig, createEnv, exists, ok } from './env.mjs';
+import { npmConfig, createEnv, exists, ok, releaseContract } from './env.mjs';
 
 const bytes = Buffer.from('fixed native OfficeCLI release payload');
 const checksum = createHash('sha256').update(bytes).digest('hex');
@@ -144,28 +144,16 @@ async function fixture(t, platform = process.platform, extra = {}) {
     ...base,
     async fetchText(url) {
       f.calls.push({ kind: 'fetch', target: url });
-      if (url.endsWith('/releases/latest'))
-        return JSON.stringify({
-          tag_name: `v${state.release}`,
-          draft: false,
-          prerelease: false,
-          assets: [
-            ...assetNames.map(name => ({
-              name,
-              browser_download_url: `https://github.com/iOfficeAI/OfficeCLI/releases/download/v${state.release}/${name}`,
-              digest: `sha256:${checksum}`,
-            })),
-            {
-              name: 'SHA256SUMS',
-              browser_download_url: `https://github.com/iOfficeAI/OfficeCLI/releases/download/v${state.release}/SHA256SUMS`,
-            },
-          ],
-        });
-      if (url.endsWith('/SHA256SUMS')) return assetNames.map(name => `${checksum}  ${name}`).join('\n');
-      if (url.includes('/git/ref/tags/'))
-        return JSON.stringify({ ref: `refs/tags/v${state.release}`, object: { type: 'commit', sha: revision } });
-      if (url.includes('registry.npmjs.org')) return JSON.stringify({ gitHead: revision });
-      throw new Error('unexpected-fetch');
+      return releaseContract({
+        tag: `v${state.release}`,
+        asset: assetNames,
+        digest: checksum,
+        revision,
+        also: url => {
+          if (url.includes('registry.npmjs.org')) return JSON.stringify({ gitHead: revision });
+          throw new Error('unexpected-fetch');
+        },
+      }).fetchText(url);
     },
     async fetchBytes(url) {
       f.calls.push({ kind: 'binary', target: url });
@@ -202,10 +190,7 @@ async function fixture(t, platform = process.platform, extra = {}) {
       return stamp;
     },
   };
-  const ccw =
-    extra.arch !== undefined || extra.libc !== undefined
-      ? createCcw({ machine, home: f.home, claudeRoot: f.claudeRoot, cclineRoot: f.cclineRoot, platform, ...extra })
-      : f.ccw(machine, { platform });
+  const ccw = f.ccw(machine, { platform, ...extra });
   const seedNpm = async kind => {
     const name = kind === 'claude' ? '@anthropic-ai/claude-code' : '@officecli/officecli';
     packages.set(name, kind === 'claude' ? '2.1.311' : '1.0.123');
