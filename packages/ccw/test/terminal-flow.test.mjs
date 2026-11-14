@@ -202,6 +202,60 @@ for (const scenario of [
     );
   });
 
+test('模型配置表单读取并提交 Fable 模型', async () => {
+  const item = {
+    id: 'settings',
+    title: '模型配置',
+    kind: 'settings',
+    canInstall: true,
+    facts: [{ code: 'api-configured' }],
+    hasCredential: true,
+    values: { mode: 'api', baseUrl: 'https://gateway.example.test', fable: 'previous-fable' },
+  };
+  let home = 0;
+  let selections = 0;
+  let request;
+  await runTerminal(
+    {
+      inspect: async () => ({ items: [item], problems: [] }),
+      plan: async value => {
+        request = value;
+        return {
+          id: 'settings-plan',
+          problem: null,
+          items: [{ id: 'settings', title: '模型配置', action: 'configure', changes: [], problem: null }],
+        };
+      },
+    },
+    {
+      wait: (_title, work) => work(new AbortController().signal),
+      choose: async title => {
+        if (title === HOME_TITLE) return home++ ? 4 : 0;
+        if (title === '模型配置') return 1;
+        assert.ok(title.startsWith('变更预览'));
+        return 1;
+      },
+      select: async () => {
+        if (selections++ === 0) return { kind: 'edit', index: 0 };
+        return selections === 2 ? 'submit' : 'cancel';
+      },
+      form: async (title, fields, validate) => {
+        assert.equal(title, '第三方 API');
+        assert.deepEqual(
+          fields.map(field => field.key),
+          ['baseUrl', 'secret', 'model', 'fable', 'opus', 'sonnet', 'haiku'],
+        );
+        assert.equal(fields.find(field => field.key === 'fable').value, 'previous-fable');
+        const values = Object.fromEntries(fields.map(field => [field.key, field.value]));
+        values.fable = 'updated-fable';
+        assert.equal(validate(values), null);
+        return values;
+      },
+    },
+  );
+  assert.equal(request.selected[0].fields.fable, 'updated-fable');
+});
+
 test('取消预览不执行，返回列表后可退出', async () => {
   const scenario = createTerminalScenario({ cancel: true });
   await runTerminal(scenario.ccw, scenario.terminal);

@@ -104,8 +104,8 @@ if (scenario === 'home' || scenario === 'narrow') {
   const values = await terminal.form(
     'FORM_INPUT',
     [
-      { key: 'name', label: 'NAME', value: '' },
-      { key: 'secret', label: 'SECRET', value: '', secret: true },
+      { key: 'name', label: '默认模型', value: '' },
+      { key: 'secret', label: 'Fable', value: '', secret: true },
     ],
     v => (v.name ? null : { message: 'NAME_REQUIRED', field: 'name' }),
   );

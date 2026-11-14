@@ -94,6 +94,7 @@ const ACTION_NAMES: Readonly<Record<Action, string>> = {
 /** 模型配置表单的字段键与显示顺序 */
 export const MODEL_FIELDS = [
   { key: 'model', label: '默认模型' },
+  { key: 'fable', label: 'Fable' },
   { key: 'opus', label: 'Opus' },
   { key: 'sonnet', label: 'Sonnet' },
   { key: 'haiku', label: 'Haiku' },

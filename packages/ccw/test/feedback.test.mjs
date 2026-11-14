@@ -152,6 +152,7 @@ test('检查页对齐模型字段和同组状态，共用插件路径只显示�
         location: '/settings.json',
         values: {
           model: 'model-default',
+          fable: 'model-fable',
           opus: 'model-opus',
           sonnet: 'model-sonnet',
           haiku: 'model-haiku',
@@ -170,9 +171,10 @@ test('检查页对齐模型字段和同组状态，共用插件路径只显示�
     problems: [],
   });
   const lines = text.split('\n');
-  const fields = lines.filter(line => /^ {2}(默认模型|Opus|Sonnet|Haiku|默认语言|输出风格|路径)/.test(line));
-  const modelFields = fields.slice(0, 7);
-  assert.equal(modelFields.length, 7);
+  const fields = lines.filter(line => /^ {2}(默认模型|Fable|Opus|Sonnet|Haiku|默认语言|输出风格|路径)/.test(line));
+  const modelFields = fields.slice(0, 8);
+  assert.equal(modelFields.length, 8);
+  assert.match(text, /Fable\s*：model-fable/);
   assert.equal(new Set(modelFields.map(line => stringWidth(line.split('：')[0]))).size, 1);
   const pluginLines = lines.filter(line => /^(GitHub|Frontend Design|Serena)/.test(line));
   assert.equal(pluginLines.length, 3);

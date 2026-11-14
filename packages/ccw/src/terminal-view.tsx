@@ -410,6 +410,7 @@ function InlineForm({
   };
   const [problem, setProblem] = useState<FormProblem>(null);
   const size = useWindowSize();
+  const labelWidth = Math.max(0, ...fields.map(field => stringWidth(field.label)));
   const append = (text: string) => {
     const field = fields[activeRef.current];
     if (field) {
@@ -473,7 +474,7 @@ function InlineForm({
                 : (values[field.key] ?? '');
               const characters = Array.from(text);
               const caret = index === active ? cursor : characters.length;
-              const available = Math.max(1, size.columns - stringWidth(field.label) - LAYOUT.formDecorationColumns);
+              const available = Math.max(1, size.columns - labelWidth - LAYOUT.formDecorationColumns);
               let from = caret;
               while (from > 0 && stringWidth(characters.slice(from - 1, caret).join('')) < available) from--;
               let to = caret;
@@ -481,7 +482,9 @@ function InlineForm({
               return (
                 <Text key={field.key} wrap="truncate-end" {...(index === active ? { color: ACCENT } : {})}>
                   {index === active ? '› ' : '  '}
-                  {field.label}：{safeText(characters.slice(from, caret).join(''))}
+                  {field.label}
+                  {' '.repeat(labelWidth - stringWidth(field.label))}：
+                  {safeText(characters.slice(from, caret).join(''))}
                   {index === active && <Text inverse>{characters[caret] ?? ' '}</Text>}
                   {safeText(characters.slice(caret + (index === active ? 1 : 0), to).join(''))}
                   {!values[field.key] && field.placeholder ? ' ' + field.placeholder : ''}

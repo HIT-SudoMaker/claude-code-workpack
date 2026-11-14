@@ -142,6 +142,7 @@ internal static class ConPtyTest
               Send(inWrite,"\x1b"); WaitFor("SETTINGS_DONE",5000);
             } else if(args[2]=="form") {
               WaitFor("FORM_INPUT",5000);
+              WaitFor("默认模型：",5000); WaitFor("Fable   ：",5000);
               Send(inWrite,"\x1b[B\r"); WaitFor("NAME_REQUIRED",5000);
               Send(inWrite,"\x1b[200~中文 name\x1b[201~"); WaitFor("中文 name",5000);
               Send(inWrite,"\t"); Thread.Sleep(100);
