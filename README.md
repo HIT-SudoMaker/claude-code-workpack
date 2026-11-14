@@ -1,4 +1,4 @@
-# CCW 0.5.0
+# CCW 0.5.1
 
 CCW 是一个管理 Claude Code 及其常用扩展的终端工具。安装、更新和移除前，CCW 会先展示变更预览，确认后再执行。
 
@@ -72,7 +72,7 @@ npm start
 ```powershell
 New-Item -ItemType Directory -Force .scratch | Out-Null
 npm pack ./packages/ccw --pack-destination .scratch
-pnpm add --global --force ./.scratch/hit-sudomaker-ccw-0.5.0.tgz
+pnpm add --global --force ./.scratch/hit-sudomaker-ccw-0.5.1.tgz
 ```
 
 重新打包后再安装，关闭旧的 CCW 窗口并运行 `ccw`，即可使用新版本。如果原来使用 npm 全局安装，可将最后一行换成 `npm install -g`，并指定同一个安装包。打包和本地安装不会发布版本。
