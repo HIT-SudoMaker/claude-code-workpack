@@ -10,8 +10,7 @@ import { startupFailure } from '../dist/render.js';
 const { version } = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 const main = fileURLToPath(new URL('../dist/main.js', import.meta.url));
-// Isolate the OS user boundary so parallel CLI test files do not contend for
-// this file's startup lease. Configuration environment variables remain real.
+// 隔离测试用户，避免并行测试争用启动锁；配置环境变量仍使用真实值
 const userFixture = `data:text/javascript,${encodeURIComponent(`
   import os from 'node:os';
   const user = os.userInfo();
@@ -25,6 +24,22 @@ const run = (args, env = {}) =>
     env: { ...process.env, ...env },
   });
 
+// 帮助与版本的正常输出
+for (const mode of ['--help', '--version'])
+  for (const args of [
+    [mode, '--details'],
+    ['--details', mode],
+  ])
+    test(`保留正常输出：${args.join(' ')}`, () => {
+      const result = run(args, { CLAUDE_CONFIG_DIR: path.parse(process.cwd()).root });
+      assert.equal(result.status, 0);
+      assert.equal(result.stderr, '');
+      if (mode === '--version') assert.equal(result.stdout, `${version}\n`);
+      else assert.match(result.stdout, /--details：显示诊断代码与检查明细/);
+      assert.doesNotMatch(result.stdout, /代码：/);
+    });
+
+// 无效参数与启动失败
 for (const args of [
   ['--bad'],
   ['--detials'],
@@ -40,7 +55,7 @@ for (const args of [
     const result = run(args);
     assert.equal(result.status, 1);
     assert.equal(result.stdout, '');
-    assert.equal(result.stderr, '参数无效\n');
+    assert.equal(result.stderr, 'CCW 启动失败：参数无效\n');
   });
 
 for (const args of [
@@ -52,33 +67,19 @@ for (const args of [
     const result = run(args);
     assert.equal(result.status, 1);
     assert.equal(result.stdout, '');
-    assert.match(result.stderr, /^参数无效\n/);
+    assert.match(result.stderr, /^CCW 启动失败：参数无效\n/);
     assert.match(result.stderr, /代码：unknown-argument/);
-    assert.match(result.stderr, /只接受一个模式/);
+    assert.equal(result.stderr, 'CCW 启动失败：参数无效\n代码：unknown-argument\n');
     assert.doesNotMatch(result.stderr, /secret-argument|Error:|at main|process\.env/);
   });
-
-for (const mode of ['--help', '--version'])
-  for (const args of [
-    [mode, '--details'],
-    ['--details', mode],
-  ])
-    test(`保留正常输出：${args.join(' ')}`, () => {
-      const result = run(args, { CLAUDE_CONFIG_DIR: path.parse(process.cwd()).root });
-      assert.equal(result.status, 0);
-      assert.equal(result.stderr, '');
-      if (mode === '--version') assert.equal(result.stdout, `${version}\n`);
-      else assert.match(result.stdout, /--details：显示启动异常与检查完整明细/);
-      assert.doesNotMatch(result.stdout, /代码：/);
-    });
 
 test('保留交互终端失败退出码', () => {
   const ordinary = run([]);
   const explicit = run(['--details']);
   assert.equal(ordinary.status, 1);
   assert.equal(explicit.status, 1);
-  assert.equal(ordinary.stderr, '需要交互终端\n');
-  assert.match(explicit.stderr, /^需要交互终端\n/);
+  assert.equal(ordinary.stderr, 'CCW 启动失败：需要交互终端\n');
+  assert.match(explicit.stderr, /^CCW 启动失败：需要交互终端\n/);
   assert.match(explicit.stderr, /代码：interactive-terminal-required/);
 });
 
@@ -88,16 +89,16 @@ test('按需显示检查模式的启动异常', () => {
   const explicit = run(['--inspect', '--details'], env);
   assert.equal(ordinary.status, 1);
   assert.equal(explicit.status, 1);
-  assert.equal(ordinary.stderr, '启动失败\n');
+  assert.equal(ordinary.stderr, 'CCW 启动失败：配置目录无效\n');
   assert.equal(ordinary.stdout, '');
-  assert.match(explicit.stderr, /^启动失败\n/);
+  assert.match(explicit.stderr, /^CCW 启动失败：配置目录无效\n/);
   assert.match(explicit.stderr, /代码：invalid-config-root/);
 });
 
 test('隐藏异常的原始内容', () => {
-  assert.equal(startupFailure('unmapped-startup', false), '启动失败');
+  assert.equal(startupFailure('unmapped-startup', false), 'CCW 启动失败：原因未知');
   assert.equal(
     startupFailure('secret\nAuthorization: private-value', true),
-    '启动失败\n执行操作失败：原因未知\n代码：operation-failed',
+    'CCW 启动失败：原因未知\n代码：operation-failed',
   );
 });

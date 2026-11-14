@@ -1,126 +1,89 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID } from 'node:crypto';
 
-import { knownTitle, programCopySuffix } from './titles.js';
-import { createCcline } from './ccline.js';
-import { createClaudeDomain, createSettingsDomain } from './claude-config.js';
-import { createCleanupDomain, prepareClaudeDataRemoval } from './cleanup.js';
-import { createMcpDomain } from './mcp.js';
-import { createPluginsDomain } from './plugins.js';
-import { createSkillsDomain, overlappingSkillSelections } from './skills.js';
 import { errorCode } from './machine.js';
-import { CLAUDE_DATA_ID, cancelled, context, defaultInstallAction, kindOf, restOf } from './model.js';
+import { cancelled, context } from './model.js';
 import type {
   CcwOptions,
-  Change,
-  Context,
-  Describe,
   Domain,
   Inspection,
+  ItemResult,
   Plan,
   PlanItem,
   PreparationProgress,
-  Prepared,
   Progress,
   Request,
   RunResult,
-  Selection,
-  OperationHandler,
-  Recovery,
 } from './model.js';
-import { createOfficecli, OFFICECLI_ENTRY_IDS } from './officecli.js';
 import { createReadMachine } from './read-machine.js';
-import { createEffectMachine } from './effect-machine.js';
-import { createOperationController } from './operation-controller.js';
+import type { ReadScope } from './read-machine.js';
+import { createEffectMachine, createEffectScope } from './effect-machine.js';
+import { inspectClaudeData } from './cleanup.js';
+import { CONTENT_DOMAINS, createPlanner } from './planning.js';
+import type { ApprovedPlan } from './planning.js';
 
 export type { Action, Inspection, Item, Pick, Plan, Request } from './model.js';
+
+const INSPECTION_TIMEOUT_MS = 5_000;
+const VERIFICATION_TIMEOUT_MS = 30_000;
+
+/** 检查、准备并执行当前用户的工具配置 */
 export interface Ccw {
-  /** 并行读取独立内容；外部探测共享 5 秒预算，取消后不交付迟到结果 */
-  inspect(scope?: 'contents' | 'data', signal?: AbortSignal): Promise<Inspection>;
-  /** 准备只读资源，接受取消并报告当前获取步骤；不交付已取消的计划 */
+  /**
+   * 汇总各工具域的安装与配置状态
+   *
+   * @param signal - 取消本次检查的信号
+   * @param scope - contents 检查工具，data 仅清点可清理的 Claude 数据
+   * @returns 状态与检查问题；单域失败不阻断其他域
+   * @throws Error - 取消时以 cancelled 拒绝
+   * @remarks 不消费现有计划，不写入受管目标；外部探测共享五秒预算
+   */
+  inspect(signal?: AbortSignal, scope?: 'contents' | 'data'): Promise<Inspection>;
+  /**
+   * 根据选择准备一份可预览的内存计划
+   *
+   * @param request - 安装、移除或清理任务及所选对象；输入会先复制
+   * @param signal - 取消资源准备的信号
+   * @param progress - 准备进度接收器；抛错或拒绝后停止通知，不中断准备
+   * @returns 不含凭据的计划副本；空选择记录为计划问题，单项准备失败记录在对应条目中
+   * @throws Error - 并发操作、无效请求或取消时拒绝
+   * @remarks 新请求使旧计划失效；可查询或暂存来源，但不写入受管目标
+   */
   plan(
     request: Request,
     signal?: AbortSignal,
     progress?: (event: PreparationProgress) => void | Promise<void>,
   ): Promise<Plan>;
-  /** 消费当前计划；观察回调失败后停止通知，实际结果仍由返回值交付 */
+  /**
+   * 消费当前计划并逐项执行已确认的变更
+   *
+   * @param planId - 当前实例最近一次准备的计划标识
+   * @param signal - 停止后续写入的信号，不取消已发生效果的核验
+   * @param progress - 进度接收器；接收副本，失败后停止通知
+   * @returns 逐项结果；失效计划、执行失败和取消通过结果表达
+   * @remarks 计划只能消费一次；不回滚已发生的效果，独立项目可继续执行
+   */
   apply(planId: string, signal?: AbortSignal, progress?: (event: Progress) => void | Promise<void>): Promise<RunResult>;
-  recovery(): Promise<Recovery | undefined>;
-  abandon(taskId: string): Promise<void>;
 }
 
-/** 内容域清单单一出处：kind 键供计划路由，标签进检查问题详情 */
-const CONTENT_DOMAINS: ReadonlyArray<
-  readonly [keys: readonly string[], label: string, factory: (ctx: Context) => Domain]
-> = [
-  [['claude'], 'claude', createClaudeDomain],
-  [['officecli'], 'officecli', createOfficecli],
-  [['settings'], 'settings', createSettingsDomain],
-  [['plugin'], 'plugins', createPluginsDomain],
-  [['mcp'], 'mcp', createMcpDomain],
-  [['skill', 'skill-set', 'command'], 'skills', createSkillsDomain],
-  [['ccline'], 'ccline', createCcline],
-];
-
-/** 约束观察器：回调失败即自失效，绝不打断流程 */
-function progressGuard<P>(callback?: (event: P) => unknown) {
-  let observer = callback;
-  return (event: P) => {
-    if (observer === undefined) return;
-    try {
-      void Promise.resolve(observer(event)).catch(() => {
-        observer = undefined;
-      });
-    } catch {
-      observer = undefined;
-    }
-  };
-}
-
-/** 生成准备前的纯描述；需要来源证据的标题由领域准备步骤用同一份事实补全 */
-function planDisplayTitle(id: string, selected: readonly Selection[]): string {
-  const kind = kindOf(id);
-  const key = restOf(id) ?? '';
-  if (kind === 'mcp' || kind === 'plugin' || kind === 'skill' || kind === 'command') return key || id;
-  if (kind === 'claude' || kind === 'officecli')
-    return `${knownTitle(kind)}${programCopySuffix(
-      id,
-      selected.map(other => other.id),
-    )}`;
-  return knownTitle(id);
-}
-
-/** 统一管理当前用户的内容；检查不消费计划，执行逐项报告已发生的效果 */
+/**
+ * 创建独立持有计划和操作锁的 CCW 实例
+ *
+ * @throws Error - 用户目录或配置根不是有效的绝对非根路径
+ * @remarks 创建时不安装工具，读写由实例方法触发
+ */
 export function createCcw(options: CcwOptions): Ccw {
   const ctx = context(options);
-  const handlers = new Map<string, OperationHandler>();
-  const controller = createOperationController(ctx, options.machine, handlers);
-  const effects = controller.effects;
-  const preparation = new AsyncLocalStorage<{
-    signal?: AbortSignal;
-    report: (stage: PreparationProgress['stage']) => void;
-  }>();
-  const preparationContext = { ...ctx, effects, machine: createReadMachine(ctx.machine, () => preparation.getStore()) };
-  /** 登记 prepare 域：随 preparationContext 一次建成；inspect 域每次内联新建以吃当次读取预算 */
-  const prepareDomains = new Map<string, Domain>();
-  for (const [keys, , factory] of CONTENT_DOMAINS) {
-    const domain = factory(preparationContext);
-    for (const [key, handler] of Object.entries(domain.handlers ?? {})) {
-      if (handlers.has(key)) throw new Error('duplicate-operation-handler');
-      handlers.set(key, handler);
-    }
-    for (const key of keys) prepareDomains.set(key, domain);
-  }
-  const cleanup = createCleanupDomain(preparationContext);
-  prepareDomains.set('data', cleanup);
-  for (const [key, handler] of Object.entries(cleanup.handlers ?? {})) {
-    if (handlers.has(key)) throw new Error('duplicate-operation-handler');
-    handlers.set(key, handler);
-  }
+  let busy = false;
+  let approved: ApprovedPlan | undefined;
+  const effectScope = createEffectScope(options.machine);
+  const effects = effectScope.machine;
+  const readScope = new AsyncLocalStorage<ReadScope>();
+  const preparationContext = { ...ctx, effects, machine: createReadMachine(ctx.machine, () => readScope.getStore()) };
+  const plan = createPlanner(preparationContext, readScope);
 
-  async function inspect(scope: 'contents' | 'data' = 'contents', signal?: AbortSignal): Promise<Inspection> {
+  async function inspect(signal?: AbortSignal, scope: 'contents' | 'data' = 'contents'): Promise<Inspection> {
     cancelled(signal);
-    const deadlineMs = performance.now() + 5_000;
+    const deadlineMs = performance.now() + INSPECTION_TIMEOUT_MS;
     const reading = {
       ...ctx,
       effects: createEffectMachine(options.machine, () => false),
@@ -138,198 +101,163 @@ export function createCcw(options: CcwOptions): Ccw {
     };
     const results =
       scope === 'data'
-        ? [await guard('data', createCleanupDomain(reading))]
+        ? [await inspectClaudeData(reading)]
         : await Promise.all(CONTENT_DOMAINS.map(([, label, factory]) => guard(label, factory(reading))));
     cancelled(signal);
-    const grouped = new Set(results.flatMap(result => result.grouped ?? []));
-    return {
-      items: results.flatMap(result => result.items).filter(item => !grouped.has(item.id)),
-      problems: results.flatMap(result => result.problems),
-    };
+    return { items: results.flatMap(result => result.items), problems: results.flatMap(result => result.problems) };
   }
 
-  async function prepare(selection: Selection, describe: Describe): Promise<Prepared> {
-    const domain = prepareDomains.get(kindOf(selection.id));
-    if (!domain) throw new Error('unknown-selection');
-    return domain.prepare(selection, describe);
+  async function apply(
+    planId: string,
+    signal?: AbortSignal,
+    progress?: (event: Progress) => void | Promise<void>,
+  ): Promise<RunResult> {
+    if (busy) return failedRun('operation-in-progress');
+    const current = approved;
+    if (!current || current.plan.id !== planId) return failedRun('plan-unavailable');
+    approved = undefined;
+    busy = true;
+    const notify = progressGuard(progress);
+    const problems = new Map<string, string>();
+    const finished = new Set<string>();
+    let wasCancelled = false;
+    const verify = <T>(read: () => Promise<T>): Promise<T> =>
+      readScope.run(
+        {
+          deadlineMs: performance.now() + VERIFICATION_TIMEOUT_MS,
+          commandTimeoutMs: VERIFICATION_TIMEOUT_MS,
+          timeoutCode: 'verification-timeout',
+        },
+        read,
+      );
+    const resultFor = (item: PlanItem): ItemResult => {
+      const outcome = current.work.get(item.id)?.result();
+      const failure = problems.get(item.id);
+      const done = !!outcome?.complete && !item.problem && failure === undefined;
+      const effects = [...(outcome?.effects ?? [])];
+      const causes = new Set([
+        ...(item.problem ? [item.problem] : []),
+        ...(failure === undefined ? [] : [failure]),
+        ...(outcome?.problems ?? []),
+      ]);
+      if (!done && wasCancelled && !finished.has(item.id) && !item.problem) causes.add('cancelled');
+      for (const problem of causes)
+        if (!effects.some(effect => effect.code === problem))
+          effects.push({
+            state: problem === 'cancelled' || problem === 'dependency-not-ready' ? 'skipped' : 'failed',
+            code: problem,
+          });
+      const hasEffect = effects.some(effect => effect.state === 'done' || effect.state === 'kept');
+      const failed = effects.some(effect => effect.state === 'failed');
+      const result: ItemResult = {
+        id: item.id,
+        title: item.title,
+        state: done
+          ? 'done'
+          : hasEffect
+            ? 'partial'
+            : failed
+              ? 'failed'
+              : causes.has('cancelled')
+                ? 'cancelled'
+                : causes.has('dependency-not-ready')
+                  ? 'skipped'
+                  : 'failed',
+        effects,
+      };
+      return result;
+    };
+    try {
+      for (const item of current.plan.items) {
+        const job = current.work.get(item.id);
+        if (!job || item.problem) {
+          notify({ kind: 'checked', id: item.id, result: resultFor(item) });
+          continue;
+        }
+        try {
+          cancelled(signal);
+          await job.run({
+            ...(signal ? { signal } : {}),
+            perform: action => effectScope.run(action, signal),
+            verify,
+            started: () => notify({ kind: 'started', id: item.id }),
+            report: effect => notify({ kind: 'effect', id: item.id, effect }),
+          });
+          finished.add(item.id);
+        } catch (error) {
+          if (errorCode(error) === 'cancelled') {
+            wasCancelled = true;
+          } else problems.set(item.id, errorCode(error));
+        }
+        notify({ kind: 'checked', id: item.id, result: resultFor(item) });
+        if (wasCancelled) break;
+      }
+      wasCancelled ||= signal?.aborted === true;
+      for (const [id, job] of current.work) {
+        try {
+          await verify(() => job.verify());
+        } catch (error) {
+          problems.set(id, errorCode(error));
+        }
+      }
+      const results = current.plan.items.map(item => {
+        const result = resultFor(item);
+        notify({ kind: 'finished', id: item.id, result });
+        return result;
+      });
+      const result: RunResult = {
+        state: results.every(item => item.state === 'done')
+          ? 'done'
+          : wasCancelled
+            ? 'cancelled'
+            : results.some(item => item.state === 'done' || item.state === 'partial')
+              ? 'partial'
+              : 'failed',
+        items: results,
+      };
+      return result;
+    } catch (error) {
+      return failedRun(errorCode(error));
+    } finally {
+      busy = false;
+    }
   }
 
   return {
     inspect,
     async plan(input, signal, progress) {
-      cancelled(signal);
-      const submitted = structuredClone(input);
-      const emit = progressGuard(progress);
-      const observe = (id: string, title: string) => ({
-        ...(signal ? { signal } : {}),
-        report(stage: PreparationProgress['stage']) {
-          emit({ id, title, stage });
-        },
-      });
-      return preparation.run({ ...(signal ? { signal } : {}), report() {} }, () =>
-        controller.plan(submitted, async () => {
-          if ('resume' in submitted) throw new Error('plan-unavailable');
-          const snapshot = submitted;
-          if (new Set(snapshot.selected.map(pick => pick.id)).size !== snapshot.selected.length)
-            throw new Error('duplicate-selection');
-          if (!['install', 'detach', 'uninstall', 'clean'].includes(snapshot.task))
-            throw new Error('action-unavailable');
-          if ('removeData' in snapshot && (snapshot.task !== 'uninstall' || typeof snapshot.removeData !== 'boolean'))
-            throw new Error('action-unavailable');
-          const shouldRemoveData = snapshot.task === 'uninstall' && snapshot.removeData === true;
-          const request: Selection[] = snapshot.selected.map(pick => {
-            if (
-              pick.maintenance !== undefined &&
-              (snapshot.task !== 'install' || !['update', 'reinstall', 'login'].includes(pick.maintenance))
-            )
-              throw new Error('action-unavailable');
-            if (pick.removal !== undefined && (snapshot.task !== 'uninstall' || pick.removal !== 'detach'))
-              throw new Error('action-unavailable');
-            const isProgram = ['claude', 'officecli', 'ccline'].includes(kindOf(pick.id));
-            const action =
-              snapshot.task === 'install'
-                ? (pick.maintenance ?? defaultInstallAction(pick.id))
-                : snapshot.task === 'uninstall'
-                  ? pick.removal === 'detach' || !isProgram
-                    ? 'detach'
-                    : 'uninstall'
-                  : snapshot.task;
-            return {
-              id: pick.id,
-              action,
-              ...(pick.fields ? { fields: pick.fields } : {}),
-              ...(shouldRemoveData && kindOf(pick.id) === 'claude' ? { removeData: true } : {}),
-            };
-          });
-          const claudeRemovals = request.filter(
-            selection => selection.action === 'uninstall' && kindOf(selection.id) === 'claude',
-          );
-          if (shouldRemoveData && !claudeRemovals.length) throw new Error('claude-removal-required');
-          const work = new Map<string, Prepared>();
-          const items: PlanItem[] = [];
-          const sorted = [...request].sort((a, b) =>
-            snapshot.task === 'uninstall'
-              ? Number(kindOf(a.id) === 'claude') - Number(kindOf(b.id) === 'claude')
-              : Number(kindOf(a.id) !== 'claude') - Number(kindOf(b.id) !== 'claude'),
-          );
-          const hasOfficeConnectionChange = sorted.some(
-            selection => kindOf(selection.id) === 'officecli' && selection.action !== 'update',
-          );
-          /** 装配单项计划：成功记入 work 并取 changes，失败收敛为 problem 码 */
-          const attach = async (id: string, prepareOperation: () => Promise<Prepared>) => {
-            let problem: string | null = null;
-            let changes: readonly Change[] = [];
-            try {
-              const operation = await prepareOperation();
-              changes = operation.operations.flatMap(definition => definition.changes);
-              work.set(id, operation);
-            } catch (error) {
-              problem = errorCode(error);
-            }
-            return { changes, problem };
-          };
-          const prepareItem = async (selection: Selection): Promise<PlanItem> => {
-            cancelled(signal);
-            let title = planDisplayTitle(selection.id, sorted);
-            let observer = observe(selection.id, title);
-            return preparation.run({ ...observer, report: stage => observer.report(stage) }, async () => {
-              observer.report('inspect');
-              const { changes, problem } = await attach(selection.id, async () => {
-                if (hasOfficeConnectionChange && (OFFICECLI_ENTRY_IDS as readonly string[]).includes(selection.id))
-                  throw new Error('overlapping-selection');
-                return prepare(selection, resolved => {
-                  cancelled(signal);
-                  if (title === resolved) return;
-                  title = resolved;
-                  observer = observe(selection.id, title);
-                  observer.report('inspect');
-                });
-              });
-              cancelled(signal);
-              return { id: selection.id, title, action: selection.action, changes, problem };
-            });
-          };
-          let next = 0;
-          const workers = await Promise.allSettled(
-            Array.from({ length: Math.min(2, sorted.length) }, async () => {
-              while (next < sorted.length) {
-                const index = next++;
-                const selection = sorted[index];
-                if (selection) items[index] = await prepareItem(selection);
-              }
-            }),
-          );
-          for (const result of workers) if (result.status === 'rejected') throw result.reason;
-          for (const id of overlappingSkillSelections(preparationContext, sorted, work)) {
-            const index = items.findIndex(item => item.id === id);
-            items[index] = { ...items[index]!, changes: [], problem: 'overlapping-selection' };
-            work.delete(id);
-          }
-          const claudePrerequisites = sorted
-            .filter(
-              selection =>
-                kindOf(selection.id) === 'claude' && ['install', 'update', 'reinstall'].includes(selection.action),
-            )
-            .map(selection => `${selection.id}/program-ready`);
-          for (const [id, prepared] of work) {
-            const needsClaude = (operation: Prepared['operations'][number]) =>
-              (kindOf(id) === 'plugin' && sorted.find(selection => selection.id === id)?.action !== 'detach') ||
-              operation.handler === 'settings.login';
-            if (!claudePrerequisites.length || !prepared.operations.some(needsClaude)) continue;
-            const available = claudePrerequisites.every(prerequisite =>
-              [...work.values()].some(value => value.operations.some(operation => operation.id === prerequisite)),
-            );
-            const operations = prepared.operations.flatMap(operation =>
-              !needsClaude(operation)
-                ? [operation]
-                : available
-                  ? [{ ...operation, dependsOn: [...new Set([...operation.dependsOn, ...claudePrerequisites])] }]
-                  : [],
-            );
-            work.set(id, { ...prepared, operations });
-            if (!available) {
-              const index = items.findIndex(item => item.id === id);
-              items[index] = { ...items[index]!, problem: 'dependency-not-ready' };
-            }
-          }
-          if (shouldRemoveData) {
-            await preparation.run(observe(CLAUDE_DATA_ID, knownTitle(CLAUDE_DATA_ID)), async () => {
-              preparation.getStore()?.report('inspect');
-              const { changes, problem } = await attach(CLAUDE_DATA_ID, () => {
-                const prerequisites = claudeRemovals.map(selection => `${selection.id}/program-removed`);
-                if (
-                  !claudeRemovals.every((selection, index) =>
-                    work.get(selection.id)?.operations.some(operation => operation.id === prerequisites[index]),
-                  )
-                )
-                  throw new Error('dependency-not-ready');
-                return prepareClaudeDataRemoval(preparationContext, prerequisites);
-              });
-              if (problem && problem !== 'dependency-not-ready') {
-                for (const selection of claudeRemovals) {
-                  work.delete(selection.id);
-                  const index = items.findIndex(item => item.id === selection.id);
-                  items[index] = { ...items[index]!, problem: items[index]!.problem ?? problem };
-                }
-              }
-              items.push({
-                id: CLAUDE_DATA_ID,
-                title: knownTitle(CLAUDE_DATA_ID),
-                action: 'uninstall',
-                changes,
-                problem,
-              });
-            });
-          }
-          const plan: Plan = { id: randomUUID(), items, problem: items.length === 0 ? 'empty-selection' : null };
-          cancelled(signal);
-          return { plan, work };
-        }),
-      );
+      if (busy) throw new Error('operation-in-progress');
+      approved = undefined;
+      busy = true;
+      try {
+        const current = await plan(input, signal, progressGuard(progress));
+        approved = current;
+        return structuredClone(current.plan);
+      } finally {
+        busy = false;
+      }
     },
-    recovery: () => controller.recovery(),
-    abandon: id => controller.abandon(id),
     apply: (id, signal, progress) =>
-      preparation.run({ ...(signal ? { signal } : {}), report() {} }, () => controller.apply(id, signal, progress)),
+      readScope.run({ ...(signal ? { signal } : {}) }, () => apply(id, signal, progress)),
+  };
+}
+
+const failedRun = (problem: string): RunResult => ({
+  state: 'failed',
+  items: [{ id: 'plan', title: '操作计划', state: 'failed', effects: [{ state: 'failed', code: problem }] }],
+});
+
+/** 复制公开进度并隔离接收器异常 */
+function progressGuard<P>(callback?: (event: P) => unknown) {
+  let observer = callback;
+  return (event: P) => {
+    if (!observer) return;
+    try {
+      void Promise.resolve(observer(structuredClone(event))).catch(() => {
+        observer = undefined;
+      });
+    } catch {
+      observer = undefined;
+    }
   };
 }

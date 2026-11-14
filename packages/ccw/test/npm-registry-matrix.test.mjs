@@ -1,19 +1,48 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
+import { createTestEnvironment, fail, ok, npmConfig } from './test-environment.mjs';
 
-import {
-  createEnv,
-  fail,
-  npmOf,
-  npmWorld,
-  ok,
-  registryOf,
-  scopedRegistryOf,
-  seedBinary,
-  versionProbe,
-} from './env.mjs';
+const npmOf = (scenario, command) => scenario.calls.filter(call => call.kind === 'npm' && call.target === command);
+const registryOf = args => option(args, '--registry');
+const scopedRegistryOf = (args, scope) => option(args, '--' + scope + ':registry');
+function option(args, key) {
+  const inline = args.find(arg => arg.startsWith(key + '='));
+  const index = args.indexOf(key);
+  return (
+    (inline === undefined ? (index < 0 ? null : args[index + 1]) : inline.slice(key.length + 1))?.replace(/\/$/, '') ??
+    null
+  );
+}
+function npmPackage({ name, npmRoot, version = null, view, install }) {
+  const state = { version };
+  return {
+    state,
+    async npm(args) {
+      if (args[0] === 'config') return npmConfig(args);
+      if (args[0] === 'root') return ok(npmRoot);
+      if (args[0] === 'ls')
+        return ok(
+          JSON.stringify({ dependencies: state.version === null ? {} : { [name]: { version: state.version } } }),
+        );
+      if (args[0] === 'view') return view(args);
+      if (args[0] === 'install') {
+        const version = args.at(-1).slice(args.at(-1).lastIndexOf('@') + 1);
+        const result = await install(version);
+        if (result.code === 0) state.version = version;
+        return result;
+      }
+      throw new Error('Unexpected npm command: ' + args[0]);
+    },
+  };
+}
+function versionProbe({ binary, node = false, output }) {
+  return async (executable, args) => {
+    assert.equal(executable, node ? process.execPath : binary);
+    assert.deepEqual(args, node ? [binary, '--version'] : ['--version']);
+    return ok(output());
+  };
+}
 
 const OFFICIAL = 'https://registry.npmjs.org';
 const MIRROR = 'https://registry.npmmirror.com';
@@ -28,62 +57,39 @@ const viewResult = outcome =>
         ? ok(JSON.stringify('not-a-version'))
         : fail();
 
-async function fixture(t, { configuredView = 'ok', mirrorView = 'ok', install = 'ok', installed = false } = {}) {
-  const f = await createEnv(t, { seed: { settings: {}, state: {} } });
-  const binary = path.join(f.cclineRoot, process.platform === 'win32' ? 'ccline.exe' : 'ccline');
-  const npmRoot = path.join(f.root, 'npm', 'node_modules');
-  if (installed) await f.write(binary, 'fixture binary');
-  const world = npmWorld({
-    package: PACKAGE,
+async function createNpmScenario(
+  testContext,
+  { configuredView = 'ok', mirrorView = 'ok', install = 'ok', installed = false } = {},
+) {
+  const workspace = await createTestEnvironment(testContext, { seed: { settings: {}, state: {} } });
+  const binary = path.join(workspace.cclineRoot, process.platform === 'win32' ? 'ccline.exe' : 'ccline');
+  const npmRoot = path.join(workspace.root, 'npm', 'node_modules');
+  if (installed) await workspace.write(binary, 'fixture binary');
+  const world = npmPackage({
+    name: PACKAGE,
     npmRoot,
     version: installed ? '2.0.1' : null,
-    installVersion: '2.0.1',
-    binary,
-    binaryContent: 'fixture binary',
     view: args => viewResult(registryOf(args) === MIRROR ? mirrorView : configuredView),
-    install: install === 'fail' ? 'fail' : null,
+    install: async () => {
+      if (install === 'fail') return fail();
+      await workspace.write(binary, 'fixture binary');
+      return ok();
+    },
   });
-  const machine = f.machine({
+  const machine = workspace.machine({
     processes: async () => [],
     npm: world.npm,
     execute: versionProbe({ binary, output: () => `ccline ${world.state.version ?? '2.0.1'}` }),
   });
-  return { ...f, ccw: f.ccw(machine) };
+  return { ...workspace, ccw: workspace.ccw(machine) };
 }
 
-async function officeNpmFixture(t, view) {
-  const f = await createEnv(t, { seed: { settings: {}, state: {} } });
-  const npmRoot = path.join(f.root, 'npm', 'node_modules');
-  const binary = path.join(npmRoot, '@officecli', 'officecli', 'vendor', 'officecli.exe');
-  await f.write(binary, 'OfficeCLI 1.0.123 fixture');
-  const world = npmWorld({
-    package: '@officecli/officecli',
-    npmRoot,
-    version: '1.0.123',
-    installVersion: '1.0.160',
-    binary,
-    binaryContent: 'OfficeCLI 1.0.160 fixture',
-    lsOnRequest: true,
-    view,
-  });
-  const machine = {
-    ...f.machine({
-      processes: async () => [],
-      npm: world.npm,
-      execute: versionProbe({ binary, output: () => `OfficeCLI ${world.state.version}` }),
-    }),
-    async fetchText(url) {
-      throw new Error(`unexpected direct metadata fetch: ${url}`);
-    },
-  };
-  return { ...f, binary, machine };
-}
-
-test('安装 CCometixLine：复用镜像与查询期限', async t => {
-  const f = await fixture(t, { configuredView: 'fail' });
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
+// 安装、更新与卸载
+test('安装 CCometixLine：复用镜像与查询期限', async testContext => {
+  const scenario = await createNpmScenario(testContext, { configuredView: 'fail' });
+  const plan = await scenario.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
   assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  const views = npmOf(f, 'view');
+  const views = npmOf(scenario, 'view');
   assert.deepEqual(
     views.map(call => registryOf(call.args)),
     [OFFICIAL, MIRROR],
@@ -101,20 +107,105 @@ test('安装 CCometixLine：复用镜像与查询期限', async t => {
   assert.ok(views.every(call => call.args.includes('--fetch-retries=0')));
   assert.ok(views.every(call => call.args.includes('--fetch-timeout=4000')));
   assert.equal(
-    f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
+    scenario.calls.some(call => call.kind === 'npm' && call.target === 'install'),
     false,
   );
 
-  assert.equal((await f.ccw.apply(plan.id)).state, 'done');
-  const installs = npmOf(f, 'install');
+  assert.equal((await scenario.ccw.apply(plan.id)).state, 'done');
+  const installs = npmOf(scenario, 'install');
   assert.equal(installs.length, 1);
   assert.equal(registryOf(installs[0].args), MIRROR);
   assert.equal(scopedRegistryOf(installs[0].args, '@cometix'), MIRROR);
   assert.ok(installs[0].args.includes('--fetch-retries=1'));
   assert.ok(installs[0].args.includes('--fetch-timeout=30000'));
-  assert.ok(npmOf(f, 'ls').every(call => call.options?.timeoutMs === 5_000));
+  assert.ok(npmOf(scenario, 'ls').every(call => call.options?.timeoutMs > 0 && call.options.timeoutMs <= 5_000));
 });
 
+test('Claude npm 自动更新：固定 stable 版本', async testContext => {
+  const workspace = await createTestEnvironment(testContext, { seed: { settings: {}, state: {} } });
+  const npmRoot = path.join(workspace.root, 'npm', 'node_modules');
+  const packageName = '@anthropic-ai/claude-code';
+  const binary = path.join(npmRoot, packageName, 'cli.js');
+  const stable = { version: '2.1.318' };
+  const world = npmPackage({
+    name: packageName,
+    npmRoot,
+    view: args => ok(JSON.stringify(args[1].endsWith('@stable') ? stable.version : '2.9.999')),
+    install: async version => {
+      await workspace.json(path.join(npmRoot, packageName, 'package.json'), {
+        name: packageName,
+        version,
+        bin: { claude: 'cli.js' },
+      });
+      await workspace.write(binary, 'fixture binary');
+      return ok();
+    },
+  });
+  const machine = workspace.machine({
+    processes: async () => [],
+    npm: world.npm,
+    execute: versionProbe({
+      binary,
+      node: true,
+      output: () => `${world.state.version ?? '2.1.318'} (Claude Code)`,
+    }),
+  });
+  const ccw = workspace.ccw(machine, { platform: 'win32' });
+
+  const first = await ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+  assert.ok(
+    first.items.every(item => item.problem === null),
+    JSON.stringify(first),
+  );
+  assert.equal((await ccw.apply(first.id)).state, 'done');
+  const item = (await ccw.inspect()).items.find(item => item.kind === 'claude');
+  world.state.version = '2.1.300';
+  workspace.calls.length = 0;
+  stable.version = '2.1.320';
+  const plan = await ccw.plan({ task: 'install', selected: [{ id: item.id }] });
+  assert.match(JSON.stringify(plan.items[0].changes), /2\.1\.320/);
+  stable.version = '2.1.321';
+  const result = await ccw.apply(plan.id);
+  assert.equal(result.state, 'done');
+  assert.equal(world.state.version, '2.1.320');
+  assert.ok(
+    workspace.calls.some(
+      call =>
+        call.kind === 'npm' && call.target === 'install' && call.args.at(-1) === '@anthropic-ai/claude-code@2.1.320',
+    ),
+  );
+  assert.equal(
+    workspace.calls.filter(call => call.kind === 'npm' && call.args.includes('@anthropic-ai/claude-code@stable'))
+      .length,
+    1,
+  );
+  assert.equal(
+    workspace.calls.some(call => call.kind === 'npm' && call.args.includes('@anthropic-ai/claude-code@latest')),
+    false,
+  );
+  const repeat = await ccw.plan({ task: 'install', selected: [{ id: item.id }] });
+  assert.ok(
+    repeat.items.every(item => item.problem === null),
+    JSON.stringify(repeat),
+  );
+  assert.equal((await ccw.apply(repeat.id)).state, 'done');
+  assert.equal(world.state.version, '2.1.321');
+});
+
+test('卸载 CCometixLine：限时读取 npm 记录', async testContext => {
+  const scenario = await createNpmScenario(testContext, { installed: true });
+  const plan = await scenario.ccw.plan({ task: 'uninstall', selected: [{ id: 'ccline' }] });
+  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
+  const localReads = scenario.calls.filter(call => call.kind === 'npm' && ['ls', 'root'].includes(call.target));
+  assert.ok(localReads.some(call => call.target === 'ls'));
+  assert.ok(localReads.some(call => call.target === 'root'));
+  assert.ok(
+    localReads.every(call => call.options?.timeoutMs === 5_000),
+    JSON.stringify(localReads),
+  );
+});
+
+// 配置源与镜像的选择边界
 for (const { title, options, views, problem = null, state = 'done', installs = [] } of [
   { title: '安装 CCometixLine：沿用有效配置源', views: [OFFICIAL], installs: [OFFICIAL] },
   {
@@ -145,188 +236,21 @@ for (const { title, options, views, problem = null, state = 'done', installs = [
     installs: [MIRROR],
   },
 ])
-  test(title, async t => {
-    const f = await fixture(t, options);
-    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
+  test(title, async testContext => {
+    const scenario = await createNpmScenario(testContext, options);
+    const plan = await scenario.ccw.plan({ task: 'install', selected: [{ id: 'ccline' }] });
     assert.equal(plan.items[0]?.problem, problem, JSON.stringify(plan));
     assert.deepEqual(
-      npmOf(f, 'view').map(call => registryOf(call.args)),
+      npmOf(scenario, 'view').map(call => registryOf(call.args)),
       views,
     );
-    assert.equal(npmOf(f, 'install').length, 0);
+    assert.equal(npmOf(scenario, 'install').length, 0);
     if (state === null) return;
-    const result = await f.ccw.apply(plan.id);
+    const result = await scenario.ccw.apply(plan.id);
     if (state === 'not-done') assert.notEqual(result.state, 'done');
     else assert.equal(result.state, state);
     assert.deepEqual(
-      npmOf(f, 'install').map(call => registryOf(call.args)),
+      npmOf(scenario, 'install').map(call => registryOf(call.args)),
       installs,
     );
-  });
-
-test('卸载 CCometixLine：限时读取 npm 记录', async t => {
-  const f = await fixture(t, { installed: true });
-  const plan = await f.ccw.plan({ task: 'uninstall', selected: [{ id: 'ccline' }] });
-  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  const localReads = f.calls.filter(call => call.kind === 'npm' && ['ls', 'root'].includes(call.target));
-  assert.ok(localReads.some(call => call.target === 'ls'));
-  assert.ok(localReads.some(call => call.target === 'root'));
-  assert.ok(
-    localReads.every(call => call.options?.timeoutMs === 5_000),
-    JSON.stringify(localReads),
-  );
-});
-
-test('更新 OfficeCLI：复用 npm 镜像', async t => {
-  const f = await officeNpmFixture(t, args => (registryOf(args) === MIRROR ? ok(JSON.stringify('1.0.160')) : fail()));
-  const ccw = f.ccw(f.machine, { platform: 'win32' });
-  const id = `officecli:npm:${f.binary}`;
-  const plan = await ccw.plan({
-    task: 'install',
-    selected: [{ id, maintenance: 'update', fields: { connection: 'mcp' } }],
-  });
-  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  assert.deepEqual(
-    npmOf(f, 'view').map(call => registryOf(call.args)),
-    [OFFICIAL, MIRROR],
-  );
-  assert.ok(
-    f.calls
-      .filter(call => call.kind === 'npm' && ['ls', 'root'].includes(call.target))
-      .every(call => call.options?.timeoutMs === 5_000),
-  );
-
-  assert.equal((await ccw.apply(plan.id)).state, 'done');
-  const installs = npmOf(f, 'install');
-  assert.equal(installs.length, 1);
-  assert.equal(registryOf(installs[0].args), MIRROR);
-});
-
-test('更新 OfficeCLI 技能：固定镜像提交', async t => {
-  const oldRevision = '1111111111111111111111111111111111111111';
-  const nextRevision = '2222222222222222222222222222222222222222';
-  const f = await officeNpmFixture(t, args =>
-    registryOf(args) !== MIRROR ? fail() : ok(JSON.stringify(args.includes('gitHead') ? nextRevision : '1.0.160')),
-  );
-  const skill = path.join(f.claudeRoot, 'skills', 'officecli');
-  await f.write(path.join(skill, 'SKILL.md'), '---\nname: officecli\n---\nold skill');
-  const stamp = await f.machine.treeStamp(skill);
-  const metadataFile = path.join(f.home, '.ccw', 'sources.json');
-  await f.write(
-    metadataFile,
-    JSON.stringify({ [skill]: { repository: 'https://github.com/iOfficeAI/OfficeCLI', revision: oldRevision, stamp } }),
-  );
-  const sourceCalls = () => f.calls.filter(call => call.kind === 'source').length;
-  const machine = {
-    ...f.machine,
-    async source(repository, revision, folder) {
-      f.calls.push({ kind: 'source', target: repository, args: [revision, folder] });
-      assert.equal(repository, 'https://github.com/iOfficeAI/OfficeCLI');
-      assert.equal(revision, nextRevision);
-      assert.equal(folder, 'skills/officecli');
-      return [{ path: 'SKILL.md', data: Buffer.from('---\nname: officecli\n---\nnew skill') }];
-    },
-  };
-  const ccw = f.ccw(machine, { platform: 'win32' });
-  const id = `officecli:npm:${f.binary}`;
-  const plan = await ccw.plan({
-    task: 'install',
-    selected: [{ id, maintenance: 'update', fields: { connection: 'skill' } }],
-  });
-  assert.equal(plan.items[0]?.problem, null, JSON.stringify(plan));
-  assert.equal(sourceCalls(), 1, '准备时冻结 Skill 载荷');
-  const views = npmOf(f, 'view');
-  assert.deepEqual(
-    views.map(call => [call.args.includes('gitHead') ? 'gitHead' : 'version', registryOf(call.args)]),
-    [
-      ['version', OFFICIAL],
-      ['version', MIRROR],
-      ['gitHead', MIRROR],
-    ],
-  );
-  const gitHead = views.find(call => call.args.includes('gitHead'));
-  assert.equal(gitHead.options?.timeoutMs, 5_000);
-  assert.equal(scopedRegistryOf(gitHead.args, '@officecli'), MIRROR);
-
-  assert.equal((await ccw.apply(plan.id)).state, 'done');
-  assert.equal(sourceCalls(), 1);
-  const saved = JSON.parse(await fs.readFile(metadataFile, 'utf8'));
-  assert.equal(saved[skill].revision, nextRevision);
-});
-
-for (const action of ['update', 'reinstall'])
-  test(`Claude npm ${action}：固定 stable 版本`, async t => {
-    const f = await createEnv(t, { seed: { settings: {}, state: {} } });
-    const npmRoot = path.join(f.root, 'npm', 'node_modules');
-    const packageName = '@anthropic-ai/claude-code';
-    const binary = path.join(npmRoot, packageName, 'cli.js');
-    const stable = { version: '2.1.318' };
-    // npmWorld 的 installVersion 在工厂期凝固，而本测试要求安装版本跟随 install 参数（计划期冻结的 stable），
-    // 故以 install 函数按原 bin 种子序列表达动态版本
-    const world = npmWorld({
-      package: packageName,
-      npmRoot,
-      bin: { claude: 'cli.js' },
-      binaryContent: 'fixture binary',
-      view: args => ok(JSON.stringify(args[1].endsWith('@stable') ? stable.version : '2.9.999')),
-      install: async (state, args) => {
-        const spec = args.at(-1);
-        state.version = spec.slice(spec.lastIndexOf('@') + 1);
-        await seedBinary(
-          path.join(npmRoot, packageName, 'package.json'),
-          JSON.stringify({ name: packageName, version: state.version, bin: { claude: 'cli.js' } }),
-        );
-        await seedBinary(binary, 'fixture binary');
-        return ok();
-      },
-    });
-    const machine = f.machine({
-      processes: async () => [],
-      npm: world.npm,
-      execute: versionProbe({
-        binary,
-        node: true,
-        output: () => `${world.state.version ?? '2.1.318'} (Claude Code)`,
-        otherwise: 'throw',
-      }),
-    });
-    const ccw = f.ccw(machine, { platform: 'win32' });
-
-    const first = await ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
-    assert.ok(
-      first.items.every(item => item.problem === null),
-      JSON.stringify(first),
-    );
-    assert.equal((await ccw.apply(first.id)).state, 'done');
-    const item = (await ccw.inspect()).items.find(item => item.kind === 'claude');
-    world.state.version = '2.1.300';
-    f.calls.length = 0;
-    stable.version = '2.1.320';
-    const plan = await ccw.plan({ task: 'install', selected: [{ id: item.id, maintenance: action }] });
-    assert.match(JSON.stringify(plan.items[0].changes), /2\.1\.320/);
-    stable.version = '2.1.321';
-    const result = await ccw.apply(plan.id);
-    assert.equal(result.state, 'done');
-    assert.equal(world.state.version, '2.1.320');
-    assert.ok(
-      f.calls.some(
-        call =>
-          call.kind === 'npm' && call.target === 'install' && call.args.at(-1) === '@anthropic-ai/claude-code@2.1.320',
-      ),
-    );
-    assert.equal(
-      f.calls.filter(call => call.kind === 'npm' && call.args.includes('@anthropic-ai/claude-code@stable')).length,
-      1,
-    );
-    assert.equal(
-      f.calls.some(call => call.kind === 'npm' && call.args.includes('@anthropic-ai/claude-code@latest')),
-      false,
-    );
-    const repeat = await ccw.plan({ task: 'install', selected: [{ id: item.id, maintenance: action }] });
-    assert.ok(
-      repeat.items.every(item => item.problem === null),
-      JSON.stringify(repeat),
-    );
-    assert.equal((await ccw.apply(repeat.id)).state, 'done');
-    assert.equal(world.state.version, '2.1.321');
   });

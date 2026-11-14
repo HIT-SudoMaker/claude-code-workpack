@@ -36,11 +36,105 @@ function response(body = 'payload', url = 'https://example.invalid/asset', heade
   return value;
 }
 
+// 获取固定来源
+test('获取技能：固定提交并清理目录', async () => {
+  let temporary;
+  const calls = [];
+  const machine = {
+    ...createMachine(sourceEnvironment),
+    async execute(_binary, args, options) {
+      temporary = options.cwd;
+      calls.push(args);
+      if (args.includes('checkout')) {
+        await fs.mkdir(path.join(temporary, 'skills/example'), { recursive: true });
+        await fs.writeFile(path.join(temporary, 'skills/example/SKILL.md'), 'fixture skill');
+      }
+      return { code: 0, failed: false, stdout: '' };
+    },
+  };
+  const files = await machine.source(repository, revision, 'skills');
+  assert.deepEqual(
+    files.map(file => [file.path, Buffer.from(file.data).toString()]),
+    [['example/SKILL.md', 'fixture skill']],
+  );
+  assert.ok(calls.some(args => args.includes('fetch') && args.includes(repository) && args.includes(revision)));
+  assert.equal(
+    await fs.stat(temporary).then(
+      () => true,
+      () => false,
+    ),
+    false,
+  );
+});
+
+// 下载边界与超时
+test('下载文本：拒绝不安全重定向', async testContext => {
+  const original = globalThis.fetch;
+  let cancelled = false;
+  testContext.after(() => {
+    globalThis.fetch = original;
+  });
+  globalThis.fetch = async () =>
+    response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      'http://example.invalid/unsafe',
+    );
+  await assert.rejects(createMachine().fetchText('https://example.invalid/asset'), /invalid-source-url/);
+  assert.equal(cancelled, true);
+});
+
+test('下载文本：拒绝超大正文', async testContext => {
+  const original = globalThis.fetch;
+  let cancelled = false;
+  testContext.after(() => {
+    globalThis.fetch = original;
+  });
+  globalThis.fetch = async () =>
+    response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      undefined,
+      { 'content-length': `${9 * 1024 * 1024}` },
+    );
+  await assert.rejects(createMachine().fetchText('https://example.invalid/asset'), /source-too-large/);
+  assert.equal(cancelled, true);
+});
+
 for (const method of ['fetchText', 'fetchBytes'])
-  test(`${method}：跳过已取消请求`, async t => {
+  test(`${method}：限制正文读取时长`, async testContext => {
+    const original = globalThis.fetch;
+    testContext.after(() => {
+      globalThis.fetch = original;
+    });
+    globalThis.fetch = async () =>
+      response(
+        new ReadableStream({
+          async start(controller) {
+            await delay(30);
+            controller.enqueue(Buffer.from('late body'));
+            controller.close();
+          },
+        }),
+      );
+    await assert.rejects(
+      createMachine()[method]('https://example.invalid/asset', { timeoutMs: 5 }),
+      /^Error: source-timeout$/,
+    );
+  });
+
+// 取消与临时资源回收
+for (const method of ['fetchText', 'fetchBytes'])
+  test(`${method}：跳过已取消请求`, async testContext => {
     const original = globalThis.fetch;
     let calls = 0;
-    t.after(() => {
+    testContext.after(() => {
       globalThis.fetch = original;
     });
     globalThis.fetch = async () => {
@@ -57,12 +151,12 @@ for (const method of ['fetchText', 'fetchBytes'])
   });
 
 for (const method of ['fetchText', 'fetchBytes'])
-  test(`${method}：丢弃取消后响应`, async t => {
+  test(`${method}：丢弃取消后响应`, async testContext => {
     const original = globalThis.fetch;
     const entered = Promise.withResolvers();
     const release = Promise.withResolvers();
     let discarded = false;
-    t.after(() => {
+    testContext.after(() => {
       globalThis.fetch = original;
     });
     globalThis.fetch = async () => {
@@ -84,67 +178,6 @@ for (const method of ['fetchText', 'fetchBytes'])
     await assert.rejects(reading, /^Error: cancelled$/);
     assert.equal(discarded, true);
   });
-
-for (const method of ['fetchText', 'fetchBytes'])
-  test(`${method}：限制正文读取时长`, async t => {
-    const original = globalThis.fetch;
-    t.after(() => {
-      globalThis.fetch = original;
-    });
-    globalThis.fetch = async () =>
-      response(
-        new ReadableStream({
-          async start(controller) {
-            await delay(30);
-            controller.enqueue(Buffer.from('late body'));
-            controller.close();
-          },
-        }),
-      );
-    await assert.rejects(
-      createMachine()[method]('https://example.invalid/asset', { timeoutMs: 5 }),
-      /^Error: source-timeout$/,
-    );
-  });
-
-test('下载文本：拒绝不安全重定向', async t => {
-  const original = globalThis.fetch;
-  let cancelled = false;
-  t.after(() => {
-    globalThis.fetch = original;
-  });
-  globalThis.fetch = async () =>
-    response(
-      new ReadableStream({
-        cancel() {
-          cancelled = true;
-        },
-      }),
-      'http://example.invalid/unsafe',
-    );
-  await assert.rejects(createMachine().fetchText('https://example.invalid/asset'), /invalid-source-url/);
-  assert.equal(cancelled, true);
-});
-
-test('下载文本：拒绝超大正文', async t => {
-  const original = globalThis.fetch;
-  let cancelled = false;
-  t.after(() => {
-    globalThis.fetch = original;
-  });
-  globalThis.fetch = async () =>
-    response(
-      new ReadableStream({
-        cancel() {
-          cancelled = true;
-        },
-      }),
-      undefined,
-      { 'content-length': `${9 * 1024 * 1024}` },
-    );
-  await assert.rejects(createMachine().fetchText('https://example.invalid/asset'), /source-too-large/);
-  assert.equal(cancelled, true);
-});
 
 test('取消技能获取：跳过 Git', async () => {
   const controller = new AbortController();
@@ -207,37 +240,7 @@ for (const stop of ['cancel', 'timeout'])
     );
   });
 
-test('获取技能：固定提交并清理目录', async () => {
-  let temporary;
-  const calls = [];
-  const machine = {
-    ...createMachine(sourceEnvironment),
-    async execute(_binary, args, options) {
-      temporary = options.cwd;
-      calls.push(args);
-      if (args.includes('checkout')) {
-        await fs.mkdir(path.join(temporary, 'skills/example'), { recursive: true });
-        await fs.writeFile(path.join(temporary, 'skills/example/SKILL.md'), 'fixture skill');
-      }
-      return { code: 0, failed: false, stdout: '' };
-    },
-  };
-  const files = await machine.source(repository, revision, 'skills');
-  assert.deepEqual(
-    files.map(file => [file.path, Buffer.from(file.data).toString()]),
-    [['example/SKILL.md', 'fixture skill']],
-  );
-  assert.ok(calls.some(args => args.includes('fetch') && args.includes(repository) && args.includes(revision)));
-  assert.equal(
-    await fs.stat(temporary).then(
-      () => true,
-      () => false,
-    ),
-    false,
-  );
-});
-
-test('取消 Git 下载：终止 HTTP 子进程', { timeout: 8_000 }, async t => {
+test('取消 Git 下载：终止 HTTP 子进程', { timeout: 8_000 }, async testContext => {
   const entered = Promise.withResolvers();
   const server = createServer(() => {
     entered.resolve();
@@ -245,7 +248,7 @@ test('取消 Git 下载：终止 HTTP 子进程', { timeout: 8_000 }, async t =>
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   assert.ok(address && typeof address === 'object');
-  t.after(
+  testContext.after(
     () =>
       new Promise(resolve => {
         server.closeAllConnections();

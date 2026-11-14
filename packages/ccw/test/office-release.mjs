@@ -1,4 +1,4 @@
-/** GitHub release metadata shared by filesystem and packaged-runtime fixtures. */
+/** 构造文件测试与运行包测试共用的 GitHub 发布元数据 */
 export function releaseContract({ tag, asset, digest, revision, network = null, also = null }) {
   const release = `https://github.com/iOfficeAI/OfficeCLI/releases/download/${tag}/`;
   const assets = [asset].flat();

@@ -1,20 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
 import { createMachine } from '../dist/machine.js';
+import { createTemporaryDirectory } from './test-environment.mjs';
 
-async function temporaryDirectory(t) {
-  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ccw-binary-')));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  return root;
-}
-
-test('替换二进制：校验前置摘要', async t => {
-  const root = await temporaryDirectory(t);
+// 部署与已有 PATH
+test('替换二进制：校验前置摘要', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
   const machine = createMachine({}, root);
   const binary = path.join(root, 'tool');
   const notes = path.join(root, 'notes');
@@ -31,8 +26,14 @@ test('替换二进制：校验前置摘要', async t => {
   assert.deepEqual((await fs.readdir(root)).sort(), ['notes', 'tool']);
 });
 
-test('拒绝沿共享链接部署程序', async t => {
-  const root = await temporaryDirectory(t);
+test('保留已配置的用户 PATH', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
+  await assert.doesNotReject(createMachine({ PATH: root }, root).ensureUserPath(root));
+});
+
+// 路径与用户目录保护
+test('拒绝沿共享链接部署程序', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
   const shared = path.join(root, 'shared');
   const link = path.join(root, 'link');
   await fs.mkdir(shared);
@@ -50,8 +51,8 @@ test('拒绝沿共享链接部署程序', async t => {
   assert.equal(await fs.readFile(path.join(shared, 'tool'), 'utf8'), 'shared');
 });
 
-test('安装越界资源：保留现有目录', async t => {
-  const root = await temporaryDirectory(t);
+test('安装越界资源：保留现有目录', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
   const machine = createMachine({}, root);
   const directory = path.join(root, 'asset');
   await fs.mkdir(directory);
@@ -71,12 +72,16 @@ test('安装越界资源：保留现有目录', async t => {
   );
 });
 
-test('缺少用户目录：拒绝修改 PATH', async t => {
-  const root = await temporaryDirectory(t);
+test('缺少用户目录：拒绝修改 PATH', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
   await assert.rejects(createMachine({}, root).ensureUserPath(root), /user-home-unconfirmed/);
 });
 
-test('保留已配置的用户 PATH', async t => {
-  const root = await temporaryDirectory(t);
-  await assert.doesNotReject(createMachine({ PATH: root }, root).ensureUserPath(root));
+test('PATH 匹配不能绕过非法目标校验', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
+  for (const directory of ['relative', path.parse(root).root, root + '\ninvalid', root + '\0invalid']) {
+    const machine = createMachine({ PATH: directory }, root);
+    await assert.rejects(machine.userPathContains(directory), /invalid-target/);
+    await assert.rejects(machine.ensureUserPath(directory), /invalid-target/);
+  }
 });

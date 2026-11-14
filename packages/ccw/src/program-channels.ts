@@ -1,117 +1,47 @@
 import path from 'node:path';
-
-import { isObject, succeeded } from './machine.js';
-import { claudeEnvironment, json, normalizePath, success, userBinDirectory } from './model.js';
-import { OFFICECLI_REPO_SLUG } from './management-catalog.js';
-import { npmInstallArgs, npmUninstallArgs, NPM_READ_TIMEOUT_MS } from './npm-registry.js';
-import type { CommandResult } from './machine.js';
+import { isObject } from './machine.js';
+import { normalizePath, success } from './model.js';
 import type { Context } from './model.js';
-import type { NpmRegistry } from './npm-registry.js';
-import { NPM_ENABLE_SCRIPTS } from './npm-registry.js';
+import { NPM_READ_TIMEOUT_MS } from './npm-registry.js';
 
-export type ProgramKind = 'claude' | 'officecli';
-type ProgramChannel = 'native' | 'npm' | 'brew' | 'winget' | 'scoop' | 'apt' | 'dnf' | 'apk' | 'manual';
-
-export interface Program {
-  readonly kind: ProgramKind;
-  readonly channel: ProgramChannel;
-  readonly binary: string;
-  readonly version: string | null;
-  readonly packageName: string;
-  readonly isMissing?: boolean;
-  readonly npmRoot?: string;
-}
-
-export interface ProgramScope {
-  readonly data: FrozenProgramScope;
-  readonly verify: () => Promise<void>;
-  readonly matches: (program: Program) => Promise<boolean>;
-  readonly manager?: string;
-  readonly npmRoot?: string;
-}
-
-export interface NpmScope {
-  readonly data: FrozenNpmScope;
-  readonly npmRoot: string;
-  readonly args: readonly string[];
-  readonly verify: () => Promise<void>;
-  readonly matches: (root: string) => Promise<boolean>;
-}
-
-export const PROGRAM_PACKAGES: Readonly<Record<ProgramKind, string>> = {
-  claude: '@anthropic-ai/claude-code',
-  officecli: '@officecli/officecli',
-};
-/** 包管理器包标识与定位旗标：安装/卸载/清点与输出校验共用，字面量不得散布 */
-const WINGET_CLAUDE_ID = 'Anthropic.ClaudeCode';
-const OFFICECLI_PACKAGE_ID = 'officecli';
-const WINGET_ID_FLAGS = ['--id', WINGET_CLAUDE_ID] as const;
-const WINGET_MATCH_FLAGS = ['--exact', '--disable-interactivity'] as const;
-/** npm 安装的脚本放行旗标：恒开 ignore-scripts，claude 另放行自身脚本与可选依赖 */
-export const npmScriptFlags = (kind: ProgramKind): readonly string[] =>
-  kind === 'claude'
-    ? [...NPM_ENABLE_SCRIPTS, `--allow-scripts=${PROGRAM_PACKAGES.claude}`, '--include=optional']
-    : [...NPM_ENABLE_SCRIPTS];
-/** OfficeCLI 官方主页的认可形状（仓库标识单一出处） */
-const officecliHomepage = new RegExp(
-  `^https://(?:github\\.com/${OFFICECLI_REPO_SLUG.replaceAll('.', '\\.')}/?|officecli\\.ai/?)$`,
-);
-
-export function officeBinary(ctx: Context) {
-  const root =
-    ctx.platform === 'win32'
-      ? path.join(ctx.localAppData ?? path.join(ctx.home, 'AppData/Local'), 'OfficeCli')
-      : userBinDirectory(ctx);
-  if (!path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root)
-    throw new Error('invalid-config-root');
-  return path.join(root, ctx.platform === 'win32' ? 'officecli.exe' : 'officecli');
-}
-
-export function samePath(ctx: Context, left: string, right: string) {
-  return normalizePath(ctx.platform, left) === normalizePath(ctx.platform, right);
-}
-
-export function containsPath(ctx: Context, directory: string, file: string) {
-  const root = path.resolve(directory);
-  const target = path.resolve(file);
-  return ctx.platform === 'win32'
-    ? target.toLowerCase().startsWith(`${root.toLowerCase()}${path.sep}`)
-    : target.startsWith(`${root}${path.sep}`);
-}
-
-export function npmScopeArgs(ctx: Context, root?: string) {
-  if (root === undefined) return [];
-  const prefix = ctx.platform === 'win32' ? path.dirname(root) : path.dirname(path.dirname(root));
-  return [`--prefix=${prefix}`];
-}
-
-export async function npmGlobalRoot(ctx: Context, expected?: string) {
-  const result = await ctx.machine.npm(['root', '-g', ...npmScopeArgs(ctx, expected)], {
-    timeoutMs: NPM_READ_TIMEOUT_MS,
-  });
-  if (result.reason === 'npm-not-found') throw new Error('npm-not-found');
-  const root = success(result).trim();
-  if (!path.isAbsolute(root) || /[\r\n]/.test(root)) throw new Error('invalid-npm-root');
-  return root;
-}
-
+/** 冻结一次 npm 操作使用的全局安装目录、显式参数与可执行身份 */
 export interface FrozenNpmScope {
+  /** npm 报告的全局包目录 */
   readonly npmRoot: string;
+  /** 根目录的真实路径；无法取得真实路径时保留原路径 */
   readonly canonical: string;
+  /** 将后续 npm 操作限定到该全局目录的参数 */
   readonly args: readonly string[];
+  /** 准备时的 npm 入口、实际程序路径与内容指纹 */
   readonly identity: { readonly entry: string; readonly binary: string; readonly stamp: string };
 }
-export interface FrozenProgramScope {
-  readonly channel: Program['channel'];
-  readonly binary: string;
-  readonly npm?: FrozenNpmScope;
-  readonly manager?: string;
-  readonly executable?: string;
-  readonly managerStamp?: string;
-  readonly root?: string;
-  readonly packageRoot?: string;
-  readonly scoop?: string;
+/**
+ * 读取并核验当前 npm 的全局安装范围
+ *
+ * @param ctx - 提供平台、npm 身份及路径读取能力
+ * @returns 经再次核验的目录、真实路径、显式范围参数和 npm 身份快照
+ * @throws Error - npm 不可用、目录无效或读取期间范围及身份变化时拒绝 Promise
+ * @remarks 仅查询现状，不创建目录；后续写入前仍需调用 verifyNpmScope
+ */
+export async function freezeNpmScope(ctx: Context) {
+  const npmRoot = await npmGlobalRoot(ctx);
+  const scope: FrozenNpmScope = {
+    npmRoot,
+    canonical: (await ctx.machine.realpath(npmRoot)) ?? npmRoot,
+    args: npmScopeArgs(ctx, npmRoot),
+    identity: await ctx.machine.npmIdentity(),
+  };
+  await verifyNpmScope(ctx, scope);
+  return scope;
 }
+/**
+ * 重新核验冻结的 npm 身份与全局安装范围
+ *
+ * @param ctx - 提供 npm 查询及真实路径读取能力
+ * @param scope - 准备阶段冻结的目录、参数和程序身份
+ * @returns npm 身份、默认范围及显式范围均匹配时完成，不修改目标
+ * @throws Error - npm 不可用、目录无效、身份或安装范围变化时拒绝 Promise
+ */
 export async function verifyNpmScope(ctx: Context, scope: FrozenNpmScope) {
   const identity = await ctx.machine.npmIdentity();
   if (
@@ -123,451 +53,87 @@ export async function verifyNpmScope(ctx: Context, scope: FrozenNpmScope) {
   for (const root of [await npmGlobalRoot(ctx), await npmGlobalRoot(ctx, scope.npmRoot)])
     if (!(await matchesNpmScope(ctx, scope, root))) throw new Error('program-scope-unconfirmed');
 }
-export async function matchesNpmScope(ctx: Context, scope: FrozenNpmScope, root: string) {
-  return samePath(ctx, (await ctx.machine.realpath(root)) ?? root, scope.canonical);
-}
-/** Frozen values are durable; compatibility methods do not own progress. */
-export async function freezeNpmScope(ctx: Context, root?: string): Promise<NpmScope> {
-  const npmRoot = root ?? (await npmGlobalRoot(ctx));
-  const data: FrozenNpmScope = {
-    npmRoot,
-    canonical: (await ctx.machine.realpath(npmRoot)) ?? npmRoot,
-    args: npmScopeArgs(ctx, npmRoot),
-    identity: await ctx.machine.npmIdentity(),
-  };
-  await verifyNpmScope(ctx, data);
-  return {
-    data,
-    npmRoot,
-    args: data.args,
-    verify: () => verifyNpmScope(ctx, data),
-    matches: root => matchesNpmScope(ctx, data, root),
-  };
-}
-
-export async function npmVersion(
-  ctx: Context,
-  name: string,
-  root?: string,
-  options: { needsNpm?: boolean } = {},
-): Promise<string | null> {
+/**
+ * 从 npm 全局安装记录读取指定包的版本
+ *
+ * @param ctx - 提供 npm 查询及目录读取能力
+ * @param name - 要精确匹配的包名
+ * @param root - 已冻结的全局包目录；省略时检查当前默认范围，允许 npm 尚未安装
+ * @returns 已校验的版本；包未登记、确认全局目录缺失或默认检查中 npm 缺失时返回 null
+ * @throws Error - 指定范围时 npm 缺失、命令失败、安装记录异常或版本字段无效时拒绝 Promise
+ * @remarks 退出码 1 仍需检查返回记录，不单凭非零退出码判定失败；版本记录不证明入口存在
+ */
+export async function npmVersion(ctx: Context, name: string, root?: string): Promise<string | null> {
   const result = await ctx.machine.npm(['ls', '-g', ...npmScopeArgs(ctx, root), '--depth=0', '--json', name], {
     timeoutMs: NPM_READ_TIMEOUT_MS,
   });
   if (result.reason === 'npm-not-found') {
-    if (options.needsNpm) throw new Error('npm-not-found');
+    if (root !== undefined) throw new Error('npm-not-found');
     return null;
   }
   if (result.failed) throw new Error('npm-inspection-failed');
-  let data: unknown;
+  let npmResult: unknown;
   try {
-    data = JSON.parse(result.stdout);
+    npmResult = JSON.parse(result.stdout);
   } catch {
     throw new Error('invalid-npm-result');
   }
   if (
-    isObject(data) &&
-    isObject(data.error) &&
-    data.error.code === 'ENOENT' &&
+    isObject(npmResult) &&
+    isObject(npmResult.error) &&
+    npmResult.error.code === 'ENOENT' &&
     (await ctx.machine.treeStamp(await npmGlobalRoot(ctx, root))) === null
   )
     return null;
-  // npm ls 以退出码 1 表示未安装；其余非零才是检查失败
+  // npm ls 的退出码 1 也可能表示未安装，仍须继续检查错误字段与依赖记录
   if (result.code !== 0 && result.code !== 1) throw new Error('npm-inspection-failed');
-  if (!isObject(data) || data.error !== undefined || (Array.isArray(data.problems) && data.problems.length))
+  if (
+    !isObject(npmResult) ||
+    npmResult.error !== undefined ||
+    (Array.isArray(npmResult.problems) && npmResult.problems.length)
+  )
     throw new Error('npm-inspection-failed');
-  if (data.dependencies === undefined) return null;
-  if (!isObject(data.dependencies)) throw new Error('invalid-npm-result');
-  const entry = data.dependencies[name];
+  if (npmResult.dependencies === undefined) return null;
+  if (!isObject(npmResult.dependencies)) throw new Error('invalid-npm-result');
+  const entry = npmResult.dependencies[name];
   if (entry === undefined) return null;
   if (!isObject(entry) || typeof entry.version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(entry.version))
     throw new Error('invalid-npm-result');
   return entry.version;
 }
 
-export async function npmBinary(ctx: Context, kind: ProgramKind, root?: string) {
-  const directory = path.join(root ?? (await npmGlobalRoot(ctx)), PROGRAM_PACKAGES[kind]);
-  if (kind === 'officecli')
-    return path.join(directory, 'vendor', ctx.platform === 'win32' ? 'officecli.exe' : 'officecli');
-  const manifest = await json(ctx.machine, path.join(directory, 'package.json'));
-  const relative =
-    typeof manifest.bin === 'string' ? manifest.bin : isObject(manifest.bin) ? manifest.bin.claude : undefined;
-  if (typeof relative !== 'string') throw new Error('program-not-ready');
-  const binary = path.resolve(directory, relative);
-  if (!binary.startsWith(`${directory}${path.sep}`)) throw new Error('invalid-program-entry');
-  return binary;
+/**
+ * 按平台路径规则比较两个路径
+ *
+ * @returns 解析为绝对路径后是否相同，Windows 忽略大小写
+ * @remarks 不读取文件系统，也不解析符号链接
+ */
+export function samePath(ctx: Context, left: string, right: string) {
+  return normalizePath(ctx.platform, left) === normalizePath(ctx.platform, right);
 }
 
-/** 将已定位入口归属到唯一渠道；无法确认所有权时保持 manual */
-export async function identifyProgramChannel(
-  ctx: Context,
-  kind: ProgramKind,
-  binary: string,
-  canonical: string,
-  native: string,
-): Promise<Pick<Program, 'channel' | 'packageName'>> {
-  let channel: ProgramChannel = samePath(ctx, binary, native) ? 'native' : 'manual';
-  if (channel === 'native' && kind === 'claude') {
-    const versionRoot = path.join(ctx.home, '.local/share/claude/versions');
-    if (!containsPath(ctx, versionRoot, canonical)) {
-      const stamp = await ctx.machine.treeStamp(binary);
-      let hasMatchingVersion = false;
-      for (const entry of await ctx.machine.entries(versionRoot)) {
-        if (entry.kind === 'file' && (await ctx.machine.treeStamp(path.join(versionRoot, entry.name))) === stamp) {
-          hasMatchingVersion = true;
-          break;
-        }
-      }
-      if (!hasMatchingVersion) channel = 'manual';
-    }
-  }
-
-  const normalized = canonical.replaceAll('\\', '/').toLowerCase();
-  if (
-    (kind === 'claude' && /\/caskroom\/claude-code(?:@latest)?\//.test(normalized)) ||
-    (kind === 'officecli' && /\/cellar\/officecli\/[^/]+\/(?:[^/]+\/)*officecli$/.test(normalized))
-  )
-    channel = 'brew';
-  // WinGet 便携包目录带来源段；伪造版本目录不授予渠道身份与卸载资格
-  if (
-    kind === 'claude' &&
-    /\/microsoft\/winget\/packages\/anthropic\.claudecode_microsoft\.winget\.source_8wekyb3d8bbwe\/(?:[^/]+\/)*claude\.exe$/.test(
-      normalized,
-    )
-  )
-    channel = 'winget';
-  if (kind === 'officecli' && normalized.includes('/apps/officecli/')) {
-    const appRoot = /^(.*[\\/]apps[\\/]officecli[\\/][^\\/]+)/i.exec(canonical)?.[1];
-    const manifest = appRoot === undefined ? {} : await json(ctx.machine, path.join(appRoot, 'manifest.json'));
-    const scoopRoot = await ctx.machine.realpath(ctx.scoopRoot ?? path.join(ctx.home, 'scoop'));
-    const appParent = appRoot === undefined ? undefined : path.dirname(appRoot);
-    if (
-      scoopRoot !== null &&
-      appParent !== undefined &&
-      samePath(ctx, appParent, path.join(scoopRoot, 'apps/officecli')) &&
-      typeof manifest.homepage === 'string' &&
-      officecliHomepage.test(manifest.homepage)
-    )
-      channel = 'scoop';
-  }
-  if (ctx.platform === 'linux' && channel === 'manual') {
-    for (const [manager, args] of [
-      ['apt', ['dpkg-query', '-S', canonical]],
-      ['dnf', ['rpm', '-qf', '--qf', '%{NAME}\n', canonical]],
-      ['apk', ['apk', 'info', '--who-owns', canonical]],
-    ] as const) {
-      const result = await ctx.machine.execute(args[0], args.slice(1));
-      if (!succeeded(result) || kind !== 'claude') continue;
-      const lines = result.stdout.trim().split(/\r?\n/);
-      const isOwned =
-        manager === 'apt'
-          ? lines.length === 1 &&
-            /^claude-code(?::[A-Za-z0-9_-]+)?: /.test(lines[0] ?? '') &&
-            lines[0]?.endsWith(`: ${canonical}`)
-          : manager === 'dnf'
-            ? lines.length === 1 && lines[0] === 'claude-code'
-            : lines.length === 1 &&
-              lines[0]?.startsWith(`${canonical} is owned by `) &&
-              /^claude-code-\d[A-Za-z0-9._+~]*-r\d+$/.test(lines[0].slice(`${canonical} is owned by `.length));
-      if (isOwned) {
-        channel = manager;
-        break;
-      }
-    }
-  }
-  return {
-    channel,
-    packageName:
-      channel === 'brew' && kind === 'claude' && normalized.includes('/caskroom/claude-code@latest/')
-        ? 'claude-code@latest'
-        : kind === 'claude'
-          ? 'claude-code'
-          : OFFICECLI_PACKAGE_ID,
-  };
+/**
+ * 查询 npm 全局包目录，可限定到已冻结的安装范围
+ *
+ * @param expected - 已确认的包目录；省略时读取当前默认范围
+ * @returns npm 返回的绝对包目录，不创建或修改目录
+ * @throws Error - npm 不可用、查询失败或返回路径无效时拒绝
+ */
+export async function npmGlobalRoot(ctx: Context, expected?: string) {
+  const result = await ctx.machine.npm(['root', '-g', ...npmScopeArgs(ctx, expected)], {
+    timeoutMs: NPM_READ_TIMEOUT_MS,
+  });
+  if (result.reason === 'npm-not-found') throw new Error('npm-not-found');
+  const root = success(result).trim();
+  if (!path.isAbsolute(root) || /[\r\n]/.test(root)) throw new Error('invalid-npm-root');
+  return root;
+}
+async function matchesNpmScope(ctx: Context, scope: FrozenNpmScope, root: string) {
+  return samePath(ctx, (await ctx.machine.realpath(root)) ?? root, scope.canonical);
 }
 
-export function channelCanPinVersion(channel: ProgramChannel) {
-  return channel === 'npm' || channel === 'native' || channel === 'winget';
-}
-
-async function scoopTarget(ctx: Context, program: Program) {
-  const result = await ctx.machine.execute('scoop', ['prefix', OFFICECLI_PACKAGE_ID]);
-  const prefix = result.stdout.trim();
-  if (!succeeded(result) || !path.isAbsolute(prefix) || /[\r\n]/.test(prefix))
-    throw new Error('program-scope-unconfirmed');
-  const current = await ctx.machine.realpath(prefix);
-  const binary = await ctx.machine.realpath(program.binary);
-  if (current === null || binary === null || !samePath(ctx, path.join(current, 'officecli.exe'), binary))
-    throw new Error('program-scope-unconfirmed');
-  return current;
-}
-
-const BREW_ENV = { HOMEBREW_NO_AUTO_UPDATE: '1' };
-
-async function brewPackage(ctx: Context, program: Program, manager: string) {
-  const result = await ctx.machine.execute(
-    manager,
-    ['list', program.kind === 'claude' ? '--cask' : '--formula', '--versions', program.packageName],
-    { env: BREW_ENV },
-  );
-  const canonical = await ctx.machine.realpath(program.binary);
-  const packageRoot = path.join(
-    path.dirname(path.dirname(manager)),
-    program.kind === 'claude' ? 'Caskroom' : 'Cellar',
-    program.packageName,
-  );
-  if (canonical === null || !containsPath(ctx, packageRoot, canonical)) throw new Error('program-scope-unconfirmed');
-  const version = path.relative(packageRoot, canonical).split(path.sep)[0];
-  const registered = result.stdout
-    .split(/\r?\n/)
-    .filter(line => line.trim())
-    .map(line => line.trim().split(/\s+/));
-  // 无版本参数的变更命令无法绑定同一包内的多版本
-  if (
-    !succeeded(result) ||
-    registered.length !== 1 ||
-    registered[0]?.length !== 2 ||
-    registered[0][0] !== program.packageName ||
-    registered[0][1] !== version
-  )
-    throw new Error('program-scope-unconfirmed');
-}
-
-/** Freeze manager identity and scope once; recovery only verifies those values. */
-export async function freezeProgramScope(ctx: Context, program: Program): Promise<ProgramScope> {
-  let data: FrozenProgramScope = { channel: program.channel, binary: program.binary };
-  if (program.channel === 'npm') {
-    const npm = (await freezeNpmScope(ctx, program.npmRoot)).data;
-    if (!samePath(ctx, await npmBinary(ctx, program.kind, npm.npmRoot), program.binary))
-      throw new Error('program-scope-unconfirmed');
-    data = { ...data, npm };
-  } else if (program.channel === 'brew') {
-    const canonical = await ctx.machine.realpath(program.binary);
-    const collection = program.kind === 'claude' ? 'Caskroom' : 'Cellar';
-    const marker = path.sep + collection + path.sep + program.packageName + path.sep;
-    const index = canonical?.indexOf(marker) ?? -1;
-    if (canonical === null || index < 0) throw new Error('program-scope-unconfirmed');
-    const root = canonical.slice(0, index);
-    const manager = path.join(root, 'bin/brew');
-    const executable = await ctx.machine.realpath(manager);
-    const managerStamp = executable === null ? null : await ctx.machine.treeStamp(executable);
-    if (executable === null || managerStamp === null) throw new Error('program-scope-unconfirmed');
-    data = {
-      ...data,
-      root,
-      manager,
-      executable,
-      managerStamp,
-      packageRoot: path.join(root, collection, program.packageName),
-    };
-    await brewPackage(ctx, program, manager);
-  } else if (program.channel === 'scoop') data = { ...data, scoop: await scoopTarget(ctx, program) };
-  await verifyProgramScope(ctx, data, program);
-  return programScope(ctx, data, program);
-}
-export function programScope(ctx: Context, data: FrozenProgramScope, program: Program): ProgramScope {
-  return {
-    data,
-    ...(data.npm ? { npmRoot: data.npm.npmRoot } : {}),
-    ...(data.manager ? { manager: data.manager } : {}),
-    verify: () => verifyProgramScope(ctx, data, program),
-    matches: candidate => matchesProgramScope(ctx, data, candidate),
-  };
-}
-export async function verifyProgramScope(ctx: Context, scope: FrozenProgramScope, program: Program) {
-  if (scope.npm) return verifyNpmScope(ctx, scope.npm);
-  if (scope.channel === 'brew') {
-    const current = await ctx.machine.realpath(scope.manager!);
-    if (
-      current !== scope.executable ||
-      current === null ||
-      (await ctx.machine.treeStamp(current)) !== scope.managerStamp
-    )
-      throw new Error('program-scope-unconfirmed');
-    const collection = program.kind === 'claude' ? 'Caskroom' : 'Cellar';
-    const result = await ctx.machine.execute(scope.manager!, [collection === 'Cellar' ? '--cellar' : '--caskroom'], {
-      env: BREW_ENV,
-    });
-    const location = result.stdout.trim();
-    if (
-      !succeeded(result) ||
-      !path.isAbsolute(location) ||
-      /[\r\n]/.test(location) ||
-      !samePath(ctx, (await ctx.machine.realpath(location)) ?? location, path.join(scope.root!, collection))
-    )
-      throw new Error('program-scope-unconfirmed');
-  }
-  if (scope.scoop && !samePath(ctx, await scoopTarget(ctx, program), scope.scoop))
-    throw new Error('program-scope-unconfirmed');
-}
-export async function matchesProgramScope(ctx: Context, scope: FrozenProgramScope, candidate: Program) {
-  if (candidate.channel !== scope.channel) return false;
-  if (scope.npm) return candidate.npmRoot !== undefined && matchesNpmScope(ctx, scope.npm, candidate.npmRoot);
-  const current = await ctx.machine.realpath(candidate.binary);
-  if (scope.packageRoot) return current !== null && containsPath(ctx, scope.packageRoot, current);
-  if (scope.scoop) return current !== null && containsPath(ctx, path.dirname(scope.scoop), current);
-  return samePath(ctx, candidate.binary, scope.binary);
-}
-
-/** npm 渠道占用前复核：版本与二进制位都未变才继续 */
-async function ensureNpmProgramUnchanged(ctx: Context, program: Program, scope: ProgramScope) {
-  if (
-    (await npmVersion(ctx, PROGRAM_PACKAGES[program.kind], scope.npmRoot)) !== program.version ||
-    !samePath(ctx, await npmBinary(ctx, program.kind, scope.npmRoot), program.binary)
-  )
-    throw new Error('program-changed');
-}
-
-export async function verifyProgramBeforeCommand(ctx: Context, program: Program, scope: ProgramScope) {
-  await scope.verify();
-  if (program.channel === 'npm') await ensureNpmProgramUnchanged(ctx, program, scope);
-  if (program.channel === 'brew') await brewPackage(ctx, program, scope.manager ?? '');
-}
-
-/** 渠道命令分发尾：解包校验命令并先行 brew 包裹，执行与成功判据由调用方决定 */
-async function dispatchChannelCommand(
-  ctx: Context,
-  program: Program,
-  commands: Partial<Record<ProgramChannel, readonly string[]>>,
-) {
-  const command = commands[program.channel];
-  if (command === undefined) throw new Error('channel-not-supported');
-  const [executable, ...args] = command;
-  if (!executable) throw new Error('channel-not-supported');
-  if (program.channel === 'brew') await brewPackage(ctx, program, executable);
-  return { executable, args };
-}
-
-export async function maintainProgramChannel(
-  ctx: Context,
-  program: Program,
-  scope: ProgramScope,
-  action: 'install' | 'update' | 'reinstall',
-  targetVersion: string | null,
-  targetRegistry: NpmRegistry | undefined,
-): Promise<CommandResult> {
-  if (program.channel === 'manual') throw new Error('channel-not-supported');
-  if (program.channel === 'npm') {
-    await ensureNpmProgramUnchanged(ctx, program, scope);
-    const args = npmInstallArgs(
-      [
-        'install',
-        '-g',
-        ...npmScopeArgs(ctx, scope.npmRoot),
-        ...(action === 'reinstall' ? ['--force'] : []),
-        ...npmScriptFlags(program.kind),
-        `${PROGRAM_PACKAGES[program.kind]}@${targetVersion}`,
-      ],
-      targetRegistry ?? null,
-    );
-    return ctx.effects.npm(args);
-  }
-  if (program.channel === 'native') {
-    if (program.kind !== 'claude' || targetVersion === null) throw new Error('channel-not-supported');
-    return ctx.effects.execute(
-      program.binary,
-      ['install', targetVersion, ...(action === 'reinstall' ? ['--force'] : [])],
-      { env: claudeEnvironment(ctx), cwd: ctx.home },
-    );
-  }
-  const commands: Partial<Record<ProgramChannel, readonly string[]>> = {
-    brew: [
-      scope.manager ?? '',
-      action === 'reinstall' ? 'reinstall' : 'upgrade',
-      ...(program.kind === 'claude' ? ['--cask'] : []),
-      program.packageName,
-    ],
-    winget: [
-      'winget',
-      action === 'reinstall' ? 'install' : 'upgrade',
-      ...(action === 'reinstall' ? ['--force'] : []),
-      ...WINGET_ID_FLAGS,
-      ...(targetVersion !== null ? ['--version', targetVersion] : []),
-      ...WINGET_MATCH_FLAGS,
-    ],
-    scoop: ['scoop', 'update', ...(action === 'reinstall' ? ['--force'] : []), OFFICECLI_PACKAGE_ID],
-    apt: [
-      'apt-get',
-      'install',
-      '--yes',
-      action === 'reinstall' ? '--reinstall' : '--only-upgrade',
-      program.packageName,
-    ],
-    dnf: ['dnf', action === 'reinstall' ? 'reinstall' : 'upgrade', '--assumeyes', program.packageName],
-    apk: ['apk', action === 'reinstall' ? 'fix' : 'upgrade', program.packageName],
-  };
-  const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
-  return ctx.effects.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined);
-}
-
-export async function removeProgramChannel(
-  ctx: Context,
-  program: Program,
-  scope: ProgramScope,
-): Promise<CommandResult> {
-  if (program.channel === 'npm') {
-    await ensureNpmProgramUnchanged(ctx, program, scope);
-    return ctx.effects.npm(
-      npmUninstallArgs(['uninstall', '-g', ...npmScopeArgs(ctx, scope.npmRoot), PROGRAM_PACKAGES[program.kind]]),
-    );
-  }
-  const commands: Partial<Record<ProgramChannel, readonly string[]>> = {
-    brew: [scope.manager ?? '', 'uninstall', ...(program.kind === 'claude' ? ['--cask'] : []), program.packageName],
-    winget: ['winget', 'uninstall', ...WINGET_ID_FLAGS, ...WINGET_MATCH_FLAGS],
-    scoop: ['scoop', 'uninstall', OFFICECLI_PACKAGE_ID],
-    apt: ['apt-get', 'remove', '--yes', program.packageName],
-    dnf: ['dnf', 'remove', '--assumeyes', program.packageName],
-    apk: ['apk', 'del', program.packageName],
-  };
-  const { executable, args } = await dispatchChannelCommand(ctx, program, commands);
-  return ctx.effects.execute(executable, args, program.channel === 'brew' ? { env: BREW_ENV } : undefined);
-}
-
-export async function programPackageAbsent(
-  ctx: Context,
-  program: Program,
-  scope: ProgramScope,
-): Promise<boolean | null> {
-  if (program.channel === 'brew') {
-    await scope.verify();
-    if (scope.manager === undefined) return null;
-    const result = await ctx.machine.execute(
-      scope.manager,
-      ['list', program.kind === 'claude' ? '--cask' : '--formula', '--versions'],
-      { env: BREW_ENV },
-    );
-    return !succeeded(result)
-      ? null
-      : !result.stdout.split(/\r?\n/).some(line => line.trim().split(/\s+/)[0] === program.packageName);
-  }
-  if (program.channel === 'winget') {
-    const result = await ctx.machine.execute('winget', ['list', ...WINGET_ID_FLAGS, ...WINGET_MATCH_FLAGS]);
-    if (result.failed || result.code === null) return null;
-    if (result.code >>> 0 === 0x8a150014) return true;
-    // 点号转义：包标识按字面匹配，形近 ID 不得计为仍在
-    return result.code !== 0
-      ? null
-      : !new RegExp(`\\b${WINGET_CLAUDE_ID.replaceAll('.', '\\.')}\\b`, 'i').test(result.stdout);
-  }
-  if (program.channel === 'scoop') {
-    const result = await ctx.machine.execute('scoop', ['list', OFFICECLI_PACKAGE_ID]);
-    return !succeeded(result)
-      ? null
-      : !result.stdout.split(/\r?\n/).some(line => new RegExp(`^\\s*${OFFICECLI_PACKAGE_ID}\\s`, 'i').test(line));
-  }
-  if (program.channel === 'apt') {
-    const result = await ctx.machine.execute('dpkg-query', ['-W', '-f=${Package} ${db:Status-Status}\n']);
-    return !succeeded(result)
-      ? null
-      : !result.stdout.split(/\r?\n/).some(line => line.trim() === `${program.packageName} installed`);
-  }
-  if (program.channel === 'dnf') {
-    const result = await ctx.machine.execute('rpm', ['-qa', '--qf', '%{NAME}\n']);
-    return !succeeded(result) ? null : !result.stdout.split(/\r?\n/).some(line => line.trim() === program.packageName);
-  }
-  if (program.channel === 'apk') {
-    const result = await ctx.machine.execute('apk', ['info']);
-    return !succeeded(result) ? null : !result.stdout.split(/\r?\n/).some(line => line.trim() === program.packageName);
-  }
-  return null;
+function npmScopeArgs(ctx: Context, root?: string) {
+  if (root === undefined) return [];
+  const prefix = ctx.platform === 'win32' ? path.dirname(root) : path.dirname(path.dirname(root));
+  return [`--prefix=${prefix}`];
 }

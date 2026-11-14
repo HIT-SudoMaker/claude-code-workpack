@@ -1,474 +1,248 @@
 import path from 'node:path';
+import { knownTitle, OFFICECLI_REPO_SLUG, OFFICE_INTEGRATION } from './management-catalog.js';
+import {
+  sourcesFile,
+  currentSkill,
+  prepareSkillFiles,
+  skillFilesStamp,
+  disableSkillEntry,
+  repairSkillSource,
+  ownsSkill,
+  checkSkillSource,
+} from './skill-files.js';
+import { isGitRevision, isObject, errorCode, succeeded } from './machine.js';
+import { createHash } from 'node:crypto';
+import { json, userBinDirectory } from './model.js';
+import type { Context, Domain, Prepared, Selection, Item } from './model.js';
+import { isExactVersion, compareVersions } from './npm-registry.js';
+import { samePath } from './program-channels.js';
+import { removeProgramFile, deployProgram, programPath } from './program-operations.js';
+import { step, sequence, work } from './work.js';
 
-import { knownTitle } from './titles.js';
-import { OFFICECLI_REPO_SLUG, officeIntegration, SKILL_ENTRY } from './management-catalog.js';
-import { currentSkill, prepareSkillFiles, skillFilesStamp } from './skill-files.js';
-import { prepareSkill } from './skills.js';
-import { prepareMcp } from './mcp.js';
-import { errorCode, isGitRevision, isObject } from './machine.js';
-import { json, readMcpServers, REPLACE_CONSENT, unchanged } from './model.js';
-import type { Change, Context, Inspection, Item, Prepared, Selection, OperationHandler } from './model.js';
-import { isExactVersion, resolveNpmView } from './npm-registry.js';
-import type { NpmRegistry } from './npm-registry.js';
-import { officeBinary, samePath } from './program-channels.js';
-import { officeVersion, prepareProgram, programs } from './programs.js';
-import { composeProgramOperations, programOperation } from './program-operations.js';
-import { sourcesFile } from './storage.js';
+const PROGRAM_ACTION_CHANGE = { install: 'program-install', update: 'program-update' } as const;
+const CHECKSUM_DOWNLOAD_TIMEOUT_MS = 10_000;
+const PROGRAM_DOWNLOAD_TIMEOUT_MS = 30_000;
+const VERSION_PROBE_TIMEOUT_MS = 5_000;
+const MAX_TAG_DEREFERENCES = 4;
 
-/** OfficeCLI 接入入口的 id 集合：域内入口类型与计划层的重叠门判共用 */
-export const OFFICECLI_ENTRY_IDS = ['skill:officecli', 'mcp:officecli'] as const;
-
-interface OfficeEntry {
-  readonly id: (typeof OFFICECLI_ENTRY_IDS)[number];
-  readonly owner: string | null | undefined;
+interface OfficeProgram {
+  readonly channel: 'native' | 'manual';
+  readonly binary: string;
 }
-
-const OFFICECLI_SKILL = 'officecli';
-/** 随包技能的读取落点：检查与准备共用 */
-const officeSkillDirectory = (ctx: Context) => path.join(ctx.claudeRoot, 'skills', OFFICECLI_SKILL);
-/** 区分技能入口证据：来源记录确认，或仅 frontmatter 形态相似；形态不构成认领证据 */
-type SkillEvidence = 'confirmed' | 'shape' | 'none';
-
-interface Observation {
-  readonly found: Awaited<ReturnType<typeof programs>>;
-  readonly entries: readonly OfficeEntry[];
-  readonly problems: readonly Change[];
-  readonly skillEvidence: SkillEvidence;
-  readonly skillStamp: string | null;
-  readonly sourceRecord: unknown;
-  /** 匹配注册形状的命令；registration 存在但不匹配时为 undefined */
-  readonly mcpCommand: string | undefined;
-  readonly registration: unknown;
-  readonly isConnectionsUnknown: boolean;
-}
-
-/** 管理 OfficeCLI 程序与所选 Claude 入口，计划及剩余工作由 CCW 消费 */
-export function createOfficecli(ctx: Context) {
-  const directory = officeSkillDirectory(ctx);
-
-  async function commandOwner(command: string, found: Observation['found']): Promise<string | undefined> {
-    const candidates = path.isAbsolute(command)
-      ? [command]
-      : command === 'officecli' || command === 'officecli.exe'
-        ? await ctx.machine.locate('officecli')
-        : [];
-    const candidate = candidates[0];
-    if (candidate === undefined) return undefined;
-    for (const [id, program] of found.values) if (samePath(ctx, candidate, program.binary)) return id;
-    const canonical = await ctx.machine.realpath(candidate);
-    if (canonical === null) return undefined;
-    for (const [id, program] of found.values) {
-      if (samePath(ctx, candidate, program.binary) || samePath(ctx, canonical, program.binary)) return id;
-      if (program.channel !== 'npm') continue;
-      const packageRoot = path.dirname(path.dirname(program.binary));
-      const normalized = ctx.platform === 'win32' ? canonical.toLowerCase() : canonical;
-      const prefix = ctx.platform === 'win32' ? packageRoot.toLowerCase() : packageRoot;
-      if (normalized.startsWith(`${prefix}${path.sep}`)) return id;
-      if (
-        program.binary.startsWith(
-          path.join(path.dirname(candidate), 'node_modules', '@officecli', 'officecli') + path.sep,
-        )
-      )
-        return id;
-    }
-    return undefined;
-  }
-
-  async function observe(found?: Observation['found']): Promise<Observation> {
-    found ??= await programs(ctx, 'officecli');
-    const problems: Change[] = found.problems.map(code => ({ code, detail: 'officecli' }));
-    let isConnectionsUnknown = false;
-    let skillEvidence: SkillEvidence = 'none';
-    let skillStamp: string | null = null;
-    let mcpCommand: string | undefined;
-    let registration: unknown;
-    let metadata: Record<string, unknown> = {};
-    try {
-      metadata = await json(ctx.machine, sourcesFile(ctx));
-    } catch {
-      problems.push({ code: 'source-metadata-unavailable', detail: 'officecli' });
-    }
-    try {
-      skillStamp = await ctx.machine.treeStamp(directory);
-      const text = skillStamp !== null ? await ctx.machine.read(path.join(directory, SKILL_ENTRY)) : null;
-      skillEvidence = officeSkillEvidence(text, metadata[directory], skillStamp);
-    } catch (error) {
-      isConnectionsUnknown = true;
-      problems.push({ code: errorCode(error), detail: directory });
-    }
-    try {
-      registration = (await readMcpServers(ctx)).officecli;
-      mcpCommand = officeMcpCommand(registration);
-    } catch (error) {
-      isConnectionsUnknown = true;
-      problems.push({ code: errorCode(error), detail: ctx.stateFile });
-    }
-    const entries: OfficeEntry[] = [];
-    // 无程序时只认领有来源记录的残留技能入口；仅凭 frontmatter 同名不认领用户自建内容
-    if (skillEvidence !== 'none' && (found.values.size > 0 || skillEvidence === 'confirmed'))
-      entries.push({
-        id: 'skill:officecli',
-        owner: found.values.size === 0 ? null : await commandOwner('officecli', found),
-      });
-    if (mcpCommand !== undefined)
-      entries.push({
-        id: 'mcp:officecli',
-        owner: found.values.size === 0 ? null : await commandOwner(mcpCommand, found),
-      });
-    return {
-      found,
-      entries,
-      problems,
-      skillEvidence,
-      skillStamp,
-      sourceRecord: metadata[directory],
-      mcpCommand,
-      registration,
-      isConnectionsUnknown,
-    };
-  }
-
-  function related(observed: Observation, id: string | null) {
-    return observed.entries.filter(entry => entry.owner === id);
-  }
-
-  async function detach(entries: readonly OfficeEntry[], itemId: string): Promise<Prepared> {
-    if (entries.length === 0) throw new Error('no-connection');
-    const operations = [];
-    for (const entry of entries) {
-      const prepared =
-        entry.id === 'skill:officecli'
-          ? await prepareSkill(ctx, 'officecli', 'skills', { id: entry.id, action: 'detach' })
-          : await prepareMcp(ctx, 'officecli', { id: entry.id, action: 'detach' });
-      operations.push(...composeProgramOperations(prepared, itemId, 'detach-' + entry.id).operations);
-    }
-    return { operations };
-  }
-
+/**
+ * 管理 OfficeCLI 原生程序和配套技能
+ *
+ * @remarks 仅管理固定用户目录；按发布摘要及技能提交安装，摘要匹配时复用程序
+ * 拒绝降级、来源不明或覆盖本地技能改动
+ * 卸载移除程序并保留自有技能副本，不动其他技能和用户数据
+ */
+export function createOfficecli(ctx: Context): Domain {
+  const directory = path.join(ctx.claudeRoot, 'skills', 'officecli');
   return {
-    handlers: {
-      'office.detached': {
-        async assess(definition) {
-          if (typeof definition.payload.binary !== 'string' || typeof definition.payload.identity !== 'string')
-            return { state: 'blocked', problem: 'operation-record-invalid' };
-          const binary = definition.payload.binary;
-          const identity = definition.payload.identity;
-          const unmatched = Array.isArray(definition.payload.unmatched) ? definition.payload.unmatched : [];
-          const current = await observe();
-          if (current.isConnectionsUnknown) return { state: 'unknown', problem: 'installation-state-unconfirmed' };
-          const entries = current.entries.filter(
-            entry =>
-              !unmatched.includes(entry.id) &&
-              (entry.owner === identity ||
-                (entry.owner === null &&
-                  (entry.id === 'skill:officecli' ||
-                    (current.mcpCommand !== undefined && !path.isAbsolute(current.mcpCommand)))) ||
-                (entry.id === 'mcp:officecli' &&
-                  current.mcpCommand !== undefined &&
-                  path.isAbsolute(current.mcpCommand) &&
-                  samePath(ctx, current.mcpCommand, binary))),
-          );
-          return entries.length
-            ? { state: 'blocked', problem: 'target-changed' }
-            : { state: 'complete', evidence: { detached: true } };
-        },
-        execute() {
-          return Promise.resolve({ receipt: { kind: 'returned', failure: null } });
-        },
-      } satisfies OperationHandler,
-      'office.keep': {
-        assess(definition) {
-          return Promise.resolve({
-            state: 'complete',
-            evidence: {},
-            effects: definition.changes.map(change => ({ ...change, state: 'kept' as const })),
-          });
-        },
-        execute() {
-          return Promise.resolve({ receipt: { kind: 'returned', failure: null } });
-        },
-      } satisfies OperationHandler,
-    },
-    async inspect(): Promise<Inspection> {
-      const observed = await observe();
-      const items: Item[] = observed.found.items.map(item => {
-        const entries = related(observed, item.id);
-        const program = observed.found.values.get(item.id);
-        const problem = observed.isConnectionsUnknown ? 'installation-state-unconfirmed' : undefined;
-        return {
-          ...item,
-          facts: [
-            ...item.facts,
-            ...(program?.channel === 'native' || program?.channel === 'manual'
-              ? [{ code: 'program-identity-unchecked' }]
-              : []),
-            ...connectionFacts(entries),
-          ],
-          actions: [...item.actions, ...(entries.length ? ['detach' as const] : [])],
-          ...(problem ? { problem } : {}),
-        };
-      });
-      if (items.length === 0) {
-        const entries = related(observed, null);
-        items.push({
-          id: 'officecli',
-          title: knownTitle('officecli'),
-          kind: 'officecli',
-          canInstall: true,
-          facts: [
-            { code: observed.found.problems.length ? 'inspection-incomplete' : 'not-installed' },
-            ...connectionFacts(entries),
-          ],
-          actions: ['install', ...(entries.length ? ['detach' as const] : [])],
-          ...(observed.isConnectionsUnknown ? { problem: 'installation-state-unconfirmed' } : {}),
-        });
-      }
+    async inspect() {
+      const found = await officePrograms(ctx);
       return {
-        items,
-        problems: observed.problems,
-        grouped: observed.isConnectionsUnknown
-          ? []
-          : observed.entries.filter(entry => entry.owner !== undefined).map(entry => entry.id),
+        items: found.items.length
+          ? found.items
+          : [
+              {
+                id: 'officecli',
+                title: knownTitle('officecli'),
+                kind: 'officecli',
+                location: officeBinary(ctx),
+                canInstall: true,
+                facts: [{ code: 'not-installed' }],
+              },
+            ],
+        problems: [],
       };
     },
     async prepare(selection: Selection): Promise<Prepared> {
-      const observed = await observe();
-      const program =
-        observed.found.values.get(selection.id) ??
-        (selection.id === 'officecli' && observed.found.values.size === 1
-          ? [...observed.found.values.values()][0]
-          : undefined);
-      const identity = program ? [...observed.found.values].find(([, value]) => value === program)?.[0] : null;
-      if (selection.id !== 'officecli' && program === undefined) throw new Error('program-changed');
-      if (selection.id === 'officecli' && observed.found.values.size > 1) throw new Error('program-selection-required');
-      if (
-        observed.isConnectionsUnknown ||
-        (selection.action !== 'detach' && observed.found.problems.length > 0 && (!program || program.channel === 'npm'))
-      )
-        throw new Error('installation-state-unconfirmed');
-      const entries = related(observed, identity ?? null);
-      if (selection.action === 'detach') return detach(entries, selection.id);
-      if (selection.action === 'uninstall') {
-        if (!program)
-          return {
-            operations: [
-              ...(await detach(entries, selection.id)).operations,
-              programOperation(selection.id, 'program-absent', 'office.keep', {}, [{ code: 'program-not-installed' }]),
-            ],
-          };
-        const removal = await prepareProgram(ctx, 'officecli', selection, program);
-        const belongs = (value: Observation, entry: OfficeEntry) =>
-          entry.owner === identity ||
-          (entry.owner === null && value.found.values.size === 0) ||
-          (entry.id === 'mcp:officecli' &&
-            isObject(value.registration) &&
-            typeof value.registration.command === 'string' &&
-            path.isAbsolute(value.registration.command) &&
-            samePath(ctx, value.registration.command, program.binary));
-        const scope = (value: Observation) => value.entries.filter(entry => belongs(value, entry));
-        const expected = scope(observed);
-        const unmatched = [
-          ...(observed.skillStamp !== null &&
-          (observed.skillEvidence === 'none' ||
-            observed.entries.some(entry => entry.id === 'skill:officecli' && entry.owner === undefined))
-            ? [directory]
-            : []),
-          ...(observed.registration !== undefined &&
-          (observed.mcpCommand === undefined ||
-            observed.entries.some(entry => entry.id === 'mcp:officecli' && entry.owner === undefined))
-            ? ['officecli']
-            : []),
-        ];
-        const detached = expected.length ? await detach(expected, selection.id) : { operations: [] };
-        const guard = programOperation(
-          selection.id,
-          'integrations-detached',
-          'office.detached',
-          {
-            binary: program.binary,
-            identity,
-            unmatched: observed.entries.filter(entry => entry.owner === undefined).map(entry => entry.id),
-          },
-          [],
-          detached.operations.map(value => value.id),
-        );
-        const removalOperations = removal.operations.map(operation => ({
-          ...operation,
-          dependsOn: [...operation.dependsOn, guard.id],
-        }));
-        return {
-          operations: [
-            ...detached.operations,
-            guard,
-            ...removalOperations,
-            programOperation(
-              selection.id,
-              'preserved-integrations',
-              'office.keep',
-              {},
-              unmatched.map(detail => ({ code: 'unmatched-integration-kept', detail })),
-            ),
-          ],
-        };
+      if (selection.id !== 'officecli') throw new Error('channel-not-supported');
+      const found = await officePrograms(ctx);
+      const program = found.values.get('officecli');
+      if (!program && found.values.size) throw new Error('channel-not-supported');
+      let metadata: Record<string, unknown>;
+      try {
+        metadata = await json(ctx.machine, sourcesFile(ctx));
+      } catch {
+        throw new Error('source-metadata-unavailable');
       }
-
-      if (!['install', 'connect', 'update', 'reinstall'].includes(selection.action))
-        throw new Error('action-unavailable');
-      const integration = selection.fields?.connection;
-      if (observed.skillStamp !== null && observed.skillEvidence === 'none' && integration !== 'mcp')
-        throw new Error('integration-source-conflict');
-      if (
-        observed.registration !== undefined &&
-        observed.mcpCommand === undefined &&
-        (integration === 'mcp' || integration === 'both')
-      )
-        throw new Error('integration-source-conflict');
-      const stamp = program ? await ctx.machine.treeStamp(program.binary) : null;
-      const shouldKeepProgram =
-        program && !program.isMissing && (selection.action === 'install' || selection.action === 'connect');
-      // 两次读取之间二进制消失时不允许"保留程序"空转通过
-      if (shouldKeepProgram && stamp === null) throw new Error('program-changed');
-      const version = shouldKeepProgram ? (program.version ?? (await officeVersion(ctx, program.binary))) : null;
-      if (shouldKeepProgram && version === null) throw new Error('program-identity-unconfirmed');
-      if (shouldKeepProgram) unchanged(await ctx.machine.treeStamp(program.binary), stamp);
-      const operation = shouldKeepProgram
-        ? {
-            operations: [
-              programOperation(
-                selection.id,
-                'program-ready',
-                'program.ready',
-                { kind: 'officecli', binary: program.binary, before: stamp, version, keep: true },
-                [{ code: 'program-kept' }],
-              ),
-              ...(program.channel === 'native'
-                ? [
-                    programOperation(
-                      selection.id,
-                      'program-path',
-                      'program.path',
-                      { directory: path.dirname(program.binary) },
-                      [],
-                      [selection.id + '/program-ready'],
-                    ),
-                  ]
-                : []),
-            ],
-            targetVersion: version,
-            targetBinary: program.binary,
-            ...(program.channel === 'npm' ? { targetRegistry: null } : {}),
-          }
-        : await prepareProgram(ctx, 'officecli', selection, program);
-      const binary = operation.targetBinary ?? program?.binary ?? officeBinary(ctx);
-      const connection = await prepareOfficeConnection(ctx, selection, observed, {
-        version: operation.targetVersion,
-        binary,
-        source: program?.channel === 'npm' ? 'npm' : 'native',
-        ...(operation.targetRegistry !== undefined ? { registry: operation.targetRegistry } : {}),
-      });
-      const before =
-        selection.action === 'reinstall' && entries.length ? await detach(entries, selection.id) : undefined;
-      const detached = before ?? { operations: [] };
-      const programOperations = operation.operations.map(value => ({
-        ...value,
-        dependsOn: [...value.dependsOn, ...detached.operations.map(entry => entry.id)],
-      }));
-      const connected = composeProgramOperations(
-        connection,
-        selection.id,
-        'connection',
-        programOperations.map(value => value.id),
-      );
-      const superseded = detached.operations.map(operation => {
-        const next = connected.operations.find(value =>
-          operation.handler === 'skill.disable'
-            ? value.handler === 'skill.deploy'
-            : operation.handler === 'skill.source-remove'
-              ? value.handler === 'skill.source'
-              : operation.handler === 'mcp.registration' &&
-                value.handler === 'mcp.registration' &&
-                value.payload.target !== null,
+      const before = await ctx.machine.treeStamp(directory);
+      const record = metadata[directory];
+      const owned = ownsSkill(record, OFFICE_INTEGRATION.skill.repository, before);
+      if (selection.action !== 'uninstall' && before !== null)
+        checkSkillSource(record, OFFICE_INTEGRATION.skill.repository);
+      if (selection.action === 'uninstall') {
+        const operation = await prepareOfficeRemoval(ctx, program);
+        const detach = owned && before !== null ? disableSkillEntry(ctx, directory, before, record) : work([]);
+        const kept = step([], () =>
+          Promise.resolve({
+            state: 'complete',
+            effects:
+              before !== null && !owned
+                ? [{ state: 'kept', code: 'unmatched-integration-kept', detail: directory }]
+                : [],
+          }),
         );
-        return next ? { ...operation, payload: { ...operation.payload, supersededBy: next.id } } : operation;
-      });
-      return { operations: [...superseded, ...programOperations, ...connected.operations] };
+        return work([sequence([detach, operation]), kept]);
+      }
+      const operation = await prepareOfficeNative(ctx, program);
+      const revision = await officeRevision(ctx, operation.targetVersion);
+      const files = await ctx.machine.source(
+        OFFICE_INTEGRATION.skill.repository,
+        revision,
+        OFFICE_INTEGRATION.skill.folder,
+      );
+      const source = {
+        repository: OFFICE_INTEGRATION.skill.repository,
+        revision,
+        files,
+        stamp: skillFilesStamp(files),
+      };
+      const target = { name: 'officecli', directory, stamp: before, sourceRecord: record };
+      if (before !== null && !owned && before !== source.stamp) throw new Error('local-edits-preserved');
+      const skill =
+        before === source.stamp
+          ? owned
+            ? currentSkill(ctx, 'officecli', directory, before)
+            : repairSkillSource(ctx, target, source)
+          : prepareSkillFiles(ctx, target, source);
+      return {
+        ...sequence([operation, skill]),
+        action: operation.action ?? 'install',
+      };
     },
   };
 }
-
-function connectionFacts(entries: readonly OfficeEntry[]): Change[] {
-  return [
-    { code: entries.length ? 'connected' : 'not-connected' },
-    ...entries.map(entry => ({
-      code: entry.id === 'skill:officecli' ? 'office-skill-connected' : 'office-mcp-connected',
-    })),
+async function prepareOfficeRemoval(ctx: Context, program?: OfficeProgram): Promise<Prepared> {
+  if (program?.channel === 'manual') throw new Error('channel-not-supported');
+  if (!program || program.channel !== 'native') throw new Error('program-not-installed');
+  if ((await officeVersion(ctx, program.binary)) === null) throw new Error('program-identity-unconfirmed');
+  const targets = [
+    { file: program.binary, stamp: await ctx.machine.treeStamp(program.binary) },
+    ...(await officeUpdates(ctx, program.binary)),
   ];
+  return work(
+    targets.map(target =>
+      removeProgramFile(ctx, { file: target.file, before: target.stamp }, [
+        { code: 'program-uninstall', detail: target.file },
+      ]),
+    ),
+  );
 }
 
-function officeSkillEvidence(text: string | null, source: unknown, stamp: string | null): SkillEvidence {
-  if (stamp === null || !text?.trim()) return 'none';
-  if (isObject(source) && source.repository === officeIntegration.skill.repository && source.stamp === stamp)
-    return 'confirmed';
-  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)?.[1];
-  return frontmatter !== undefined && /(?:^|\n)\s*name:\s*["']?officecli["']?\s*(?:\r?\n|$)/i.test(frontmatter)
-    ? 'shape'
-    : 'none';
-}
-
-/** 生成 officecli 的 MCP 注册形状：识别与注册同源 */
-function officeMcpRegistration(command: string): { command: string; args: string[]; env: Record<string, string> } {
-  return { command, args: [...officeIntegration.mcp.args], env: { ...officeIntegration.mcp.env } };
-}
-
-function officeMcpCommand(value: unknown): string | undefined {
-  if (!isObject(value) || typeof value.command !== 'string') return undefined;
-  const shape = officeMcpRegistration(value.command);
+async function prepareOfficeNative(
+  ctx: Context,
+  program?: OfficeProgram,
+): Promise<Prepared & { readonly targetVersion: string }> {
+  if (program?.channel === 'manual') throw new Error('channel-not-supported');
+  const action = program ? 'update' : 'install';
+  const binary = program?.binary ?? officeBinary(ctx);
+  if (!samePath(ctx, binary, officeBinary(ctx))) throw new Error('channel-not-supported');
+  const before = await ctx.machine.fingerprint(binary);
+  if (!program && before !== null) throw new Error('program-changed');
+  const updates = await officeUpdates(ctx, binary);
+  const assetName = officeAsset(ctx);
+  const release: unknown = JSON.parse(
+    await ctx.machine.fetchText(`https://api.github.com/repos/${OFFICECLI_REPO_SLUG}/releases/latest`),
+  );
   if (
-    !Array.isArray(value.args) ||
-    value.args.length !== shape.args.length ||
-    value.args.some((arg, index) => arg !== shape.args[index])
+    !isObject(release) ||
+    release.draft !== false ||
+    release.prerelease !== false ||
+    typeof release.tag_name !== 'string' ||
+    !/^v\d+\.\d+\.\d+$/.test(release.tag_name) ||
+    !Array.isArray(release.assets)
   )
-    return undefined;
-  const command = value.command;
-  return /^(?:officecli|officecli\.exe)$/i.test(command) ||
-    (path.isAbsolute(command) && /(?:^|[\\/])officecli(?:\.exe)?$/i.test(command))
-    ? command
-    : undefined;
-}
-
-interface OfficeTarget {
-  readonly version: string | null;
-  readonly binary: string;
-  readonly source: 'npm' | 'native';
-  readonly registry?: NpmRegistry;
-}
-
-function officeConnections(skill: Prepared, mcp: Prepared): Prepared {
+    throw new Error('invalid-release');
+  const tag = release.tag_name;
+  const targetVersion = tag.slice(1);
+  const baseUrl = `https://github.com/${OFFICECLI_REPO_SLUG}/releases/download/${tag}/`;
+  const assets = release.assets.filter(isObject);
+  const asset = assets.find(value => value.name === assetName);
+  const manifest = assets.find(value => value.name === 'SHA256SUMS');
+  if (
+    !asset ||
+    asset.browser_download_url !== `${baseUrl}${assetName}` ||
+    !manifest ||
+    manifest.browser_download_url !== `${baseUrl}SHA256SUMS`
+  )
+    throw new Error('release-asset-unavailable');
+  const fetchReleaseFile = async <T>(
+    name: string,
+    read: (url: string, options?: { readonly timeoutMs: number }) => Promise<T>,
+    timeoutMs: number,
+  ): Promise<T> => {
+    try {
+      return await read(`${baseUrl}${name}`, { timeoutMs });
+    } catch (error) {
+      if (errorCode(error) === 'cancelled') throw error;
+      // 上游官方镜像只作为传输备选，标签、文件名与摘要仍由 GitHub 发布约束
+      return read(`${OFFICE_INTEGRATION.releaseMirror}/releases/download/${tag}/${name}`);
+    }
+  };
+  const checksums = await fetchReleaseFile(
+    'SHA256SUMS',
+    (url, options) => ctx.machine.fetchText(url, options),
+    CHECKSUM_DOWNLOAD_TIMEOUT_MS,
+  );
+  const matching = checksums
+    .split(/\r?\n/)
+    .map(line => line.trim().split(/\s+/))
+    .filter(parts => parts[1]?.replace(/^\*/, '') === assetName);
+  const digest = matching.length === 1 ? matching[0]?.[0]?.toLowerCase() : undefined;
+  if (
+    digest === undefined ||
+    !/^[a-f0-9]{64}$/.test(digest) ||
+    (asset.digest !== undefined && asset.digest !== null && asset.digest !== `sha256:${digest}`)
+  )
+    throw new Error('release-checksum-unavailable');
+  if (before !== null) {
+    const currentVersion = await officeVersion(ctx, binary);
+    if (currentVersion === null) throw new Error('program-version-unconfirmed');
+    if (compareVersions(currentVersion, targetVersion) > 0) throw new Error('newer-version-preserved');
+  }
+  // 完整摘要与发布原件一致才复用，版本号相同但内容不同仍需下载校验
+  const shouldKeepBinary = action === 'update' && before === digest;
+  const bytes = shouldKeepBinary
+    ? null
+    : await fetchReleaseFile(
+        assetName,
+        (url, options) => ctx.machine.fetchBytes(url, options),
+        PROGRAM_DOWNLOAD_TIMEOUT_MS,
+      );
+  if (bytes !== null && createHash('sha256').update(bytes).digest('hex') !== digest)
+    throw new Error('release-checksum-mismatch');
+  const removals = updates.map(target =>
+    removeProgramFile(
+      ctx,
+      { file: target.file, before: target.stamp },
+      target.stamp === null ? [] : [{ code: 'program-copy-remove', detail: target.file }],
+    ),
+  );
+  const deploy = deployProgram(ctx, { binary, before, digest, bytes }, [
+    {
+      code: shouldKeepBinary ? 'program-kept' : PROGRAM_ACTION_CHANGE[action],
+      detail: 'OfficeCLI · native · ' + targetVersion + ' · ' + binary,
+    },
+  ]);
+  const ready = step([], async () => {
+    if ((await ctx.machine.fingerprint(binary)) !== digest || (await officeVersion(ctx, binary)) !== targetVersion)
+      throw new Error('program-not-ready');
+    return { state: 'complete', effects: [{ state: 'done', code: 'program-ready' }] };
+  });
+  const userPath = programPath(ctx, path.dirname(binary), [
+    { code: 'program-user-path', detail: path.dirname(binary) },
+    { code: 'keep-user-data' },
+  ]);
   return {
-    operations: [
-      ...skill.operations,
-      ...mcp.operations.map(operation => ({
-        ...operation,
-        dependsOn: [...operation.dependsOn, ...skill.operations.map(value => value.id)],
-      })),
-    ],
+    ...sequence([...(removals.length ? [work(removals)] : []), deploy, ready, userPath]),
+    action,
+    targetVersion,
   };
 }
-
-async function officeRevision(ctx: Context, target: OfficeTarget): Promise<string> {
-  const version = target.version;
-  if (version === null) throw new Error('source-version-unavailable');
-  if (target.source === 'npm') {
-    const resolved = await resolveNpmView(
-      ctx.machine,
-      '@officecli/officecli@' + version,
-      'gitHead',
-      value => (typeof value === 'string' && isGitRevision(value) ? value : null),
-      target.registry ?? null,
-    );
-    if (resolved === null) throw new Error('source-version-unavailable');
-    return resolved.value;
-  }
+async function officeRevision(ctx: Context, version: string): Promise<string> {
   if (!isExactVersion(version)) throw new Error('source-version-unavailable');
   const reference: unknown = JSON.parse(
     await ctx.machine.fetchText(`https://api.github.com/repos/${OFFICECLI_REPO_SLUG}/git/ref/tags/v${version}`),
@@ -476,7 +250,8 @@ async function officeRevision(ctx: Context, target: OfficeTarget): Promise<strin
   if (!isObject(reference) || reference.ref !== 'refs/tags/v' + version || !isObject(reference.object))
     throw new Error('source-version-unavailable');
   let object = reference.object;
-  for (let depth = 0; depth < 4; depth++) {
+  // 技能固定到对应程序版本的提交，最多解引用四层附注标签
+  for (let depth = 0; depth < MAX_TAG_DEREFERENCES; depth++) {
     if (typeof object.sha !== 'string' || !isGitRevision(object.sha)) throw new Error('source-version-unavailable');
     if (object.type === 'commit') return object.sha;
     if (object.type !== 'tag') throw new Error('source-version-unavailable');
@@ -490,84 +265,91 @@ async function officeRevision(ctx: Context, target: OfficeTarget): Promise<strin
   throw new Error('source-version-unavailable');
 }
 
-async function prepareOfficeConnection(
-  ctx: Context,
-  selection: Selection,
-  observed: Observation,
-  target: OfficeTarget,
-): Promise<Prepared> {
-  const directory = officeSkillDirectory(ctx);
-  const { skillStamp: before, sourceRecord: record, mcpCommand: command } = observed;
-  const hasMcp = command !== undefined && (!path.isAbsolute(command) || samePath(ctx, command, target.binary));
-  const integration = selection.fields?.connection;
-  const mcp = async (action: 'connect', hasDetached = false): Promise<Prepared> => {
-    const registration = officeMcpRegistration(target.binary);
-    const operation = await prepareMcp(
-      ctx,
-      'officecli',
-      { ...selection, action },
-      {
-        hasDetached,
-        registration: () => registration,
-      },
-    );
-    return operation;
-  };
+async function officeUpdates(ctx: Context, binary: string) {
+  const files = ['.update', '.update.partial', '.old'].map(suffix => binary + suffix);
+  const entries = await ctx.machine.entries(path.dirname(binary));
+  return Promise.all(
+    files.map(async file => {
+      if (entries.some(entry => entry.name === path.basename(file) && entry.kind === 'directory'))
+        throw new Error('program-update-conflict');
+      return { file, stamp: await ctx.machine.treeStamp(file) };
+    }),
+  );
+}
+function officeAsset(ctx: Context) {
+  const arch = ctx.arch ?? process.arch;
+  if (arch !== 'x64' && arch !== 'arm64') throw new Error('unsupported-architecture');
+  if (ctx.platform === 'win32') return `officecli-win-${arch}.exe`;
+  if (ctx.platform === 'darwin') return `officecli-mac-${arch}`;
+  return `officecli-linux-${ctx.libc === 'musl' ? 'alpine-' : ''}${arch}`;
+}
 
-  if (selection.action === 'install') {
-    if (before !== null && observed.skillEvidence !== 'none') {
-      const skill = currentSkill(ctx, 'officecli', directory, before);
-      if (integration === 'both') return officeConnections(skill, await mcp('connect'));
-      return integration === 'mcp' ? mcp('connect') : skill;
-    }
-  }
-  if (selection.action === 'update') {
-    if (observed.problems.some(problem => problem.code === 'source-metadata-unavailable'))
-      throw new Error('source-metadata-unavailable');
+/** OfficeCLI 自行发现受管原生安装和只读的外部入口，不参与 npm 发现 */
+async function officePrograms(ctx: Context): Promise<{ items: Item[]; values: Map<string, OfficeProgram> }> {
+  const values = new Map<string, OfficeProgram>();
+  const native = officeBinary(ctx);
+  if ((await ctx.machine.treeStamp(native)) !== null) values.set('officecli', { channel: 'native', binary: native });
+  for (const binary of await ctx.machine.locate('officecli')) {
+    const canonical = await ctx.machine.realpath(binary);
     if (
-      before === null ||
-      !isObject(record) ||
-      record.repository !== officeIntegration.skill.repository ||
-      record.stamp !== before
-    ) {
-      const code = before === null ? 'office-connection-kept' : 'office-local-skill-kept';
-      return { operations: [programOperation(selection.id, 'connection-kept', 'office.keep', {}, [{ code }])] };
-    }
+      !canonical ||
+      [...values.values()].some(
+        program => samePath(ctx, program.binary, binary) || samePath(ctx, program.binary, canonical),
+      )
+    )
+      continue;
+    values.set('officecli:external:' + binary, { channel: 'manual', binary });
   }
+  return {
+    values,
+    items: [...values.entries()].map(([id, program]) => ({
+      id,
+      title: knownTitle('officecli'),
+      kind: 'officecli',
+      location: program.binary,
+      canInstall: program.channel !== 'manual',
+      canUninstall: program.channel !== 'manual',
+      facts: [
+        { code: 'program-exists', detail: program.channel },
+        ...(program.channel === 'manual' ? [{ code: 'external-program-preserved' }] : []),
+      ],
+    })),
+  };
+}
 
-  const isReinstall = selection.action === 'reinstall';
-  if (
-    (isReinstall || integration === 'mcp' || integration === 'both') &&
-    observed.registration !== undefined &&
-    !hasMcp
-  )
-    throw new Error('integration-source-conflict');
-  const shouldConnectBoth =
-    integration === 'both' ||
-    (isReinstall &&
-      ((hasMcp && integration !== 'mcp') || (observed.skillEvidence !== 'none' && integration === 'mcp')));
-  if (integration === 'mcp' && !shouldConnectBoth) return mcp('connect', isReinstall);
-  if (
-    before !== null &&
-    selection.fields?.replace !== REPLACE_CONSENT &&
-    (!isObject(record) || record.stamp !== before)
-  )
-    throw new Error('local-edits-preserved');
-  if (isReinstall && before !== null && observed.skillEvidence === 'none')
-    throw new Error('integration-source-conflict');
-
-  const revision = await officeRevision(ctx, target);
-  let skill: Prepared;
-  if (before !== null && isObject(record) && record.stamp === before && record.revision === revision && !isReinstall) {
-    skill = currentSkill(ctx, 'officecli', directory, before);
-  } else {
-    const repository = officeIntegration.skill.repository;
-    const files = await ctx.machine.source(repository, revision, officeIntegration.skill.folder);
-    skill = prepareSkillFiles(
-      ctx,
-      { name: 'officecli', directory, stamp: isReinstall ? null : before, sourceRecord: record },
-      { repository, revision, files, stamp: skillFilesStamp(files) },
-    );
-  }
-  return shouldConnectBoth ? officeConnections(skill, await mcp('connect', isReinstall)) : skill;
+/**
+ * 计算 OfficeCLI 固定入口：Windows 本地应用目录，其他平台用户 bin 目录
+ *
+ * @throws Error - 目录不是绝对路径或指向文件系统根时抛出 invalid-config-root
+ */
+function officeBinary(ctx: Context) {
+  const root =
+    ctx.platform === 'win32'
+      ? path.join(ctx.localAppData ?? path.join(ctx.home, 'AppData/Local'), 'OfficeCli')
+      : userBinDirectory(ctx);
+  if (!path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root)
+    throw new Error('invalid-config-root');
+  return path.join(root, ctx.platform === 'win32' ? 'officecli.exe' : 'officecli');
+}
+/**
+ * 禁用自更新后探测 OfficeCLI 身份和版本
+ *
+ * @returns 经确认的三段版本，无法确认时为 null；命令调用拒绝仍向外传播
+ * @remarks 版本与帮助探测共用五秒；版本输出缺少程序名时再查帮助
+ */
+async function officeVersion(ctx: Context, binary: string) {
+  const deadlineMs = performance.now() + VERSION_PROBE_TIMEOUT_MS;
+  const probe = (argument: string) =>
+    ctx.machine.execute(binary, [argument], {
+      env: { ...OFFICE_INTEGRATION.suppressSelfUpdate },
+      cwd: ctx.home,
+      timeoutMs: Math.max(1, Math.ceil(deadlineMs - performance.now())),
+    });
+  const output = await probe('--version');
+  const version = /\b(\d+\.\d+\.\d+)\b/.exec(output.stdout)?.[1];
+  if (!succeeded(output) || version === undefined) return null;
+  if (/\bofficecli\b/i.test(output.stdout)) return version;
+  if (performance.now() >= deadlineMs) return null;
+  const help = await probe('--help');
+  return succeeded(help) && /\bofficecli\b/i.test(help.stdout) ? version : null;
 }

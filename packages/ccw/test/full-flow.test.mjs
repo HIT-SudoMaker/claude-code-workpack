@@ -3,265 +3,164 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
+import { npmConfig, createTestEnvironment, exists, fail, ok, releaseContract, revision } from './test-environment.mjs';
+import { createSkillsCliFixture } from './skills-cli-fixture.mjs';
 
-import { HOME_TITLE } from '../dist/render.js';
-import { runTerminal } from './terminal-test.mjs';
-import {
-  npmConfig,
-  attribution,
-  createEnv,
-  exists,
-  fail,
-  ok,
-  pluginMarketplaceFiles,
-  releaseContract,
-  revision,
-} from './env.mjs';
-
-const defaultEnv = {
-  DISABLE_TELEMETRY: '1',
-  DISABLE_ERROR_REPORTING: '1',
-  DISABLE_INSTALLATION_CHECKS: '1',
-  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-};
-
-async function fixture(t, { platform = process.platform } = {}) {
-  // layout 'root'：状态文件按 claudeRoot/.claude.json 派生；cclineRoot 仍取 home/.claude/ccline，与活动配置根分离
-  const f = await createEnv(t, {
+async function createInstallationScenario(
+  testContext,
+  { platform = process.platform, cclineOutput = 'ccline 2.0.1', claudeEntry = 'cli.js' } = {},
+) {
+  const workspace = await createTestEnvironment(testContext, {
     layout: 'root',
-    seed: {
-      settings: {},
-      state: { projects: { untouched: { mcpServers: { projectOnly: { command: 'keep' } } } } },
-    },
+    seed: { settings: {}, state: { projects: { untouched: { mcpServers: { projectOnly: { command: 'keep' } } } } } },
   });
-  const cclineRoot = path.join(f.home, '.claude/ccline');
-  const npmRoot = path.join(f.root, 'npm/node_modules');
-  const settings = f.settingsFile;
-  const stateFile = f.stateFile;
-  const native = path.join(f.home, '.local/bin', platform === 'win32' ? 'claude.exe' : 'claude');
-  const uv = path.join(f.home, '.local/bin', platform === 'win32' ? 'uv.exe' : 'uv');
-  const officeNative =
+  const cclineRoot = path.join(workspace.home, '.claude/ccline');
+  const skills = createSkillsCliFixture(workspace);
+  const cclineBinary = path.join(cclineRoot, platform === 'win32' ? 'ccline.exe' : 'ccline');
+  const npmRoot = path.join(workspace.root, 'npm/node_modules');
+  const claudePackage = '@anthropic-ai/claude-code';
+  const claudeBinary = path.join(npmRoot, claudePackage, claudeEntry);
+  const native = path.join(workspace.home, '.local/bin', platform === 'win32' ? 'claude.exe' : 'claude');
+  const officeBinary =
     platform === 'win32'
-      ? path.join(f.home, 'AppData/Local/OfficeCli/officecli.exe')
-      : path.join(f.home, '.local/bin/officecli');
-  const officeAsset = `officecli-${platform === 'win32' ? 'win' : platform === 'darwin' ? 'mac' : 'linux'}-${process.arch}${platform === 'win32' ? '.exe' : ''}`;
+      ? path.join(workspace.home, 'AppData/Local/OfficeCli/officecli.exe')
+      : path.join(workspace.home, '.local/bin/officecli');
+  const officeAsset =
+    'officecli-' +
+    { win32: 'win', darwin: 'mac', linux: 'linux' }[platform] +
+    '-' +
+    process.arch +
+    (platform === 'win32' ? '.exe' : '');
   const officePayload = Buffer.from('OfficeCLI native fixture');
-  const officeDigest = createHash('sha256').update(officePayload).digest('hex');
   const release = releaseContract({
     tag: 'v1.0.123',
     asset: officeAsset,
-    digest: officeDigest,
+    digest: createHash('sha256').update(officePayload).digest('hex'),
     revision,
-    also: url => {
-      if (url.includes('pypi.org')) return JSON.stringify({ info: { version: '1.2.3' } });
-    },
   });
-  const officeRelease = release.release;
-  const toolsBin = path.join(f.root, 'tools bin');
   const packages = new Map();
-  const state = {
-    fail: '',
-    stableVersion: '2.1.318',
-    nativeVersion: '2.1.318',
-    fetchResponse: null, // 整体替换 fetchText 响应
-    npmDelay: 0, // npm 探测延迟（毫秒），用于并发测量
-    npmActive: 0,
-    npmPeak: 0,
-    onNpm: null, // npm 调用钩子（可返回阻塞 promise）
-    pluginHelp: null, // 重装探针应答（null＝支持 --keep-data 的正常帮助输出）
-  };
-  const readJson = async file => {
-    try {
-      return JSON.parse(await fs.readFile(file, 'utf8'));
-    } catch (error) {
-      if (error.code === 'ENOENT') return {};
-      throw error;
-    }
-  };
-  await f.write(uv, 'uv fixture');
-  const base = f.machine({
-    locate: async command => {
-      if (command === 'claude')
-        return await fs.stat(native).then(
-          () => [native],
-          () => [],
-        );
-      if (command === 'officecli') {
-        const binary = packages.has('@officecli/officecli')
-          ? path.join(npmRoot, '@officecli/officecli/vendor', platform === 'win32' ? 'officecli.exe' : 'officecli')
-          : officeNative;
-        return await fs.stat(binary).then(
-          () => [binary],
-          () => [],
-        );
-      }
-      if (command === 'uv') return [uv];
-      return [];
-    },
-    processes: async () => [],
-    npm: async (args, options) => {
-      state.npmActive++;
-      state.npmPeak = Math.max(state.npmPeak, state.npmActive);
-      try {
-        if (state.npmDelay) await new Promise(resolve => setTimeout(resolve, state.npmDelay));
-        if (state.onNpm) await state.onNpm(args, options);
+  const state = { fail: '', stableVersion: '2.1.318' };
+  const readJson = async file => ((await exists(file)) ? workspace.read(file) : {});
+  const machine = {
+    ...workspace.machine({
+      locate: async command => {
+        const binary = command === 'claude' ? native : command === 'officecli' ? officeBinary : undefined;
+        return binary && (await exists(binary)) ? [binary] : [];
+      },
+      processes: async () => [],
+      npm: async (args, options) => {
+        state.onNpm?.(args, options);
         const last = args.at(-1);
-        if (state.fail === `npm:${args[0]}`) return fail();
+        if (state.fail === 'npm:' + args[0]) return fail();
+        if (args[0] === 'exec') return skills.npm(args, options);
         if (args[0] === 'config') return npmConfig(args);
         if (args[0] === 'root') return ok(npmRoot);
         if (args[0] === 'ls')
           return ok(
             JSON.stringify({ dependencies: packages.has(last) ? { [last]: { version: packages.get(last) } } : {} }),
           );
-        if (args[0] === 'view')
-          return ok(
-            JSON.stringify(
-              args[1].includes('officecli')
-                ? '1.0.123'
-                : args[1].includes('claude-code')
-                  ? args[1].endsWith('@stable')
-                    ? state.stableVersion
-                    : '2.9.999'
-                  : '2.0.1',
-            ),
+        if (args[0] === 'view') {
+          assert.ok(
+            [claudePackage + '@stable', '@cometix/ccline@latest'].includes(args[1]),
+            'unsupported package query',
           );
+          return ok(JSON.stringify(args[1].startsWith(claudePackage) ? state.stableVersion : '2.0.1'));
+        }
+        if (args[0] === 'uninstall') {
+          assert.ok([claudePackage, '@cometix/ccline'].includes(last));
+          packages.delete(last);
+          await fs.rm(path.join(npmRoot, last), { recursive: true, force: true });
+          if (last === '@cometix/ccline') await fs.rm(cclineBinary, { force: true });
+          return ok();
+        }
         if (args[0] === 'install') {
           const split = last.lastIndexOf('@');
-          const name = last.slice(0, split);
-          const version = last.slice(split + 1);
+          const name = last.slice(0, split),
+            version = last.slice(split + 1);
+          assert.ok([claudePackage, '@cometix/ccline'].includes(name));
           packages.set(name, version);
-          await f.write(
-            path.join(npmRoot, name, 'package.json'),
-            JSON.stringify({ name, version, bin: { claude: 'cli.js' } }),
-          );
-          await f.write(
-            name === '@cometix/ccline'
-              ? path.join(cclineRoot, platform === 'win32' ? 'ccline.exe' : 'ccline')
-              : path.join(
-                  npmRoot,
-                  name,
-                  name === '@officecli/officecli' ? `vendor/officecli${platform === 'win32' ? '.exe' : ''}` : 'cli.js',
-                ),
-            'binary fixture',
-          );
+          await workspace.json(path.join(npmRoot, name, 'package.json'), {
+            name,
+            version,
+            bin: { claude: claudeEntry },
+          });
+          await workspace.write(name === claudePackage ? claudeBinary : cclineBinary, 'binary fixture');
           return ok();
         }
-        throw new Error(`Unexpected npm command ${args[0]}`);
-      } finally {
-        state.npmActive--;
-      }
-    },
-    execute: async (executable, originalArgs) => {
-      const args = [...originalArgs];
-      if (executable === path.join(cclineRoot, platform === 'win32' ? 'ccline.exe' : 'ccline')) {
-        assert.deepEqual(args, ['--version']);
-        return ok('ccline 2.0.1');
-      }
-      if (executable === officeNative || executable.includes(`${path.sep}@officecli${path.sep}officecli${path.sep}`)) {
-        assert.deepEqual(args, ['--version']);
-        return ok('OfficeCLI 1.0.123');
-      }
-      if (args[0]?.endsWith('cli.js')) args.shift();
-      if (executable === 'git') return ok(`${revision}\tHEAD\n`);
-      if (executable === uv) {
-        if (args[1] === 'list')
-          return ok(
-            await fs.stat(path.join(toolsBin, platform === 'win32' ? 'serena.exe' : 'serena')).then(
-              () => 'serena-agent v1.2.3\n- serena',
-              () => '',
-            ),
-          );
-        if (args[1] === 'dir') return ok(toolsBin);
-        if (args[1] === 'install') {
-          await f.write(path.join(toolsBin, platform === 'win32' ? 'serena.exe' : 'serena'), 'serena fixture');
-          return ok();
+        throw new Error('Unexpected npm command: ' + args[0]);
+      },
+      execute: async (executable, args) => {
+        if (executable === cclineBinary || executable === officeBinary) {
+          assert.deepEqual(args, ['--version']);
+          return ok(executable === cclineBinary ? cclineOutput : 'OfficeCLI 1.0.123');
         }
-      }
-      if (executable === path.join(toolsBin, platform === 'win32' ? 'serena.exe' : 'serena')) return ok();
-      if (executable === native || args[0] === 'plugin' || args[0] === '--version') {
-        if (args[0] === '--version')
-          return ok(
-            `${executable === native ? state.nativeVersion : (packages.get('@anthropic-ai/claude-code') ?? state.nativeVersion)} (Claude Code)`,
-          );
-        if (args[0] === 'install') {
-          state.nativeVersion = args[1];
-          await f.write(native, 'updated native fixture');
-          await f.write(path.join(f.home, '.local/share/claude/versions/1'), 'updated native fixture');
-          return ok();
+        if (executable === 'git') {
+          assert.equal(args[0], 'ls-remote');
+          return ok(revision + '\tHEAD\n');
         }
+        if (executable === native) {
+          assert.deepEqual(args, ['--version']);
+          return ok('2.1.318 (Claude Code)');
+        }
+        if (executable !== claudeBinary) {
+          assert.equal(executable, process.execPath);
+          assert.equal(args[0], claudeBinary);
+          args = args.slice(1);
+        }
+        if (args[0] === '--version') return ok(packages.get(claudePackage) + ' (Claude Code)');
+        assert.equal(args[0], 'plugin');
         if (args[1] === 'marketplace') {
-          await f.write(
-            path.join(f.claudeRoot, 'plugins/known_marketplaces.json'),
-            JSON.stringify({
-              'claude-plugins-official': { source: { source: 'github', repo: 'anthropics/claude-plugins-official' } },
-            }),
-          );
+          assert.deepEqual(args.slice(1), [
+            'marketplace',
+            'add',
+            'anthropics/claude-plugins-official',
+            '--scope',
+            'user',
+          ]);
+          await workspace.json(path.join(workspace.claudeRoot, 'plugins/known_marketplaces.json'), {
+            'claude-plugins-official': { source: { source: 'github', repo: 'anthropics/claude-plugins-official' } },
+          });
           return ok();
         }
-        if (args[1] === 'uninstall' && args[2] === '--help')
-          return state.pluginHelp ? state.pluginHelp() : ok('  --keep-data  Keep plugin data when uninstalling\n');
-        if (args[1] === 'uninstall') {
-          const id = args[2];
-          const config = await readJson(settings);
-          const file = path.join(f.claudeRoot, 'plugins/installed_plugins.json');
-          const records = await readJson(file);
-          if (records.plugins) delete records.plugins[id];
-          if (config.enabledPlugins) delete config.enabledPlugins[id];
-          await f.write(file, JSON.stringify(records));
-          await f.write(settings, JSON.stringify(config));
-          return ok();
-        }
-        const id = args[2];
-        const config = await readJson(settings);
-        config.enabledPlugins ??= {};
-        const file = path.join(f.claudeRoot, 'plugins/installed_plugins.json');
-        const records = await readJson(file);
+        assert.ok(['install', 'update', 'enable'].includes(args[1]));
+        assert.deepEqual(args.slice(3), ['--scope', 'user']);
+        const id = args[2],
+          config = await readJson(workspace.settingsFile);
+        const recordFile = path.join(workspace.claudeRoot, 'plugins/installed_plugins.json');
+        const records = await readJson(recordFile);
+        const installPath = path.join(workspace.claudeRoot, 'plugins/cache', id);
+        await workspace.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
         records.version = 2;
         records.plugins ??= {};
-        const installPath = path.join(f.claudeRoot, 'plugins/cache', id);
-        await f.write(path.join(installPath, '.claude-plugin/plugin.json'), '{}');
         records.plugins[id] = [{ scope: 'user', version: '1.0.0', installPath, gitCommitSha: revision }];
+        config.enabledPlugins ??= {};
         config.enabledPlugins[id] = true;
-        await f.write(file, JSON.stringify(records));
-        await f.write(settings, JSON.stringify(config));
+        await workspace.json(recordFile, records);
+        await workspace.json(workspace.settingsFile, config);
         return ok();
-      }
-      throw new Error(`Unexpected command: ${executable}`);
-    },
-  });
-  const machine = {
-    ...base,
+      },
+    }),
     userPathContains: async () => true,
     async ensureUserPath() {},
+    async replaceFile(...args) {
+      if (state.fail === 'replace-file') throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+      const result = await workspace.machine().replaceFile(...args);
+      if (state.fail === 'replace-after-write') throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+      return result;
+    },
     async fetchBytes(url) {
-      assert.equal(url, officeRelease + officeAsset);
+      assert.equal(url, release.release + officeAsset);
       return officePayload;
     },
-    async fetchText(url) {
-      f.calls.push({ kind: 'fetch', target: url });
-      if (state.fetchResponse !== null) return state.fetchResponse;
-      return release.fetchText(url);
-    },
+    fetchText: release.fetchText,
     async source(repository, commit, folder) {
-      if (folder === '.') return pluginMarketplaceFiles();
-      if (folder === '.agents/skills' || folder === 'skills')
-        return (
-          repository.includes('mattpocock')
-            ? ['engineering/tdd', 'engineering/code-review']
-            : ['ssre2-design', 'ssre2-review']
-        ).flatMap(name => [
-          { path: `${name}/SKILL.md`, data: Buffer.from(`---\nname: ${path.basename(name)}\n---\n`) },
-          { path: `${name}/assets/icon.bin`, data: Uint8Array.from([0, 128, 255]) },
-        ]);
-      return [
-        { path: 'SKILL.md', data: Buffer.from(`---\nname: ${path.basename(folder)}\n---\nSee reference/details.md`) },
-        { path: 'reference/details.md', data: Buffer.from('independent reference bytes') },
-        { path: 'assets/icon.bin', data: Uint8Array.from([0, 128, 255]) },
-      ];
+      assert.equal(commit, revision);
+      assert.equal(repository, 'https://github.com/iOfficeAI/OfficeCLI');
+      assert.equal(folder, 'skills/officecli');
+      return [{ path: 'SKILL.md', data: Buffer.from('---\nname: officecli\n---\n') }];
     },
   };
-  const ccw = f.ccw(machine, { cclineRoot, platform });
+  const ccw = workspace.ccw(machine, { cclineRoot, platform });
   const apply = async input => {
     const plan = await ccw.plan(input);
     assert.ok(
@@ -270,423 +169,506 @@ async function fixture(t, { platform = process.platform } = {}) {
     );
     return ccw.apply(plan.id);
   };
-  return {
-    ...f,
-    native,
-    settings,
-    stateFile,
-    machine,
-    ccw,
-    state,
-    packages,
-    readJson,
-    apply,
-  };
+  return { ...workspace, native, settings: workspace.settingsFile, ccw, state, packages, readJson, apply };
 }
 
-test('安装完整套件：写入活动配置根', async t => {
-  const f = await fixture(t);
-  const selections = [
-    { id: 'claude' },
-    {
-      id: 'settings',
-      fields: {
-        mode: 'api',
-        baseUrl: 'https://example.test/api',
-        secret: 'fixture-secret',
-        model: 'fixture-model',
-        language: '中文',
-      },
+const installation = [
+  { id: 'claude' },
+  {
+    id: 'settings',
+    fields: {
+      mode: 'api',
+      baseUrl: 'https://example.test/api',
+      secret: 'fixture-secret',
+      model: 'fixture-model',
+      language: '中文',
     },
-    ...['code-simplifier', 'frontend-design', 'github', 'mcp-server-dev', 'skill-creator'].map(name => ({
-      id: `plugin:${name}@claude-plugins-official`,
-    })),
-    { id: 'mcp:context7' },
-    { id: 'mcp:serena' },
-    { id: 'skill-set:ssre2' },
-    { id: 'skill-set:mattpocock' },
-    { id: 'officecli' },
-    { id: 'ccline' },
-  ];
-  const plan = await f.ccw.plan({ task: 'install', selected: selections });
-  assert.ok(
-    plan.items.every(item => item.problem === null),
-    JSON.stringify(plan),
-  );
-  for (const value of ['fixture-secret', 'https://example.test/api', 'fixture-model'])
-    assert.equal(JSON.stringify(plan).includes(value), false);
-  const result = await f.ccw.apply(plan.id);
-  assert.equal(result.state, 'done', JSON.stringify(result));
-  const settings = await f.readJson(f.settings);
-  assert.equal(settings.env.ANTHROPIC_API_KEY, 'fixture-secret');
-  assert.equal(Object.keys(settings.enabledPlugins).length, 5);
-  assert.equal(settings.statusLine.command, 'ccline');
-  const state = await f.readJson(f.stateFile);
-  assert.equal(state.mcpServers.serena.args.includes('--project-from-cwd'), true);
-  assert.equal(state.projects.untouched.mcpServers.projectOnly.command, 'keep');
-  for (const name of ['ssre2-design', 'ssre2-review', 'tdd', 'code-review', 'officecli'])
-    assert.deepEqual(
-      await fs.readFile(path.join(f.claudeRoot, 'skills', name, 'assets/icon.bin')),
-      Buffer.from([0, 128, 255]),
+  },
+  ...['code-simplifier', 'frontend-design', 'github', 'context7', 'serena'].map(name => ({
+    id: 'plugin:' + name + '@claude-plugins-official',
+  })),
+  { id: 'skill:amirc-research' },
+  { id: 'skill-set:ssre2' },
+  { id: 'skill-set:mattpocock' },
+  { id: 'officecli' },
+  { id: 'ccline' },
+];
+
+// 完整流程：安装、重复更新与移除保留数据
+for (const platform of ['win32', 'darwin', 'linux'])
+  test(platform + ' 固定渠道安装，重复操作自动更新，卸载保留用户数据', async testContext => {
+    const scenario = await createInstallationScenario(testContext, { platform });
+    const plan = await scenario.ccw.plan({ task: 'install', selected: installation });
+    assert.ok(
+      plan.items.every(i => i.problem === null),
+      JSON.stringify(plan),
     );
-  assert.equal(
-    await fs.stat(path.join(f.home, '.agents')).then(
-      () => true,
-      () => false,
-    ),
-    false,
-  );
-  assert.equal(
-    f.calls.some(call => call.kind === 'execute' && call.args[0] === 'mcp' && ['list', 'get'].includes(call.args[1])),
-    false,
-  );
-});
-
-test('重装插件：保留数据证据未知时阻断', async t => {
-  const f = await fixture(t);
-  const setup = await f.apply({
-    task: 'install',
-    selected: [{ id: 'claude' }, { id: 'plugin:github@claude-plugins-official' }],
-  });
-  assert.equal(setup.state, 'done', JSON.stringify(setup));
-  for (const probe of [fail(), { code: 0, stdout: '', failed: true }]) {
-    f.state.pluginHelp = () => probe;
-    const blocked = await f.ccw.plan({
-      task: 'install',
-      selected: [{ id: 'plugin:github@claude-plugins-official', maintenance: 'reinstall' }],
-    });
-    assert.equal(blocked.items[0].problem, 'plugin-keep-data-unconfirmed');
-  }
-});
-
-test('重装插件：只在证明支持保留数据时执行', async t => {
-  const f = await fixture(t);
-  const setup = await f.apply({
-    task: 'install',
-    selected: [{ id: 'claude' }, { id: 'plugin:github@claude-plugins-official' }],
-  });
-  assert.equal(setup.state, 'done', JSON.stringify(setup));
-  for (const [probe, change, hasFlag] of [[null, 'plugin-keep-data', true]]) {
-    f.state.pluginHelp = probe;
-    f.calls.length = 0;
-    const plan = await f.ccw.plan({
-      task: 'install',
-      selected: [{ id: 'plugin:github@claude-plugins-official', maintenance: 'reinstall' }],
-    });
-    assert.equal(plan.items[0].problem, null, JSON.stringify(plan));
-    assert.ok(plan.items[0].changes.some(entry => entry.code === change));
-    const result = await f.ccw.apply(plan.id);
+    assert.equal(JSON.stringify(plan).includes('fixture-secret'), false);
+    let result = await scenario.ccw.apply(plan.id);
     assert.equal(result.state, 'done', JSON.stringify(result));
-    const uninstalls = f.calls.filter(
-      call => call.kind === 'execute' && call.args.includes('uninstall') && !call.args.includes('--help'),
+    let config = await scenario.readJson(scenario.settings);
+    assert.equal(config.env.ANTHROPIC_API_KEY, 'fixture-secret');
+    assert.equal(config.statusLine.command, 'ccline');
+    assert.equal(config.enabledPlugins['context7@claude-plugins-official'], true);
+    assert.equal((await scenario.readJson(scenario.stateFile)).mcpServers?.context7, undefined);
+    assert.equal((await scenario.readJson(scenario.stateFile)).mcpServers?.officecli, undefined);
+    assert.ok(await exists(path.join(scenario.claudeRoot, 'skills/officecli/SKILL.md')));
+    assert.ok(await exists(path.join(scenario.claudeRoot, 'skills/tdd/SKILL.md')));
+    assert.equal(
+      scenario.calls.some(c => c.kind === 'execute' && /^(brew|winget|scoop|apt|uv)$/.test(c.target)),
+      false,
     );
-    assert.equal(uninstalls.length, 1);
-    assert.equal(uninstalls[0].args.includes('--keep-data'), hasFlag);
+    scenario.state.stableVersion = '2.1.319';
+    const update = await scenario.ccw.plan({ task: 'install', selected: installation });
+    for (const id of ['claude', 'officecli', 'ccline', 'plugin:github@claude-plugins-official'])
+      assert.equal(update.items.find(item => item.id === id).action, 'update');
+    result = await scenario.ccw.apply(update.id);
+    assert.equal(result.state, 'done', JSON.stringify(result));
+    assert.equal(scenario.packages.get('@anthropic-ai/claude-code'), '2.1.319');
+    const preserved = path.join(scenario.claudeRoot, 'projects/user-session.jsonl');
+    await scenario.write(preserved, 'user history');
+    const cclineConfig = path.join(scenario.home, '.claude/ccline/config.toml');
+    const before = await fs.readFile(cclineConfig, 'utf8');
+    const remove = await scenario.ccw.plan({
+      task: 'uninstall',
+      selected: [
+        { id: 'claude' },
+        { id: 'ccline' },
+        { id: 'officecli' },
+        { id: 'plugin:context7@claude-plugins-official' },
+        { id: 'plugin:serena@claude-plugins-official' },
+        { id: 'plugin:github@claude-plugins-official' },
+        { id: 'skill:amirc-research' },
+      ],
+    });
+    assert.ok(
+      remove.items.every(i => i.problem === null),
+      JSON.stringify(remove),
+    );
+    result = await scenario.ccw.apply(remove.id);
+    assert.equal(result.state, 'done', JSON.stringify(result));
+    assert.equal(await fs.readFile(preserved, 'utf8'), 'user history');
+    assert.equal(await fs.readFile(cclineConfig, 'utf8'), before);
+    assert.equal((await scenario.readJson(scenario.settings)).enabledPlugins['github@claude-plugins-official'], false);
+    assert.equal((await scenario.readJson(scenario.settings)).env.ANTHROPIC_API_KEY, 'fixture-secret');
+  });
+
+// Claude：固定 stable 渠道，确认安装后再配置连接
+test('新版 Claude npm 原生入口直接执行，首次写入 bypass 与危险提示配置', async testContext => {
+  const scenario = await createInstallationScenario(testContext, { claudeEntry: 'bin/claude.exe' });
+  const result = await scenario.apply({
+    task: 'install',
+    selected: [{ id: 'claude' }, { id: 'plugin:context7@claude-plugins-official' }],
+  });
+  assert.equal(result.state, 'done', JSON.stringify(result));
+  const settings = await scenario.readJson(scenario.settings);
+  assert.equal(settings.permissions.defaultMode, 'bypassPermissions');
+  assert.equal(settings.skipDangerousModePermissionPrompt, true);
+  assert.ok(
+    scenario.calls.some(
+      call => call.kind === 'execute' && call.target.endsWith('claude.exe') && call.args[0] === '--version',
+    ),
+  );
+  assert.equal(
+    scenario.calls.some(call => call.kind === 'execute' && call.target === process.execPath),
+    false,
+  );
+});
+
+test('Claude 已装更高版本时仍回到当次 stable，更新通道保持 stable', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] });
+  await scenario.json(scenario.settings, {
+    autoUpdatesChannel: 'latest',
+    permissions: { defaultMode: 'plan' },
+    skipDangerousModePermissionPrompt: false,
+  });
+  scenario.state.stableVersion = '2.1.300';
+  const result = await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] });
+  assert.equal(result.state, 'done');
+  assert.equal(scenario.packages.get('@anthropic-ai/claude-code'), '2.1.300');
+  const settings = await scenario.readJson(scenario.settings);
+  assert.equal(settings.autoUpdatesChannel, 'stable');
+  assert.equal(settings.permissions.defaultMode, 'plan');
+  assert.equal(settings.skipDangerousModePermissionPrompt, false);
+});
+
+test('npm 与外部 Claude 共存时，只更新固定 npm 安装', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  assert.equal((await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] })).state, 'done');
+  await scenario.write(scenario.native, 'external installation');
+  scenario.state.stableVersion = '2.1.319';
+  const plan = await scenario.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
+  assert.equal(plan.items[0].problem, null);
+  assert.equal(plan.items[0].action, 'update');
+  assert.equal((await scenario.ccw.apply(plan.id)).state, 'done');
+  assert.equal(scenario.packages.get('@anthropic-ai/claude-code'), '2.1.319');
+  assert.equal(await fs.readFile(scenario.native, 'utf8'), 'external installation');
+});
+
+test('外部 Claude 仅显示；固定安装渠道拒绝接管', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.write(scenario.native, 'external installation');
+  const inspected = await scenario.ccw.inspect();
+  const external = inspected.items.find(i => i.kind === 'claude' && i.id.includes('external'));
+  assert.ok(external);
+  assert.equal(external.canInstall, false);
+  assert.equal(external.canUninstall, false);
+  const plan = await scenario.ccw.plan({ task: 'uninstall', selected: [{ id: external.id }] });
+  assert.ok(plan.items[0].problem);
+  await scenario.ccw.apply(plan.id);
+  assert.equal(await fs.readFile(scenario.native, 'utf8'), 'external installation');
+});
+
+test('预览已阻断官方登录时，不提前清除现有 API 配置', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.json(scenario.settings, { env: { ANTHROPIC_API_KEY: 'existing-key' } });
+  scenario.state.fail = 'npm:config';
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [{ id: 'claude' }, { id: 'settings', fields: { mode: 'official', login: 'yes' } }],
+  });
+  assert.equal(plan.items.find(item => item.id === 'settings').problem, 'dependency-not-ready');
+  const result = await scenario.ccw.apply(plan.id);
+  assert.equal(result.items.find(item => item.id === 'settings').state, 'skipped');
+  assert.equal((await scenario.readJson(scenario.settings)).env.ANTHROPIC_API_KEY, 'existing-key');
+});
+
+test('Claude 安装失败时，已准备的官方登录不会清除现有 API 配置', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.json(scenario.settings, { env: { ANTHROPIC_API_KEY: 'existing-key' } });
+  scenario.state.fail = 'npm:install';
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [{ id: 'claude' }, { id: 'settings', fields: { mode: 'official', login: 'yes' } }],
+  });
+  assert.ok(plan.items.every(item => item.problem === null));
+  const result = await scenario.ccw.apply(plan.id);
+  assert.equal(result.items.find(item => item.id === 'settings').state, 'skipped');
+  assert.equal((await scenario.readJson(scenario.settings)).env.ANTHROPIC_API_KEY, 'existing-key');
+});
+
+// 插件与 MCP：统一插件接入，保留独立配置
+for (const existing of [false, true])
+  test(`GitHub 与默认 Context7 不写入传入令牌，保留已有配置：${existing}`, async testContext => {
+    const scenario = await createInstallationScenario(testContext);
+    await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] });
+    const env = existing ? { GITHUB_PERSONAL_ACCESS_TOKEN: 'user-token', USER_VALUE: 'keep' } : { USER_VALUE: 'keep' };
+    await scenario.json(scenario.settings, { env });
+    const context7 = { type: 'http', url: 'https://mcp.context7.com/mcp' };
+    if (existing) context7.headers = { Authorization: 'Bearer user-token', 'X-User': 'keep' };
+    await scenario.json(scenario.stateFile, { mcpServers: existing ? { context7 } : {} });
+    const result = await scenario.apply({
+      task: 'install',
+      selected: [
+        { id: 'plugin:github@claude-plugins-official', fields: { secret: 'unwanted-token' } },
+        { id: 'plugin:context7@claude-plugins-official', fields: { secret: 'unwanted-token' } },
+      ],
+    });
+    assert.equal(result.state, 'done');
+    assert.deepEqual((await scenario.readJson(scenario.settings)).env, env);
+    assert.deepEqual(
+      (await scenario.readJson(scenario.stateFile)).mcpServers.context7,
+      existing ? context7 : undefined,
+    );
+    assert.doesNotMatch(JSON.stringify(result), /unwanted-token|github-credential/);
+  });
+
+test('Context7 只安装插件，保留所有独立 MCP 配置', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] });
+  const state = {
+    mcpServers: { context7: { type: 'http', url: 'https://mcp.context7.com/mcp' }, custom: { command: 'keep' } },
+  };
+  await scenario.json(scenario.stateFile, state);
+  const result = await scenario.apply({
+    task: 'install',
+    selected: [{ id: 'plugin:context7@claude-plugins-official' }],
+  });
+  assert.equal(result.state, 'done');
+  assert.deepEqual(await scenario.readJson(scenario.stateFile), state);
+  assert.equal(
+    scenario.calls.some(call => call.kind === 'execute' && call.args.includes('mcp')),
+    false,
+  );
+});
+
+test('独立 MCP 配置变化不影响 Context7 插件安装', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] });
+  await scenario.json(scenario.stateFile, {
+    mcpServers: { context7: { type: 'http', url: 'https://mcp.context7.com/mcp' } },
+  });
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [{ id: 'plugin:context7@claude-plugins-official' }],
+  });
+  await scenario.json(scenario.stateFile, { mcpServers: { context7: { command: 'new-user-tool' } } });
+  const result = await scenario.ccw.apply(plan.id);
+  assert.equal(result.state, 'done');
+  assert.equal((await scenario.readJson(scenario.stateFile)).mcpServers.context7.command, 'new-user-tool');
+});
+
+test('Serena 通过插件安装和移除，无独立运行程序也能选择，保留已有 MCP 配置', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  const state = {
+    mcpServers: {
+      serena: { command: 'user-serena' },
+      context7: { type: 'http', url: 'https://foreign.test' },
+      other: { command: 'keep' },
+    },
+  };
+  await scenario.json(scenario.stateFile, state);
+  const inspection = await scenario.ccw.inspect();
+  assert.equal(inspection.items.find(item => item.id === 'plugin:serena@claude-plugins-official').canInstall, true);
+  assert.equal(
+    inspection.items.some(item => item.id.startsWith('mcp:')),
+    false,
+  );
+  const result = await scenario.apply({
+    task: 'install',
+    selected: [{ id: 'claude' }, { id: 'plugin:serena@claude-plugins-official' }],
+  });
+  assert.equal(result.state, 'done');
+  assert.equal((await scenario.readJson(scenario.settings)).enabledPlugins['serena@claude-plugins-official'], true);
+  assert.deepEqual(await scenario.readJson(scenario.stateFile), state);
+  assert.equal(
+    (await scenario.apply({ task: 'uninstall', selected: [{ id: 'plugin:serena@claude-plugins-official' }] })).state,
+    'done',
+  );
+  assert.equal((await scenario.readJson(scenario.settings)).enabledPlugins['serena@claude-plugins-official'], false);
+  assert.deepEqual(await scenario.readJson(scenario.stateFile), state);
+  for (const task of ['install', 'uninstall']) {
+    const unsupported = await scenario.ccw.plan({ task, selected: [{ id: 'mcp:context7' }, { id: 'mcp:serena' }] });
+    assert.ok(unsupported.items.every(item => item.problem === 'unknown-selection'));
+    await scenario.ccw.apply(unsupported.id);
+    assert.deepEqual(await scenario.readJson(scenario.stateFile), state);
   }
 });
 
-test('显示安装进度：区分失败与跳过', async t => {
-  const f = await fixture(t, { platform: 'win32' });
-  const screens = [];
-  let homes = 0;
-  let resultView;
-  let detailView;
-  let openedDetails = false;
-  f.state.fail = 'npm:install';
-  f.state.fetchResponse = '<html>installer unavailable</html>';
-  const selected = ['Claude Code', 'GitHub', 'Context7'];
-  await runTerminal(f.ccw, {
-    wait: (_title, work) => work(new AbortController().signal),
-    async handoff() {
-      assert.fail('普通安装不能暂停整个 TUI');
-    },
-    show(text) {
-      screens.push(text);
-    },
-    async select(page, change) {
-      for (const name of selected)
-        change({ kind: 'toggle', index: page.rows.findIndex(row => row.label.startsWith(name)) });
-      return { kind: 'submit', index: page.rows.length };
-    },
-    async choose(title) {
-      if (title === HOME_TITLE) return homes++ ? 4 : 0;
-      if (title === '选择结果') return 0;
-      if (typeof title === 'string' && title.startsWith('未完成任务')) return 4;
-      assert.equal(typeof title, 'object');
-      if (title.title === '结果详情') {
-        detailView = title;
-        return 0;
-      }
-      resultView = title;
-      assert.equal(title.title, '运行结果 · 部分完成');
-      assert.match(title.summary, /完成 1 · 失败 1 · 跳过 1/);
-      if (!openedDetails) {
-        openedDetails = true;
-        return 2;
-      }
-      return 1;
-    },
-  });
-  assert.ok(
-    screens.some(
-      view =>
-        view.summary === '处理 0/3 · 完成 0 · 失败 0 · 跳过 0' &&
-        view.rows.some(row => row.id === 'claude' && row.symbol === '▶' && row.status === '执行中'),
-    ),
-  );
-  const summary = screens.at(-1);
-  assert.equal(summary.summary, '处理 3/3 · 完成 1 · 失败 1 · 跳过 1');
-  assert.deepEqual(
-    summary.rows.map(row => [row.symbol, row.status, row.title]),
-    [
-      ['✕', '安装失败', 'Claude Code'],
-      ['○', '已跳过', 'GitHub'],
-      ['✔', '完成', 'Context7'],
-    ],
-  );
-  assert.ok(summary.rows.every(row => row.details.length === 0));
-  assert.ok(detailView.rows[0].details.some(detail => detail.text.includes('installer-unavailable')));
-  assert.deepEqual(
-    resultView.rows.map(row => [row.symbol, row.status, row.title]),
-    summary.rows.map(row => [row.symbol, row.status, row.title]),
-  );
-  assert.equal((await f.readJson(f.stateFile)).mcpServers.context7.type, 'http');
-});
-test('显示技能安装项：仅列整套入口', async t => {
-  const f = await fixture(t);
-  let home = 0;
-  await runTerminal(f.ccw, {
-    wait: (_title, work) => work(new AbortController().signal),
-    async choose() {
-      return home++ ? 4 : 0;
-    },
-    async select(page, change) {
-      const skills = page.rows.filter(row => row.group === 'Skills');
-      assert.deepEqual(
-        skills.map(row => row.label),
-        ['AMIRC Research Skill', 'Matt Pocock/Skills', 'HIT-SudoMaker/SSRE2'],
-      );
-      assert.equal(page.rows.filter(row => row.group === 'Plugins').length, 5);
-      assert.doesNotMatch(JSON.stringify(page), /工程技能|科学设计|科学审查|ssre2-design|ssre2-review/);
-      assert.doesNotMatch(JSON.stringify(change({ kind: 'all' })), /→ 更新|→ 重装/);
-      return { kind: 'cancel', index: 0 };
-    },
-  });
-});
-
-test('执行卸载：沿用产品与成员名称', async t => {
-  const f = await fixture(t);
-  await f.apply({ task: 'install', selected: [{ id: 'mcp:context7' }, { id: 'skill-set:ssre2' }] });
-  const selected = ['Context7', 'ssre2-design'];
-  let homes = 0;
-  let results = 0;
-  await runTerminal(f.ccw, {
-    wait: (_title, work) => work(new AbortController().signal),
-    show() {},
-    async select(page, change) {
-      for (const name of selected) {
-        const index = page.rows.findIndex(row => row.label === name);
-        assert.ok(index >= 0, `缺少卸载项：${name}`);
-        change({ kind: 'toggle', index });
-      }
-      return { kind: 'submit', index: page.rows.length };
-    },
-    async choose(title) {
-      if (typeof title === 'string') {
-        if (title === HOME_TITLE) return homes++ ? 4 : 2;
-        assert.ok(title.startsWith('变更预览'));
-        for (const name of selected) assert.ok(title.includes(` ${name}\n`));
-        return 0;
-      }
-      results++;
-      assert.deepEqual(
-        title.rows.map(row => row.title),
-        selected,
-      );
-      return 1;
-    },
-  });
-  assert.equal(results, 1);
-});
-
-test('识别手工 Claude：保留程序版本根', async t => {
-  const f = await fixture(t);
-  await f.write(f.native, 'manual binary');
-  await f.write(path.join(f.home, '.local/share/claude/versions/keep'), 'different file');
-  const item = (await f.ccw.inspect()).items.find(item => item.kind === 'claude');
-  assert.ok(item.id.includes(':manual:'));
-  assert.equal(item.actions.includes('uninstall'), false);
-  const plan = await f.ccw.plan({ task: 'uninstall', selected: [{ id: item.id }] });
-  assert.equal(plan.items[0].problem, 'channel-not-supported');
-  assert.equal((await f.ccw.apply(plan.id)).state, 'failed');
-  assert.equal(await fs.readFile(f.native, 'utf8'), 'manual binary');
-  assert.equal(await fs.readFile(path.join(f.home, '.local/share/claude/versions/keep'), 'utf8'), 'different file');
-  assert.equal(
-    f.calls.some(call => call.kind === 'npm' && call.target === 'uninstall'),
-    false,
-  );
-});
-
-for (const platform of ['darwin', 'linux', 'win32']) {
-  test(`${platform} 安装 Claude：固定 npm 版本`, async t => {
-    const f = await fixture(t, { platform });
-    await f.write(f.settings, '{"language":"zh"}');
-    const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
-    const preparedFetches = f.calls.filter(call => call.kind === 'fetch').length;
-    assert.equal((await f.ccw.apply(plan.id)).state, 'done');
-    assert.equal(f.calls.filter(call => call.kind === 'fetch').length, preparedFetches);
-    assert.ok(
-      f.calls.some(
-        call =>
-          call.kind === 'npm' &&
-          call.target === 'install' &&
-          call.args.at(-1) === '@anthropic-ai/claude-code@2.1.318' &&
-          call.args.includes('--include=optional'),
-      ),
+for (const failure of ['invalid-json', 'unreadable-json', 'invalid-record', 'unreadable-installation'])
+  test(`插件停用只依赖启用字段，保留异常安装数据：${failure}`, async testContext => {
+    const scenario = await createInstallationScenario(testContext);
+    assert.equal((await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] })).state, 'done');
+    const plugin = 'github@claude-plugins-official';
+    const id = 'plugin:' + plugin;
+    const settings = {
+      enabledPlugins: { [plugin]: true, 'user-plugin@private': true },
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'existing-token', USER_VALUE: 'keep' },
+      statusLine: { type: 'command', command: 'user-status' },
+      custom: { keep: ['unchanged'] },
+    };
+    await scenario.json(scenario.settings, settings);
+    const metadata = path.join(scenario.claudeRoot, 'plugins/installed_plugins.json');
+    const pluginFile = path.join(scenario.claudeRoot, 'plugins/cache/github/local.txt');
+    await scenario.write(pluginFile, 'local plugin content');
+    if (failure === 'invalid-json') await scenario.write(metadata, '{broken');
+    else if (failure === 'unreadable-json') await scenario.write(path.join(metadata, 'keep.txt'), 'metadata directory');
+    else
+      await scenario.json(metadata, {
+        plugins: {
+          [plugin]: [{ scope: 'user', installPath: failure === 'invalid-record' ? 42 : pluginFile + '\0' }],
+        },
+        custom: 'keep',
+      });
+    const preservedMetadata = failure === 'unreadable-json' ? path.join(metadata, 'keep.txt') : metadata;
+    const metadataBefore = await fs.readFile(preservedMetadata, 'utf8');
+    const inspected = (await scenario.ccw.inspect()).items.find(item => item.id === id);
+    assert.equal(inspected.canUninstall, true);
+    assert.ok(inspected.problem);
+    assert.ok(inspected.facts.some(fact => fact.code === 'declared-enabled'));
+    const install = await scenario.ccw.plan({ task: 'install', selected: [{ id }] });
+    assert.equal(install.items[0].problem, inspected.problem);
+    const before = scenario.calls.length;
+    const plan = await scenario.ccw.plan({ task: 'uninstall', selected: [{ id }] });
+    assert.equal(plan.items[0].problem, null);
+    assert.equal(plan.items[0].action, 'detach');
+    assert.equal((await scenario.ccw.apply(plan.id)).state, 'done');
+    assert.deepEqual(
+      scenario.calls.slice(before).map(call => call.kind),
+      ['editJson'],
     );
-    assert.equal(
-      f.calls.some(call => call.target === 'cmd.exe' || call.target === 'powershell.exe'),
-      false,
-    );
-    const item = (await f.ccw.inspect()).items.find(item => item.kind === 'claude');
-    assert.ok(item.id.includes(':npm:'));
-    const installedSettings = await f.readJson(f.settings);
-    assert.deepEqual(installedSettings, {
-      language: 'zh',
-      permissions: { defaultMode: 'bypassPermissions' },
-      attribution,
-      env: { ...defaultEnv, ...(platform === 'win32' ? { CLAUDE_CODE_USE_POWERSHELL_TOOL: '1' } : {}) },
+    assert.deepEqual(await scenario.readJson(scenario.settings), {
+      ...settings,
+      enabledPlugins: { ...settings.enabledPlugins, [plugin]: false },
     });
-    const removal = await f.ccw.plan({ task: 'uninstall', selected: [{ id: item.id }] });
-    assert.equal(removal.items[0].problem, null);
-    assert.equal(removal.items[0].action, 'uninstall');
-    assert.ok(removal.items[0].changes.some(change => change.code === 'program-uninstall'));
-    assert.deepEqual(await f.readJson(f.settings), installedSettings);
-    assert.equal(f.packages.has('@anthropic-ai/claude-code'), true);
+    assert.equal(await fs.readFile(preservedMetadata, 'utf8'), metadataBefore);
+    assert.equal(await fs.readFile(pluginFile, 'utf8'), 'local plugin content');
+    assert.equal((await scenario.ccw.inspect()).items.find(item => item.id === id).canUninstall, false);
+    assert.equal(
+      (await scenario.ccw.plan({ task: 'uninstall', selected: [{ id }] })).items[0].problem,
+      'no-connection',
+    );
   });
-  test(`${platform} 更新原生 Claude：沿用原渠道`, async t => {
-    const f = await fixture(t, { platform });
-    await f.write(f.settings, '{"language":"zh"}');
-    await f.write(f.native, 'existing native');
-    await f.write(path.join(f.home, '.local/share/claude/versions/1'), 'existing native');
-    const item = (await f.ccw.inspect()).items.find(item => item.kind === 'claude');
-    assert.ok(item.id.includes(':native:'));
-    assert.equal(
-      (await f.apply({ task: 'install', selected: [{ id: item.id, maintenance: 'update' }] })).state,
-      'done',
-    );
-    assert.ok(
-      f.calls.some(
-        call =>
-          call.kind === 'execute' &&
-          call.target === f.native &&
-          call.args[0] === 'install' &&
-          call.args[1] === '2.1.318',
-      ),
-    );
-    assert.equal(
-      f.calls.some(call => call.kind === 'npm' && call.target === 'install'),
-      false,
-    );
-    const removal = await f.ccw.plan({ task: 'uninstall', selected: [{ id: item.id }] });
-    assert.equal(removal.items[0].problem, null);
-    assert.equal(removal.items[0].action, 'uninstall');
-    assert.ok(removal.items[0].changes.some(change => change.code === 'program-uninstall'));
-    assert.deepEqual(await f.readJson(f.settings), { language: 'zh' });
-    assert.equal(await exists(f.native), true);
+
+test('Context7 插件安装失败保留旧默认注册', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  await scenario.apply({ task: 'install', selected: [{ id: 'claude' }] });
+  const registration = { type: 'http', url: 'https://mcp.context7.com/mcp' };
+  await scenario.json(scenario.stateFile, { mcpServers: { context7: registration } });
+  await scenario.json(path.join(scenario.claudeRoot, 'plugins/known_marketplaces.json'), {
+    'claude-plugins-official': { source: { repo: 'foreign/repo' } },
+  });
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [{ id: 'plugin:context7@claude-plugins-official' }],
+  });
+  assert.equal(plan.items[0].problem, 'marketplace-source-conflict');
+  await scenario.ccw.apply(plan.id);
+  assert.deepEqual((await scenario.readJson(scenario.stateFile)).mcpServers.context7, registration);
+});
+
+test('Claude 安装失败不切换渠道，GitHub 和 Context7 插件均跳过', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  scenario.state.fail = 'npm:install';
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [
+      { id: 'claude' },
+      { id: 'plugin:github@claude-plugins-official' },
+      { id: 'plugin:context7@claude-plugins-official' },
+    ],
+  });
+  const result = await scenario.ccw.apply(plan.id);
+  assert.equal(result.state, 'failed', JSON.stringify(result));
+  assert.notEqual(result.items.find(i => i.id === 'claude').state, 'done');
+  assert.notEqual(result.items.find(i => i.id.startsWith('plugin:')).state, 'done');
+  assert.equal(result.items.find(i => i.id === 'plugin:context7@claude-plugins-official').state, 'skipped');
+  assert.equal(await exists(scenario.native), false);
+});
+
+// 工具与用户内容：保留已有修改，失败后允许重试
+test('重复配置 CCometixLine 保留外观和子代理状态栏', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  const config = path.join(scenario.home, '.claude/ccline/config.toml');
+  await scenario.write(config, '# custom appearance\n');
+  await scenario.json(scenario.settings, { subagentStatusLine: { type: 'command', command: 'my-subagent-status' } });
+  for (let i = 0; i < 2; i++)
+    assert.equal((await scenario.apply({ task: 'install', selected: [{ id: 'ccline' }] })).state, 'done');
+  assert.equal(await fs.readFile(config, 'utf8'), '# custom appearance\n');
+  assert.equal((await scenario.readJson(scenario.settings)).subagentStatusLine.command, 'my-subagent-status');
+});
+
+test('本地修改的 Skill 与状态栏不覆盖', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  assert.equal((await scenario.apply({ task: 'install', selected: [{ id: 'skill:amirc-research' }] })).state, 'done');
+  await scenario.write(path.join(scenario.claudeRoot, 'skills/amirc-research/SKILL.md'), 'local edits');
+  await scenario.json(scenario.settings, {
+    statusLine: { type: 'command', command: 'user-status' },
+    subagentStatusLine: { type: 'command', command: 'user-subagent' },
+  });
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [{ id: 'skill:amirc-research' }, { id: 'ccline' }],
+  });
+  assert.equal(plan.items[0].problem, 'local-edits-preserved');
+  assert.ok(plan.items[1].problem);
+  await scenario.ccw.apply(plan.id);
+  assert.equal(
+    await fs.readFile(path.join(scenario.claudeRoot, 'skills/amirc-research/SKILL.md'), 'utf8'),
+    'local edits',
+  );
+  assert.equal((await scenario.readJson(scenario.settings)).statusLine.command, 'user-status');
+});
+
+for (const task of ['install', 'uninstall']) {
+  test('CCometixLine 保留异形状态栏字段：' + task, async testContext => {
+    const scenario = await createInstallationScenario(testContext);
+    await scenario.apply({ task: 'install', selected: [{ id: 'ccline' }] });
+    const statusLine = { type: 'command', command: ['ccline'] };
+    await scenario.json(scenario.settings, { statusLine });
+    const plan = await scenario.ccw.plan({ task, selected: [{ id: 'ccline' }] });
+    assert.equal(plan.items[0].problem, task === 'install' ? 'local-edits-preserved' : null);
+    const result = await scenario.ccw.apply(plan.id);
+    assert.equal(result.state, task === 'install' ? 'failed' : 'done');
+    assert.deepEqual((await scenario.readJson(scenario.settings)).statusLine, statusLine);
   });
 }
 
-test('取消 npm 安装：跳过备用渠道', async t => {
-  const f = await fixture(t, { platform: 'win32' });
-  const controller = new AbortController();
-  f.faults.npm.set('install', async () => controller.abort());
-  f.state.fail = 'npm:install';
-  const plan = await f.ccw.plan({ task: 'install', selected: [{ id: 'claude' }] });
-  const preparedFetches = f.calls.filter(call => call.kind === 'fetch').length;
-  const result = await f.ccw.apply(plan.id, controller.signal);
-  assert.equal(result.state, 'cancelled');
-  assert.equal(f.calls.filter(call => call.kind === 'fetch').length, preparedFetches);
-  assert.equal(
-    f.calls.some(call => call.target === 'cmd.exe'),
-    false,
-  );
+test('OfficeCLI 写入权限失败保留真实原因，解除问题后可以重试', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  scenario.state.fail = 'replace-file';
+  const request = { task: 'install', selected: [{ id: 'officecli' }] };
+  const failed = await scenario.apply(request);
+  assert.equal(failed.state, 'failed');
+  assert.ok(failed.items[0].effects.some(effect => effect.state === 'failed' && effect.code === 'EACCES'));
+  assert.ok(!failed.items[0].effects.some(effect => effect.code === 'program-changed'));
+  assert.ok(!failed.items[0].effects.some(effect => effect.code === 'program-removed'));
+  scenario.state.fail = '';
+  assert.equal((await scenario.apply(request)).state, 'done');
 });
 
-test('显示内容列表：保持分组与短状态', async t => {
-  const f = await fixture(t);
-  let menu = 0;
-  let inspected = false;
-  await runTerminal(f.ccw, {
-    wait: (_title, work) => work(new AbortController().signal),
-    handoff: work => work(),
-    show() {},
-    async choose() {
-      return menu++ === 0 ? 0 : 4;
-    },
-    async select(page) {
-      const rows = page.rows.map(row => row.label);
-      const groups = page.rows.map(row => row.group);
-      inspected = true;
-      const positions = [
-        'Claude Code',
-        '模型配置',
-        'Code Simplifier',
-        'Context7',
-        'HIT-SudoMaker/SSRE2',
-        'CCometixLine',
-        'OfficeCLI',
-      ].map(name => rows.findIndex(row => row.startsWith(name)));
-      assert.ok(
-        positions.every((value, index) => value >= 0 && (index === 0 || value > positions[index - 1])),
-        rows.join('\n'),
-      );
-      assert.deepEqual([...new Set(groups)], ['基础配置', 'Plugins', 'MCPs', 'Skills', '附加工具']);
-      assert.equal(
-        rows.some(row => /会话加载|未声明启用|尚未验证认证|连接未测试/.test(row)),
-        false,
-      );
-      return { kind: 'cancel', index: 0 };
-    },
+test('OfficeCLI 写入后回执丢失，由统一步骤核验实际结果', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  scenario.state.fail = 'replace-after-write';
+  const result = await scenario.apply({ task: 'install', selected: [{ id: 'officecli' }] });
+  assert.equal(result.state, 'done');
+  assert.ok(!result.items[0].effects.some(effect => effect.state === 'failed'));
+  assert.ok(await exists(path.join(scenario.claudeRoot, 'skills/officecli/SKILL.md')));
+});
+
+// 操作边界：拒绝无效目标和不支持的动作
+test('拒绝不支持的动作和整目录删除参数', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  for (const input of [
+    { task: 'cleanup', selected: [] },
+    { task: 'install', selected: [{ id: 'claude', action: 'reinstall' }] },
+    { task: 'uninstall', selected: [], removeData: true },
+  ])
+    await assert.rejects(scenario.ccw.plan(input), /action-unavailable/);
+});
+
+for (const task of ['install', 'uninstall'])
+  test(`未知 CCometixLine 标识：${task} 在读取程序前拒绝`, async testContext => {
+    const scenario = await createInstallationScenario(testContext);
+    const before = scenario.calls.length;
+    const plan = await scenario.ccw.plan({ task, selected: [{ id: 'ccline:unknown' }] });
+    assert.equal(plan.items[0].problem, 'unknown-selection');
+    assert.equal(scenario.calls.length, before);
+    assert.equal((await scenario.ccw.apply(plan.id)).state, 'failed');
   });
-  assert.equal(inspected, true);
-});
 
-test('并行检查内容：隔离慢 npm 探测', async t => {
-  const f = await fixture(t);
-  f.state.npmDelay = 60;
-  const start = performance.now();
-  const view = await f.ccw.inspect();
-  t.diagnostic(`inspection=${Math.round(performance.now() - start)}ms; concurrent-probes=${f.state.npmPeak}`);
-  assert.equal(view.problems.length, 0);
-  assert.equal(f.state.npmPeak, 3, 'Claude、OfficeCLI、CCometixLine 的独立 npm 读取应并行');
-});
+for (const cclineOutput of ['ccline 2.0.10', 'ccline 2.0.1-beta'])
+  test('CCometixLine 精确版本核验拒绝前缀匹配：' + cclineOutput, async testContext => {
+    const scenario = await createInstallationScenario(testContext, { cclineOutput });
+    const result = await scenario.apply({ task: 'install', selected: [{ id: 'ccline' }] });
+    assert.equal(result.state, 'partial');
+    assert.ok(result.items[0].effects.some(effect => effect.code === 'binary-version-mismatch'));
+    assert.equal((await scenario.readJson(scenario.settings)).statusLine, undefined);
+  });
 
-test('取消检查：停止探测并拒绝迟到结果', async t => {
-  const f = await fixture(t);
-  const controller = new AbortController();
-  const started = Promise.withResolvers();
-  let pending = 0;
-  let stopped = 0;
-  f.state.onNpm = (args, options) => {
-    assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 5000);
-    assert.equal(options.signal, controller.signal);
-    const result = new Promise(resolve =>
-      options.signal.addEventListener(
-        'abort',
-        () => {
-          stopped++;
-          resolve({ code: null, stdout: '', failed: true });
-        },
-        { once: true },
-      ),
-    );
-    if (++pending === 3) started.resolve();
-    return result;
+// 结果核验：各项独立确认，保留已完成事实
+test('逐项最终核验拥有独立预算，较慢查询不会让后续项目误报超时', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  let now = 0;
+  let final = false;
+  let checked = 0;
+  testContext.mock.method(performance, 'now', () => now);
+  scenario.state.onNpm = args => {
+    if (final && args[0] === 'ls') now += 3000;
   };
-  const inspecting = f.ccw.inspect('contents', controller.signal);
-  await started.promise;
-  controller.abort();
-  await assert.rejects(inspecting, /cancelled/);
-  assert.equal(stopped, 3);
+  const plan = await scenario.ccw.plan({ task: 'install', selected: [{ id: 'claude' }, { id: 'ccline' }] });
+  assert.ok(plan.items.every(item => item.problem === null));
+  const result = await scenario.ccw.apply(plan.id, undefined, event => {
+    if (event.kind === 'checked' && ++checked === 2) final = true;
+  });
+  assert.equal(result.state, 'done', JSON.stringify(result));
+});
+
+test('已经安装完成的插件不因随后 Claude 核验失败而被降为部分完成', async testContext => {
+  const scenario = await createInstallationScenario(testContext);
+  let final = false;
+  let checked = 0;
+  scenario.state.onNpm = args => {
+    if (final && args[0] === 'ls') throw new Error('inspection-timeout');
+  };
+  const plan = await scenario.ccw.plan({
+    task: 'install',
+    selected: [{ id: 'claude' }, { id: 'plugin:github@claude-plugins-official' }],
+  });
+  const result = await scenario.ccw.apply(plan.id, undefined, event => {
+    if (event.kind === 'checked' && ++checked === 2) final = true;
+  });
+  assert.equal(result.items.find(item => item.id === 'claude').state, 'partial');
+  assert.equal(result.items.find(item => item.id.startsWith('plugin:')).state, 'done', JSON.stringify(result));
 });

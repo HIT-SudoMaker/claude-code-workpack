@@ -1,6 +1,6 @@
 {
   "name": "@hit-sudomaker/ccw",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Claude Code lifecycle management terminal",
   "license": "MIT",
   "type": "module",
@@ -36,7 +36,6 @@
   "dependencies": {
     "ink": "8.0.0",
     "react": "19.3.1",
-    "smol-toml": "1.9.1",
     "string-width": "8.3.0",
     "wrap-ansi": "10.0.2"
   },

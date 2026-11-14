@@ -3,31 +3,43 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { runTerminal } from './terminal-test.mjs';
-import { createEnv, exists, ok } from './env.mjs';
+import { createTestEnvironment, exists, ok } from './test-environment.mjs';
+import { createSkillsCliFixture } from './skills-cli-fixture.mjs';
 
 const revision = 'a'.repeat(40);
-const verdict = work => Promise.race([work, new Promise(resolve => setTimeout(() => resolve('still-waiting'), 150))]);
+const CANCELLATION_TIMEOUT_MS = 150;
+const GATE_TIMEOUT_MS = 2_000;
 
-async function fixture(t, overrides = {}) {
-  const f = await createEnv(t);
-  // 场景响应语义经 overrides 提供；缺省 execute 沿用原装配：任何命令固定返回 Git 修订
-  const base = f.machine({
-    execute: overrides.execute ?? (async () => ok(revision)),
-  });
-  const machine = {
-    ...base,
-    source: overrides.source ?? (async () => [{ path: 'one/SKILL.md', data: Buffer.from('skill') }]),
-  };
-  const ccw = f.ccw(machine, { platform: process.platform });
-  return { ...f, machine, ccw };
+async function verdict(work) {
+  let timer;
+  try {
+    return await Promise.race([
+      work,
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve('still-waiting'), CANCELLATION_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function cancelledPreparationCase(t, { hook, release }) {
+async function createPreparationScenario(testContext, overrides = {}) {
+  const workspace = await createTestEnvironment(testContext);
+  const cli = createSkillsCliFixture(workspace);
+  const machine = workspace.machine({
+    execute: overrides.execute ?? (async () => ok(revision)),
+    npm: overrides.npm ?? cli.npm,
+  });
+  const ccw = workspace.ccw(machine, { platform: process.platform });
+  return { ...workspace, machine, ccw };
+}
+
+async function verifyCancelledPreparation(testContext, { hook, release }) {
   const entered = Promise.withResolvers();
   const gate = Promise.withResolvers();
   const abort = new AbortController();
-  t.after(() => {
+  testContext.after(() => {
     abort.abort();
     gate.resolve(release);
   });
@@ -38,11 +50,11 @@ async function cancelledPreparationCase(t, { hook, release }) {
     receivedSignal?.addEventListener('abort', () => gate.reject(new Error('cancelled')), { once: true });
     return gate.promise;
   };
-  const { home, ccw } = await fixture(
-    t,
+  const { home, ccw } = await createPreparationScenario(
+    testContext,
     hook === 'source'
       ? {
-          async source(_repository, _revision, _folder, options) {
+          async npm(_args, options) {
             return capture(options);
           },
         }
@@ -64,78 +76,17 @@ async function cancelledPreparationCase(t, { hook, release }) {
   assert.equal(await exists(path.join(home, '.claude')), false);
 }
 
-test('取消技能准备：终止 Git 查询', t => cancelledPreparationCase(t, { hook: 'execute', release: ok(revision) }));
-
-test('取消技能获取：释放准备计划', t => cancelledPreparationCase(t, { hook: 'source', release: [] }));
-
-test('取消安装准备：禁止执行安装', async t => {
-  const abort = new AbortController();
-  const entered = Promise.withResolvers();
-  const release = Promise.withResolvers();
-  const waits = [];
-  t.after(() => {
-    abort.abort();
-    release.resolve({ id: 'late', items: [], problem: null });
-  });
-  const item = {
-    id: 'skill-set:ssre2',
-    title: 'HIT-SudoMaker/SSRE2',
-    kind: 'skill',
-    canInstall: true,
-    facts: [],
-    actions: ['install'],
-  };
-  const running = runTerminal(
-    {
-      async inspect() {
-        return { items: [item], problems: [] };
-      },
-      async plan(_request, signal) {
-        entered.resolve();
-        signal?.addEventListener('abort', () => release.reject(new Error('cancelled')), { once: true });
-        return release.promise;
-      },
-      async apply() {
-        assert.fail('cancelled preparation must not apply');
-      },
-    },
-    {
-      async choose() {
-        return 0;
-      },
-      show() {},
-      async select(_page, change) {
-        change({ kind: 'toggle', index: 0 });
-        return { kind: 'submit', index: 1 };
-      },
-      async wait(title, work, signal) {
-        waits.push(title);
-        try {
-          return await work(signal ?? abort.signal);
-        } catch (error) {
-          if (signal?.aborted) return null;
-          throw error;
-        }
-      },
-    },
-    abort.signal,
-  ).then(() => 'stopped');
-  await entered.promise;
-  abort.abort();
-  assert.equal(await verdict(running), 'stopped');
-  assert.ok(waits.includes('准备安装'));
-});
-
-test('准备技能：报告获取步骤', async t => {
+// 准备进度与分组顺序
+test('准备技能：报告获取步骤', async testContext => {
   const events = [];
-  const { home, ccw } = await fixture(t, {
+  const { home, ccw } = await createPreparationScenario(testContext, {
     async execute(_file, _args, options) {
       assert.ok(options.timeoutMs <= 15_000);
       return ok(revision);
     },
-    async source(_repository, _revision, _directory, options) {
+    async npm(_args, options) {
       assert.equal(options.timeoutMs, 120_000);
-      return [{ path: 'one/SKILL.md', data: Buffer.from('skill') }];
+      return ok('◇  Available Skills\n│    ssre2-design\n└  Use --skill <name> to install specific skills');
     },
   });
   const plan = await ccw.plan({ task: 'install', selected: [{ id: 'skill-set:ssre2' }] }, undefined, event =>
@@ -150,46 +101,45 @@ test('准备技能：报告获取步骤', async t => {
   assert.equal(await exists(path.join(home, '.claude')), false);
 });
 
-test('安装技能：隔离准备信号', async t => {
-  const { home, ccw } = await fixture(t);
-  const abort = new AbortController();
-  const plan = await ccw.plan({ task: 'install', selected: [{ id: 'skill-set:ssre2' }] }, abort.signal);
-  assert.equal(plan.items[0].problem, null);
-  abort.abort();
-  assert.equal((await ccw.apply(plan.id)).state, 'done');
-  assert.equal(await fs.readFile(path.join(home, '.claude/skills/one/SKILL.md'), 'utf8'), 'skill');
-});
-
-test('并行准备：限制两项并保留进度归属和结果顺序', async t => {
+test('并行准备：限制两项并保留进度归属和结果顺序', { timeout: GATE_TIMEOUT_MS }, async testContext => {
   let active = 0;
   let peak = 0;
+  const pairStarted = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  testContext.after(() => release.resolve());
   const events = [];
   const pause = async () => {
     peak = Math.max(peak, ++active);
-    await new Promise(resolve => setTimeout(resolve, 8));
+    if (active === 2) pairStarted.resolve();
+    await release.promise;
     active--;
   };
-  const { ccw } = await fixture(t, {
+  const { ccw } = await createPreparationScenario(testContext, {
     async execute() {
       await pause();
       return ok(revision);
     },
-    async source(repository, _revision, folder) {
+    async npm(args) {
       await pause();
-      return [
-        {
-          path: folder.endsWith('ssre2-design')
-            ? 'SKILL.md'
-            : `${repository.includes('mattpocock') ? 'matt-member' : 'ssre-member'}/SKILL.md`,
-          data: Buffer.from('skill'),
-        },
-      ];
+      return ok(
+        '◇  Available Skills\n│    ' +
+          (args[6].endsWith('ssre2-design')
+            ? 'ssre2-design'
+            : args[6].includes('mattpocock')
+              ? 'matt-member'
+              : 'ssre-member') +
+          '\n└  Use --skill <name> to install specific skills',
+      );
     },
   });
   const ids = ['skill-set:ssre2', 'skill-set:mattpocock', 'skill:ssre2-design'];
-  const plan = await ccw.plan({ task: 'install', selected: ids.map(id => ({ id })) }, undefined, event =>
+  const preparing = ccw.plan({ task: 'install', selected: ids.map(id => ({ id })) }, undefined, event =>
     events.push(event),
   );
+  await pairStarted.promise;
+  assert.equal(events.filter(event => event.stage === 'inspect').length, 2);
+  release.resolve();
+  const plan = await preparing;
   assert.equal(peak, 2);
   assert.deepEqual(
     plan.items.map(item => item.id),
@@ -206,17 +156,61 @@ test('并行准备：限制两项并保留进度归属和结果顺序', async t 
   }
 });
 
-test('重复选择：准备前拒绝且不读取来源', async t => {
+for (const task of ['install', 'uninstall'])
+  test(`混合准备：Claude 先准备，${task} 预览保持分组顺序`, async testContext => {
+    const events = [];
+    const { ccw } = await createPreparationScenario(testContext);
+    const ids = ['settings', 'claude', 'skill-set:ssre2'];
+    const plan = await ccw.plan({ task, selected: ids.map(id => ({ id })) }, undefined, event => events.push(event));
+    assert.equal(events[0].id, 'claude');
+    assert.deepEqual(
+      plan.items.map(item => item.id),
+      task === 'install' ? ['claude', 'settings', 'skill-set:ssre2'] : ['settings', 'skill-set:ssre2', 'claude'],
+    );
+    assert.equal(plan.items.find(item => item.id === 'settings').action, task === 'install' ? 'configure' : 'detach');
+  });
+
+// 准备与执行的信号边界
+test('安装技能：隔离准备信号', async testContext => {
+  const { home, ccw } = await createPreparationScenario(testContext);
+  const abort = new AbortController();
+  const plan = await ccw.plan({ task: 'install', selected: [{ id: 'skill-set:ssre2' }] }, abort.signal);
+  assert.equal(plan.items[0].problem, null);
+  abort.abort();
+  assert.equal((await ccw.apply(plan.id)).state, 'done');
+  assert.match(await fs.readFile(path.join(home, '.claude/skills/ssre2-design/SKILL.md'), 'utf8'), /first/);
+});
+
+// 输入冲突与通知失败
+test('未知插件先由 Plugins 拒绝，不触发 Claude 或 npm 发现', async testContext => {
+  const workspace = await createTestEnvironment(testContext);
+  const ccw = workspace.ccw(workspace.machine());
+  const plan = await ccw.plan({ task: 'install', selected: [{ id: 'plugin:not-managed' }] });
+  assert.equal(plan.items[0].problem, 'unknown-selection');
+  assert.deepEqual(workspace.calls, []);
+});
+
+test('Claude 设置读取失败不遮蔽程序与插件项目', async testContext => {
+  const workspace = await createTestEnvironment(testContext);
+  await workspace.write(workspace.settingsFile, '{broken');
+  const ccw = workspace.ccw(workspace.machine({ npm: async () => ok('{}') }));
+  const inspection = await ccw.inspect();
+  assert.ok(inspection.items.some(item => item.id === 'claude'));
+  assert.ok(inspection.items.some(item => item.id === 'plugin:serena@claude-plugins-official'));
+  assert.ok(inspection.problems.some(problem => problem.code === 'invalid-settings' && problem.detail === 'settings'));
+});
+
+test('重复选择：准备前拒绝且不读取来源', async testContext => {
   let metadataCalls = 0;
   let sourceCalls = 0;
-  const { ccw } = await fixture(t, {
+  const { ccw } = await createPreparationScenario(testContext, {
     async execute() {
       metadataCalls++;
       return ok(revision);
     },
-    async source() {
+    async npm() {
       sourceCalls++;
-      return [{ path: 'one/SKILL.md', data: Buffer.from('skill') }];
+      return ok('');
     },
   });
   await assert.rejects(
@@ -230,20 +224,45 @@ test('重复选择：准备前拒绝且不读取来源', async t => {
   assert.equal(sourceCalls, 0);
 });
 
-test('取消并行准备：等待在途工作结束并停止后续项', async t => {
+for (const asynchronous of [false, true])
+  test('准备回调失败不污染计划或阻断操作：' + (asynchronous ? '异步' : '同步'), async testContext => {
+    const { ccw } = await createPreparationScenario(testContext);
+    let notifications = 0;
+    const plan = await ccw.plan({ task: 'install', selected: [{ id: 'skill-set:ssre2' }] }, undefined, event => {
+      notifications++;
+      event.id = 'caller-mutation';
+      event.title = 'caller-mutation';
+      if (asynchronous) return Promise.reject(new Error('observer-failed'));
+      throw new Error('observer-failed');
+    });
+    assert.equal(notifications, 1);
+    assert.equal(plan.items[0].id, 'skill-set:ssre2');
+    assert.equal(plan.items[0].title, 'HIT-SudoMaker/SSRE2');
+    assert.equal(plan.items[0].problem, null);
+    assert.equal((await ccw.apply(plan.id)).state, 'done');
+  });
+
+// 取消准备与后续恢复
+test('取消技能准备：终止 Git 查询', testContext =>
+  verifyCancelledPreparation(testContext, { hook: 'execute', release: ok(revision) }));
+
+test('取消技能获取：释放准备计划', testContext =>
+  verifyCancelledPreparation(testContext, { hook: 'source', release: [] }));
+
+test('取消并行准备：等待在途工作结束并停止后续项', async testContext => {
   const controller = new AbortController();
   const entered = Promise.withResolvers();
   const events = [];
   let calls = 0;
   let active = 0;
-  t.after(() => controller.abort());
-  const { ccw } = await fixture(t, {
+  testContext.after(() => controller.abort());
+  const { ccw } = await createPreparationScenario(testContext, {
     async execute(_file, _args, options) {
       active++;
       if (++calls === 2) entered.resolve();
       try {
         await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('gate-timeout')), 2000);
+          const timer = setTimeout(() => reject(new Error('gate-timeout')), GATE_TIMEOUT_MS);
           options.signal.addEventListener(
             'abort',
             () => {

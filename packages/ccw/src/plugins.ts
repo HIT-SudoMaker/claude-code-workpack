@@ -1,733 +1,153 @@
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
-
-import { knownTitle } from './titles.js';
-import { applyFrozenJson, assessFrozenJson, jsonField, jsonFingerprint as extensionDigest } from './frozen-json.js';
-import { ENABLED_PLUGINS_KEY } from './settings.js';
-import { marketplaceSources, pluginSpecs } from './management-catalog.js';
-import { errorCode, isGitRevision, isObject, treeFilesStamp } from './machine.js';
-import { commandReceipt, json, object, restOf, success, unchanged } from './model.js';
-import type {
-  Context,
-  Describe,
-  Domain,
-  Inspection,
-  Item,
-  Prepared,
-  Selection,
-  Json,
-  JsonObject,
-  OperationDefinition,
-  OperationHandler,
-  OperationFact,
-} from './model.js';
-import { claudeCommand } from './programs.js';
-import { extensionString, extensionNullableString, extensionObject, extensionObjects } from './skill-files.js';
-import { replacedDirectory } from './storage.js';
-
-function pluginSource(name: string, markets: Record<string, unknown>) {
-  const spec = Object.entries(pluginSpecs).find(([id]) => id === name)?.[1];
-  if (spec === undefined) return null;
-  const expected = marketplaceSources[spec.source];
-  const [bare, marketName] = name.split('@');
-  if (!bare || marketName !== expected.market) return null;
-  const market = markets[marketName];
-  if (market === undefined) return { repository: expected.repository, marketName };
-  if (!isObject(market) || !isObject(market.source)) return null;
-  const source =
-    typeof market.source.repo === 'string'
-      ? market.source.repo
-      : typeof market.source.url === 'string'
-        ? market.source.url.replace(/^https:\/\/github.com\//, '').replace(/\.git$/, '')
-        : '';
-  return expected.acceptedRepositories.some(repository => repository === source)
-    ? { repository: expected.repository, marketName }
-    : null;
-}
-
-/** 插件名的市场段：name@market 形态 */
-function marketOf(name: string) {
-  return name.split('@')[1];
-}
-
-/** 非目录插件的既存市场：用户自选来源只验市场记录在场，不做仓库白名单比对；
- *  目录内插件一律返回 null，保持来源冲突防护 */
-function declaredMarketSource(name: string, markets: Record<string, unknown>) {
-  if (Object.hasOwn(pluginSpecs, name)) return null;
-  const marketName = marketOf(name);
-  return marketName !== undefined && isObject(markets[marketName]) ? { marketName } : null;
-}
-
-/** 解析插件标题：未安装方案入口用官方名；实际对象须市场记录在场且来源匹配，证据不足保留原始键名 */
-function pluginTitle(name: string, markets: Record<string, unknown> | null, isInstalled: boolean): string {
-  if (!isInstalled) return knownTitle(`plugin:${name}`, name);
-  if (markets === null) return name;
-  const marketName = marketOf(name);
-  return marketName !== undefined && markets[marketName] !== undefined && pluginSource(name, markets) !== null
-    ? knownTitle(`plugin:${name}`, name)
-    : name;
-}
-
-async function pluginRecords(ctx: Context) {
-  const document = await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/installed_plugins.json'));
-  return object(document.plugins);
-}
-
-function userPluginRecords(value: unknown): Record<string, unknown>[] {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) throw new Error('invalid-plugin-record');
-  const entries: Record<string, unknown>[] = [];
-  for (const entry of value) {
-    if (!isObject(entry) || typeof entry.scope !== 'string') throw new Error('invalid-plugin-record');
-    if (entry.scope === 'user') entries.push(entry);
-  }
-  return entries;
-}
-
-/** 只回答安装记录的载荷是否存在，不决定复用资格或错误处理 */
-async function pluginFilePresent(ctx: Context, record: Record<string, unknown>): Promise<boolean> {
-  return typeof record.installPath === 'string' && (await ctx.machine.realpath(record.installPath)) !== null;
-}
-
-/** 创建插件域渠道：余段即插件名 */
+import { knownTitle, PLUGIN_SPECS, PLUGIN_MARKETPLACE } from './management-catalog.js';
+import { isObject, errorCode } from './machine.js';
+import { json, object, restOf, commandReceipt, unchanged } from './model.js';
+import type { Change, Context, Domain, Prepared, Selection, ClaudeCommand } from './model.js';
+import { jsonFingerprint, frozenJsonWork } from './frozen-json.js';
+import { step } from './work.js';
+const names = Object.keys(PLUGIN_SPECS);
+/**
+ * 管理已知 Claude 插件的用户级安装和启用状态
+ *
+ * @remarks 安装使用绑定的 Claude 命令，拒绝同名市场来源冲突，不管理访问令牌
+ * 完成须确认文件和启用声明；更新还须命令成功退出
+ * 停用只写设置并保留文件，不依赖 Claude 命令
+ */
 export function createPluginsDomain(ctx: Context): Domain {
   return {
-    handlers: pluginHandlers(ctx),
-    inspect: () => inspectPlugins(ctx),
-    prepare(selection, describe) {
-      const name = restOf(selection.id);
-      if (name === undefined) throw new Error('unknown-selection');
-      return preparePlugin(ctx, name, selection, describe);
-    },
-  };
-}
-
-async function inspectPlugins(ctx: Context): Promise<Inspection> {
-  const problems: string[] = [];
-  let enabled: Record<string, unknown> = {};
-  let records: Record<string, unknown> = {};
-  let markets: Record<string, unknown> = {};
-  let settingsProblem: string | undefined;
-  let recordsProblem: string | undefined;
-  let marketsProblem: string | undefined;
-  try {
-    enabled = object((await json(ctx.machine, ctx.settingsFile))[ENABLED_PLUGINS_KEY]);
-  } catch (error) {
-    settingsProblem = errorCode(error);
-    problems.push(settingsProblem);
-  }
-  try {
-    records = await pluginRecords(ctx);
-  } catch (error) {
-    recordsProblem = errorCode(error);
-    problems.push(recordsProblem);
-  }
-  try {
-    markets = await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json'));
-  } catch (error) {
-    marketsProblem = errorCode(error);
-    problems.push(marketsProblem);
-  }
-  const names = new Set([
-    ...Object.entries(pluginSpecs)
-      .filter(([, spec]) => spec.exposure === 'offer')
-      .map(([name]) => name),
-    ...Object.keys(enabled),
-    ...Object.keys(records),
-  ]);
-  const items: Item[] = [];
-  for (const name of names) {
-    try {
-      const installed = userPluginRecords(records[name]);
-      const source = pluginSource(name, markets);
-      const isOffered = source !== null;
-      if (!isOffered && installed.length === 0 && enabled[name] === undefined) continue;
-      const isInstalled = installed.length > 0;
-      const hasFilesPresent =
-        isInstalled && (await Promise.all(installed.map(record => pluginFilePresent(ctx, record)))).every(Boolean);
-      const problem = settingsProblem ?? recordsProblem ?? marketsProblem;
-      items.push({
-        id: `plugin:${name}`,
-        title: pluginTitle(name, marketsProblem ? null : markets, isInstalled || enabled[name] !== undefined),
-        kind: 'plugin',
-        canInstall: isOffered && !problem,
-        ...(problem ? { problem } : {}),
-        facts: [
-          ...(recordsProblem ? [] : [{ code: isInstalled ? 'plugin-installed' : 'plugin-not-installed' }]),
-          ...(isInstalled ? [{ code: hasFilesPresent ? 'plugin-files-present' : 'plugin-files-missing' }] : []),
-          ...(settingsProblem
-            ? []
-            : [
-                {
-                  code:
-                    enabled[name] === true
-                      ? 'declared-enabled'
-                      : enabled[name] === false
-                        ? 'declared-disabled'
-                        : 'not-declared',
-                },
-              ]),
-        ],
-        actions: [
-          ...(isOffered && !problem
-            ? hasFilesPresent
-              ? (['update', 'reinstall', 'connect'] as const)
-              : (['install'] as const)
-            : []),
-          // 非目录插件停用后不是死对象：文件在场时提供恢复启用入口（经安装页复用启用通道）
-          ...(!isOffered && !problem && enabled[name] === false && hasFilesPresent ? (['connect'] as const) : []),
-          ...(!settingsProblem && (enabled[name] === true || (enabled[name] === undefined && isInstalled))
-            ? (['detach'] as const)
-            : []),
-        ],
-      });
-    } catch (error) {
-      items.push({
-        id: `plugin:${name}`,
-        title: name,
-        kind: 'plugin',
-        facts: [],
-        actions: enabled[name] === true ? ['detach'] : [],
-        problem: errorCode(error),
-      });
-    }
-  }
-  return { items, problems: problems.map(code => ({ code, detail: 'plugins' })) };
-}
-
-function pluginPatches(value: unknown) {
-  return extensionObjects(value).map(patch => {
-    if (
-      !Array.isArray(patch.path) ||
-      !patch.path.every((part): part is string => typeof part === 'string') ||
-      !Object.hasOwn(patch, 'value')
-    )
-      throw new Error('operation-record-invalid');
-    const value = patch.remove === true ? undefined : (patch.value ?? null);
-    const after = extensionDigest(value);
-    return { path: patch.path, before: [extensionString(patch.before), after], after, value };
-  });
-}
-function patchOperation(
-  itemId: string,
-  suffix: string,
-  file: string,
-  document: Record<string, unknown>,
-  values: readonly { path: readonly string[]; value: Json; remove?: boolean }[],
-  dependsOn: readonly string[],
-  changes: OperationDefinition['changes'],
-): OperationDefinition {
-  return {
-    id: `${itemId}/${suffix}`,
-    itemId,
-    handler: 'plugin.fields',
-    payload: {
-      file,
-      patches: values.map(value => ({ ...value, before: extensionDigest(jsonField(document, value.path)) })),
-    },
-    dependsOn,
-    changes,
-  };
-}
-
-async function preparePlugin(ctx: Context, name: string, selection: Selection, describe?: Describe): Promise<Prepared> {
-  if (!/^[\w.-]+@[\w.-]+$/.test(name)) throw new Error('invalid-plugin-id');
-  const action = selection.action;
-  if (!['install', 'connect', 'update', 'reinstall', 'detach'].includes(action)) throw new Error('action-unavailable');
-  const itemId = selection.id;
-  const marketplaceFile = path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json');
-  let markets: Record<string, unknown> | null = null;
-  try {
-    markets = await json(ctx.machine, marketplaceFile);
-  } catch (error) {
-    if (action !== 'detach' || errorCode(error) === 'cancelled') throw error;
-  }
-  const settings = await json(ctx.machine, ctx.settingsFile);
-  const enabled = object(settings[ENABLED_PLUGINS_KEY])[name];
-  const records = action === 'detach' && enabled === true ? [] : userPluginRecords((await pluginRecords(ctx))[name]);
-  describe?.(pluginTitle(name, markets, records.length > 0 || enabled !== undefined));
-  if (action === 'detach') {
-    if (enabled !== true && (enabled !== undefined || !records.length)) throw new Error('no-connection');
-    const disable = patchOperation(
-      itemId,
-      'disable',
-      ctx.settingsFile,
-      settings,
-      [{ path: [ENABLED_PLUGINS_KEY, name], value: false }],
-      [],
-      [{ code: 'plugin-disable', detail: name }, { code: 'keep-plugin-files' }],
-    );
-    return {
-      operations: [
-        {
-          ...disable,
-          payload: {
-            ...disable.payload,
-            ...(enabled !== true ? { pluginName: name, records: extensionDigest(records) } : {}),
-          },
-        },
-      ],
-    };
-  }
-  const beforeSnapshot = await pluginSnapshot(ctx, name);
-  const source = pluginSource(name, markets ?? {});
-  const declared = source === null ? declaredMarketSource(name, markets ?? {}) : null;
-  if (source === null && declared === null) throw new Error('marketplace-source-conflict');
-  const canReuse =
-    (action === 'install' || action === 'connect') &&
-    records.length > 0 &&
-    (await Promise.all(records.map(record => pluginFilePresent(ctx, record)))).every(Boolean);
-  if (action === 'connect' && !canReuse) throw new Error('plugin-not-ready');
-  const operations: OperationDefinition[] = [];
-  const restores: OperationDefinition[] = [];
-  let dependencies: readonly string[] = [];
-  if (action === 'reinstall') {
-    const help = await claudeCommand(ctx, ['plugin', 'uninstall', '--help']);
-    if (help.failed || help.code !== 0 || !help.stdout.includes('--keep-data'))
-      throw new Error('plugin-keep-data-unconfirmed');
-  }
-  let frozen: JsonObject | null = null;
-  if (!canReuse) {
-    if (source === null) throw new Error('plugin-target-unpinned');
-    const repository = `https://github.com/${source.repository}`;
-    const declaredRef = object(object(markets?.[source.marketName]).source).ref;
-    let revision: unknown;
-    if (declaredRef === undefined)
-      revision = success(await ctx.machine.execute('git', ['ls-remote', repository, 'HEAD'])).split(/\s+/)[0];
-    else if (typeof declaredRef === 'string' && isGitRevision(declaredRef)) revision = declaredRef;
-    else if (typeof declaredRef === 'string' && declaredRef.trim()) {
-      const commit: unknown = JSON.parse(
-        await ctx.machine.fetchText(
-          `https://api.github.com/repos/${source.repository}/commits/${encodeURIComponent(declaredRef)}`,
-        ),
-      );
-      revision = isObject(commit) ? commit.sha : undefined;
-    }
-    if (typeof revision !== 'string' || !isGitRevision(revision)) throw new Error('source-unavailable');
-    const files = await ctx.machine.source(repository, revision, '.');
-    const catalogFile = files.find(file => file.path === '.claude-plugin/marketplace.json');
-    if (!catalogFile) throw new Error('invalid-marketplace');
-    const catalog: unknown = JSON.parse(Buffer.from(catalogFile.data).toString('utf8'));
-    if (!isObject(catalog) || catalog.name !== source.marketName || !Array.isArray(catalog.plugins))
-      throw new Error('invalid-marketplace');
-    const entry: unknown = catalog.plugins.find(
-      (value: unknown) => isObject(value) && value.name === name.split('@')[0],
-    );
-    if (
-      !isObject(entry) ||
-      typeof entry.source !== 'string' ||
-      !/^\.\/(?:[\w.-]+\/)*[\w.-]+$/.test(entry.source) ||
-      entry.source
-        .split('/')
-        .slice(1)
-        .some(part => part === '.' || part === '..')
-    )
-      throw new Error('plugin-target-unpinned');
-    const folder = entry.source.slice(2);
-    const pluginFiles = files
-      .filter(file => file.path.startsWith(`${folder}/`))
-      .map(file => ({ ...file, path: file.path.slice(folder.length + 1) }));
-    if (!pluginFiles.length) throw new Error('plugin-payload-missing');
-    const directory = path.join(ctx.claudeRoot, 'plugins/marketplaces', source.marketName);
-    const market = object(markets?.[source.marketName]);
-    if (market.installLocation !== undefined && market.installLocation !== directory)
-      throw new Error('marketplace-location-conflict');
-    const snapshot = [
-      ...files.filter(file => file.path !== '.gcs-sha'),
-      { path: '.gcs-sha', data: Buffer.from(revision) },
-    ];
-    const before = await ctx.machine.treeStamp(directory);
-    const stage: OperationDefinition = {
-      id: `${itemId}/marketplace-files`,
-      itemId,
-      handler: 'plugin.marketplace-files',
-      dependsOn: [],
-      payload: {
-        repository,
-        revision,
-        directory,
-        before,
-        destination: before === null ? null : path.join(replacedDirectory(ctx), `${randomUUID()}-${source.marketName}`),
-        stamp: treeFilesStamp(snapshot),
-      },
-      changes: [{ code: `plugin-${action}`, detail: `${name} · ${revision.slice(0, 12)}` }],
-    };
-    const marketWrite = patchOperation(
-      itemId,
-      'marketplace-source',
-      marketplaceFile,
-      markets ?? {},
-      [
-        { path: [source.marketName, 'source', 'source'], value: 'github' },
-        { path: [source.marketName, 'source', 'repo'], value: source.repository },
-        { path: [source.marketName, 'source', 'ref'], value: revision },
-        { path: [source.marketName, 'installLocation'], value: directory },
-      ],
-      [stage.id],
-      [],
-    );
-    const extra = object(object(settings.extraKnownMarketplaces)[source.marketName]);
-    const extraSource = object(extra.source);
-    if (extra.source !== undefined && extraSource.repo !== source.repository)
-      throw new Error('marketplace-source-conflict');
-    const settingWrite = patchOperation(
-      itemId,
-      'marketplace-settings',
-      ctx.settingsFile,
-      settings,
-      [
-        { path: ['extraKnownMarketplaces', source.marketName, 'source', 'source'], value: 'github' },
-        { path: ['extraKnownMarketplaces', source.marketName, 'source', 'repo'], value: source.repository },
-        { path: ['extraKnownMarketplaces', source.marketName, 'source', 'ref'], value: revision },
-      ],
-      [marketWrite.id],
-      [],
-    );
-    const originalKnownRef = object(object(markets?.[source.marketName]).source).ref;
-    const originalSettingsRef = extraSource.ref;
-    if (originalSettingsRef !== undefined && typeof originalSettingsRef !== 'string')
-      throw new Error('marketplace-source-conflict');
-    const knownRestore: OperationDefinition = {
-      id: `${itemId}/marketplace-source-restore`,
-      itemId,
-      handler: 'plugin.fields',
-      dependsOn: [`${itemId}/command`],
-      payload: {
-        file: marketplaceFile,
-        patches: [
-          {
-            path: [source.marketName, 'source', 'ref'],
-            before: extensionDigest(revision),
-            value: originalKnownRef === undefined ? null : extensionString(originalKnownRef),
-            remove: originalKnownRef === undefined,
-          },
-        ],
-      },
-      changes: [],
-    };
-    const settingsRestore: OperationDefinition = {
-      id: `${itemId}/marketplace-settings-restore`,
-      itemId,
-      handler: 'plugin.fields',
-      dependsOn: [`${itemId}/command`],
-      payload: {
-        file: ctx.settingsFile,
-        patches: [
-          {
-            path: ['extraKnownMarketplaces', source.marketName, 'source', 'ref'],
-            before: extensionDigest(revision),
-            value: originalSettingsRef === undefined ? null : originalSettingsRef,
-            remove: originalSettingsRef === undefined,
-          },
-        ],
-      },
-      changes: [],
-    };
-    restores.push(knownRestore, settingsRestore);
-    operations.push(
-      stage,
-      { ...marketWrite, payload: { ...marketWrite.payload, supersededBy: knownRestore.id } },
-      { ...settingWrite, payload: { ...settingWrite.payload, supersededBy: settingsRestore.id } },
-    );
-    dependencies = [settingWrite.id];
-    frozen = {
-      directory,
-      revision,
-      marketplaceStamp: treeFilesStamp(snapshot),
-      stamp: treeFilesStamp(pluginFiles),
-      repository: source.repository,
-      marketName: source.marketName,
-      knownRestore: knownRestore.id,
-      settingsRestore: settingsRestore.id,
-      originalKnownRef: extensionDigest(originalKnownRef),
-      originalSettingsRef: extensionDigest(originalSettingsRef),
-    };
-  }
-  if (action === 'reinstall') {
-    const remove: OperationDefinition = {
-      id: `${itemId}/remove`,
-      itemId,
-      handler: 'plugin.command',
-      dependsOn: dependencies,
-      payload: {
-        name,
-        verb: 'uninstall',
-        keepData: true,
-        beforeRecords: extensionDigest(records),
-        beforeFiles: extensionDigest(beforeSnapshot.files),
-        sourceIdentity: extensionDigest(source ?? declared),
-        beforeEnabled: extensionDigest(enabled),
-        source: frozen,
-        successor: `${itemId}/command`,
-      },
-      changes: [{ code: 'plugin-keep-data' }, { code: 'plugin-credentials-removed' }],
-    };
-    operations.push(remove);
-    dependencies = [remove.id];
-  }
-  const command: OperationDefinition = {
-    id: `${itemId}/command`,
-    itemId,
-    handler: 'plugin.command',
-    dependsOn: dependencies,
-    payload: {
-      name,
-      verb: canReuse ? 'enable' : action === 'update' ? 'update' : 'install',
-      keepData: false,
-      beforeRecords: extensionDigest(action === 'reinstall' ? [] : records),
-      beforeFiles: extensionDigest(action === 'reinstall' ? [] : beforeSnapshot.files),
-      sourceIdentity: extensionDigest(source ?? declared),
-      beforeEnabled: extensionDigest(enabled),
-      source: frozen,
-      afterRemoval: action === 'reinstall' ? `${itemId}/remove` : null,
-      reuse: canReuse,
-    },
-    changes: [{ code: canReuse ? 'plugin-reuse' : 'plugin-confirm', detail: name }, { code: 'new-session-required' }],
-  };
-  operations.push(command);
-  operations.push(...restores);
-  if (name.startsWith('github@') && selection.fields?.secret) {
-    const credential: OperationDefinition = {
-      id: `${itemId}/credential`,
-      itemId,
-      handler: 'plugin.credential',
-      dependsOn: [command.id],
-      payload: {
-        before: extensionDigest(object(settings.env).GITHUB_PERSONAL_ACCESS_TOKEN),
-        after: extensionDigest(selection.fields.secret),
-      },
-      requiresInput: ['secret'],
-      changes: [{ code: 'github-credential-configure' }],
-    };
-    operations.push(credential);
-    return { operations, inputs: { [credential.id]: { secret: selection.fields.secret } } };
-  }
-  return { operations };
-}
-
-async function pluginSnapshot(ctx: Context, name: string) {
-  const records = userPluginRecords((await pluginRecords(ctx))[name]);
-  const enabled = object((await json(ctx.machine, ctx.settingsFile))[ENABLED_PLUGINS_KEY])[name];
-  const files = await Promise.all(
-    records.map(async record => ({
-      installPath: typeof record.installPath === 'string' ? record.installPath : null,
-      version: typeof record.version === 'string' ? record.version : null,
-      revision: typeof record.gitCommitSha === 'string' ? record.gitCommitSha : null,
-      stamp: typeof record.installPath === 'string' ? await ctx.machine.treeStamp(record.installPath) : null,
-    })),
-  );
-  return {
-    records: extensionDigest(records),
-    enabled: extensionDigest(enabled),
-    enabledValue: enabled === true,
-    files,
-  };
-}
-
-function pluginHandlers(ctx: Context): Readonly<Record<string, OperationHandler>> {
-  const capture = (name: string) => pluginSnapshot(ctx, name);
-  const sourceIdentity = async (p: JsonObject) => {
-    const markets = await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json'));
-    const name = extensionString(p.name);
-    unchanged(extensionDigest(pluginSource(name, markets) ?? declaredMarketSource(name, markets)), p.sourceIdentity);
-  };
-  const sourceReady = async (source: JsonObject, facts: Readonly<Record<string, OperationFact>> = {}) => {
-    const market = object(
-      (await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json')))[
-        extensionString(source.marketName)
-      ],
-    );
-    const known = object(market.source);
-    const extra = object(
-      object(
-        object((await json(ctx.machine, ctx.settingsFile)).extraKnownMarketplaces)[extensionString(source.marketName)],
-      ).source,
-    );
-    unchanged(known.repo, source.repository);
-    if (facts[extensionString(source.knownRestore)]?.status === 'confirmed')
-      unchanged(extensionDigest(known.ref), source.originalKnownRef);
-    else unchanged(known.ref, source.revision);
-    unchanged(extra.repo, source.repository);
-    if (facts[extensionString(source.settingsRestore)]?.status === 'confirmed')
-      unchanged(extensionDigest(extra.ref), source.originalSettingsRef);
-    else unchanged(extra.ref, source.revision);
-    unchanged(
-      (await ctx.machine.read(path.join(extensionString(source.directory), '.gcs-sha')))?.trim(),
-      source.revision,
-    );
-    unchanged(await ctx.machine.treeStamp(extensionString(source.directory)), source.marketplaceStamp);
-  };
-  return {
-    'plugin.fields': {
-      async assess(definition, fact, facts) {
-        const patches = pluginPatches(definition.payload.patches);
-        const current = await json(ctx.machine, extensionString(definition.payload.file));
-        if (definition.payload.pluginName !== undefined)
-          unchanged(
-            extensionDigest(
-              userPluginRecords((await pluginRecords(ctx))[extensionString(definition.payload.pluginName)]),
-            ),
-            definition.payload.records,
-          );
-        const superseded =
-          typeof definition.payload.supersededBy === 'string' &&
-          facts[definition.payload.supersededBy]?.status === 'confirmed';
-        const fields = patches.map(patch => ({
-          ...patch,
-          after: superseded && patch.path.at(-1) === 'ref' ? patch.before : patch.after,
-        }));
-        const assessment = assessFrozenJson(current, fields, fact);
-        return assessment.state === 'complete'
-          ? {
-              ...assessment,
-              effects: definition.id.endsWith('/disable') ? [{ state: 'done', code: 'plugin-disabled' }] : [],
-            }
-          : assessment;
-      },
-      async execute(definition) {
-        const patches = pluginPatches(definition.payload.patches);
-        if (definition.payload.pluginName !== undefined)
-          unchanged(
-            extensionDigest(
-              userPluginRecords((await pluginRecords(ctx))[extensionString(definition.payload.pluginName)]),
-            ),
-            definition.payload.records,
-          );
-        await ctx.effects.editJson(extensionString(definition.payload.file), document => {
-          applyFrozenJson(document, patches);
-        });
-        return { receipt: { kind: 'returned', failure: null }, evidence: { matched: true } };
-      },
-    },
-    'plugin.marketplace-files': {
-      async assess(definition, fact) {
-        const p = definition.payload;
-        const stamp = await ctx.machine.treeStamp(extensionString(p.directory));
-        if (stamp === p.stamp) return { state: 'complete', evidence: { stamp } };
-        if (fact.status === 'confirmed' || stamp !== p.before) return { state: 'unknown', problem: 'target-changed' };
-        return { state: 'ready' };
-      },
-      async execute(definition) {
-        const p = definition.payload;
-        const fetched = await ctx.machine.source(extensionString(p.repository), extensionString(p.revision), '.');
-        const files = [
-          ...fetched.filter(file => file.path !== '.gcs-sha'),
-          { path: '.gcs-sha', data: Buffer.from(extensionString(p.revision)) },
-        ];
-        unchanged(treeFilesStamp(files), p.stamp);
-        await ctx.effects.replaceTree(
-          extensionString(p.directory),
-          files,
-          extensionNullableString(p.before),
-          p.destination === null ? undefined : extensionString(p.destination),
-        );
-        return {
-          receipt: { kind: 'returned', failure: null },
-          evidence: { stamp: await ctx.machine.treeStamp(extensionString(p.directory)) },
+    async inspect() {
+      const items = [];
+      for (const name of names) {
+        const facts: Change[] = [];
+        const item = {
+          id: 'plugin:' + name,
+          title: knownTitle('plugin:' + name, name),
+          kind: 'plugin' as const,
+          location: ctx.settingsFile,
+          canInstall: true,
+          canUninstall: false,
+          facts,
         };
-      },
-    },
-    'plugin.command': {
-      async assess(definition, fact, facts) {
-        const p = definition.payload;
-        await sourceIdentity(p);
-        const current = await capture(extensionString(p.name));
-        if (p.source) await sourceReady(extensionObject(p.source), facts);
-        if (p.verb === 'uninstall') {
-          const successor = facts[extensionString(p.successor)];
-          if (successor?.status === 'confirmed' && fact.receipt?.kind === 'returned' && !fact.receipt.failure)
-            return {
-              state: 'complete',
-              evidence: fact.evidence ?? {},
-              effects: [{ state: 'done', code: 'plugin-removed' }],
-            };
-          if (current.files.length === 0 && !current.enabledValue)
-            return { state: 'complete', evidence: current, effects: [{ state: 'done', code: 'plugin-removed' }] };
-        } else {
-          const reusedFilesMatch =
-            current.records === p.beforeRecords && extensionDigest(current.files) === p.beforeFiles;
-          const valid =
-            current.files.length > 0 &&
-            current.files.every(
-              file =>
-                file.stamp !== null &&
-                (p.reuse
-                  ? reusedFilesMatch
-                  : file.revision === extensionObject(p.source).revision &&
-                    file.stamp === extensionObject(p.source).stamp),
-            ) &&
-            current.enabledValue;
-          if (valid && (p.reuse || (fact.receipt?.kind === 'returned' && !fact.receipt.failure))) {
-            if (fact.evidence?.records && current.records !== fact.evidence.records)
-              return { state: 'unknown', problem: 'program-changed' };
-            return {
-              state: 'complete',
-              evidence: current,
-              effects: [{ state: 'done', code: 'plugin-ready', detail: extensionString(p.name) }],
-            };
-          }
+        try {
+          item.canUninstall = (await readEnabled(ctx, name)) === true;
+          facts.push({ code: item.canUninstall ? 'declared-enabled' : 'declared-disabled' });
+          const current = await observeInstallation(ctx, name);
+          facts.unshift({ code: current.ready ? 'plugin-installed' : 'plugin-not-installed' });
+          items.push(item);
+        } catch (error) {
+          items.push({ ...item, problem: errorCode(error) });
         }
-        if (fact.status === 'confirmed') return { state: 'unknown', problem: 'plugin-not-ready' };
-        if (fact.attemptId && fact.receipt?.kind !== 'returned')
-          return { state: 'unknown', problem: 'program-installation-unconfirmed' };
-        if (fact.receipt?.kind === 'returned' && !fact.receipt.failure)
-          return { state: 'unknown', problem: 'plugin-not-ready' };
-        const removed = p.afterRemoval ? facts[extensionString(p.afterRemoval)] : undefined;
-        unchanged(current.records, p.beforeRecords);
-        unchanged(extensionDigest(current.files), p.beforeFiles);
-        unchanged(current.enabled, removed?.evidence?.enabled ?? p.beforeEnabled);
-        return { state: 'ready', dispatch: { records: current.records, enabled: current.enabled } };
-      },
-      async execute(definition) {
-        const p = definition.payload;
-        await sourceIdentity(p);
-        if (p.source) await sourceReady(extensionObject(p.source));
-        const result = await claudeCommand(ctx, [
+      }
+      return { items, problems: [] };
+    },
+    async prepare(selection, claude) {
+      const name = restOf(selection.id);
+      if (!name || !names.includes(name)) throw new Error('unknown-selection');
+      return preparePlugin(ctx, name, selection, selection.action === 'detach' ? undefined : await claude?.());
+    },
+  };
+}
+async function preparePlugin(
+  ctx: Context,
+  name: string,
+  selection: Selection,
+  claude?: ClaudeCommand,
+): Promise<Prepared> {
+  const detach = selection.action === 'detach';
+  if (detach) {
+    const enabled = await readEnabled(ctx, name);
+    if (enabled !== true) throw new Error('no-connection');
+    return frozenJsonWork(ctx, {
+      file: ctx.settingsFile,
+      fields: [{ path: ['enabledPlugins', name], before: jsonFingerprint(enabled), value: false }],
+      changes: [{ code: 'plugin-disable', detail: name }, { code: 'keep-plugin-files' }],
+      effects: [{ state: 'done', code: 'plugin-disabled' }],
+    });
+  }
+  const before = await observe(ctx, name);
+  if (!claude) throw new Error('claude-not-installed');
+  const hadMarket = await marketplace(ctx);
+  const expected = jsonFingerprint(before);
+  const verb = before.ready ? 'update' : 'install';
+  const install = step(
+    [{ code: before.ready ? 'plugin-update' : 'plugin-install', detail: name }, { code: 'new-session-required' }],
+    async fact => {
+      if (!fact.dispatched) await claude.verify();
+      await marketplace(ctx);
+      const current = await observe(ctx, name);
+      // 更新既有插件还需命令正常返回，避免未发生更新时把原有文件误判为本次成功
+      if (fact.dispatched)
+        return current.ready &&
+          current.enabled === true &&
+          (!before.ready || (fact.receipt?.kind === 'returned' && !fact.receipt.failure))
+          ? {
+              state: 'complete',
+              effects: [{ state: 'done', code: 'plugin-ready', detail: name }],
+            }
+          : { state: 'blocked', problem: fact.receipt?.failure ?? 'plugin-not-ready' };
+      unchanged(jsonFingerprint(current), expected);
+      return { state: 'ready' };
+    },
+    async () => {
+      unchanged(jsonFingerprint(await observe(ctx, name)), expected);
+      if (!(await marketplace(ctx))) {
+        if (hadMarket) throw new Error('marketplace-source-conflict');
+        const added = await claude.execute([
           'plugin',
-          extensionString(p.verb),
-          extensionString(p.name),
+          'marketplace',
+          'add',
+          PLUGIN_MARKETPLACE.repository,
           '--scope',
           'user',
-          ...(p.keepData ? ['--keep-data'] : []),
         ]);
-        const receipt = commandReceipt(result, 'plugin-command-failed');
-        try {
-          return { receipt, evidence: await capture(extensionString(p.name)) };
-        } catch {
-          return { receipt };
-        }
-      },
+        const receipt = commandReceipt(added, 'marketplace-add-failed');
+        if (receipt.failure) return { receipt };
+        if (!(await marketplace(ctx))) throw new Error('marketplace-source-conflict');
+      }
+      const result = await claude.execute(['plugin', verb, name, '--scope', 'user']);
+      if (before.enabled !== true && verb === 'update' && result.code === 0 && !result.failed) {
+        const enabled = await claude.execute(['plugin', 'enable', name, '--scope', 'user']);
+        return { receipt: commandReceipt(enabled, 'plugin-command-failed') };
+      }
+      return { receipt: commandReceipt(result, 'plugin-command-failed') };
     },
-    'plugin.credential': {
-      async assess(definition, fact) {
-        const assessment = assessFrozenJson(
-          await json(ctx.machine, ctx.settingsFile),
-          [
-            {
-              path: ['env', 'GITHUB_PERSONAL_ACCESS_TOKEN'],
-              before: extensionString(definition.payload.before),
-              after: extensionString(definition.payload.after),
-            },
-          ],
-          fact,
-        );
-        return assessment.state === 'complete'
-          ? { ...assessment, effects: [{ state: 'done', code: 'github-credential-saved' }] }
-          : assessment;
-      },
-      async execute(definition, _fact, inputs) {
-        unchanged(extensionDigest(inputs.secret), definition.payload.after);
-        await ctx.effects.editJson(ctx.settingsFile, document => {
-          applyFrozenJson(document, [
-            {
-              path: ['env', 'GITHUB_PERSONAL_ACCESS_TOKEN'],
-              before: extensionString(definition.payload.before),
-              value: inputs.secret,
-            },
-          ]);
-        });
-        return { receipt: { kind: 'returned', failure: null }, evidence: { matched: true } };
-      },
-    },
-  };
+  );
+  return { ...install, action: verb };
+}
+async function observe(ctx: Context, name: string) {
+  return { enabled: await readEnabled(ctx, name), ...(await observeInstallation(ctx, name)) };
+}
+async function readEnabled(ctx: Context, name: string) {
+  return object((await json(ctx.machine, ctx.settingsFile)).enabledPlugins)[name];
+}
+async function observeInstallation(ctx: Context, name: string) {
+  const value = object((await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/installed_plugins.json'))).plugins)[
+    name
+  ];
+  if (value !== undefined && !Array.isArray(value)) throw new Error('invalid-plugin-record');
+  if ((value ?? []).some((record: unknown) => !isObject(record) || typeof record.scope !== 'string'))
+    throw new Error('invalid-plugin-record');
+  const records = (value ?? []).filter((record: unknown) => isObject(record) && record.scope === 'user');
+  const files = [];
+  for (const record of records) {
+    if (!isObject(record) || typeof record.installPath !== 'string') throw new Error('invalid-plugin-record');
+    files.push(await ctx.machine.treeStamp(record.installPath));
+  }
+  return { records, files, ready: records.length > 0 && files.every(stamp => stamp !== null) };
+}
+async function marketplace(ctx: Context) {
+  const value = (await json(ctx.machine, path.join(ctx.claudeRoot, 'plugins/known_marketplaces.json')))[
+    PLUGIN_MARKETPLACE.market
+  ];
+  if (value === undefined) return false;
+  const source = object(object(value).source);
+  const repo =
+    typeof source.repo === 'string'
+      ? source.repo
+      : typeof source.url === 'string'
+        ? source.url.replace(/^https:\/\/github.com\//, '').replace(/\.git$/, '')
+        : '';
+  if (!PLUGIN_MARKETPLACE.acceptedRepositories.some(accepted => accepted === repo))
+    throw new Error('marketplace-source-conflict');
+  return true;
 }

@@ -29,11 +29,58 @@ const officeBinary =
   process.platform === 'win32'
     ? path.join(home, 'AppData/Local/OfficeCli/officecli.exe')
     : path.join(home, '.local/bin/officecli');
-const officeRelease = releaseContract({ tag: 'v1.0.123', asset: officeAsset, digest: officeDigest });
+const officeRelease = releaseContract({
+  tag: 'v1.0.123',
+  asset: officeAsset,
+  digest: officeDigest,
+  revision: '0123456789abcdef0123456789abcdef01234567',
+});
+const SKILLS_CLI_PREFIX = ['exec', '--yes', '--package=skills@1.8.1', '--', 'skills'];
 const originalMachine = createMachine();
 const machine = {
-  ...createMachine(),
-  async npm(args) {
+  ...originalMachine,
+  async npm(args, options) {
+    if (args[0] === 'exec') {
+      assert.deepEqual(args.slice(0, SKILLS_CLI_PREFIX.length), SKILLS_CLI_PREFIX);
+      const [operation, sourceArgument, ...flags] = args.slice(SKILLS_CLI_PREFIX.length);
+      assert.equal(operation, 'a');
+      const source = path.join(runtime, 'packages/ccw/assets/skills/amirc-research');
+      assert.equal(sourceArgument, source);
+      assert.equal(options.env.CLAUDE_CONFIG_DIR, claudeRoot);
+      assert.equal(options.env.XDG_STATE_HOME, path.join(home, '.ccw'));
+      if (args.at(-1) === '--list')
+        return {
+          code: 0,
+          failed: false,
+          stdout: '│\n◇  Available Skills\n│    amirc-research\n└  Use --skill <name> to install specific skills\n',
+        };
+      assert.deepEqual(flags, [
+        '--skill',
+        'amirc-research',
+        '--agent',
+        'claude-code',
+        '--global',
+        '--yes',
+        '--copy',
+        '--json',
+      ]);
+      const directory = path.join(claudeRoot, 'skills/amirc-research');
+      await fs.cp(source, directory, { recursive: true });
+      return {
+        code: 0,
+        failed: false,
+        stdout: JSON.stringify([
+          {
+            name: 'amirc-research',
+            status: 'installed',
+            path: directory,
+            scope: 'global',
+            mode: 'copy',
+            agents: ['Claude Code'],
+          },
+        ]),
+      };
+    }
     if (args[0] === 'config') {
       assert.deepEqual(args.slice(0, 2), ['config', 'get']);
       assert.ok(args.length === 3 && ['registry', '@cometix:registry'].includes(args[2]));
@@ -79,7 +126,10 @@ const machine = {
     return officeBytes;
   },
   fetchText: officeRelease.fetchText,
-  async execute(executable, args, options) {
+  async source() {
+    return [{ path: 'SKILL.md', data: Buffer.from('---\nname: officecli\n---\n') }];
+  },
+  async execute(executable, args) {
     if (executable === binary) {
       assert.deepEqual(args, ['--version']);
       return { code: 0, failed: false, stdout: 'ccline 2.0.1' };
@@ -88,7 +138,7 @@ const machine = {
       assert.deepEqual(args, ['--version']);
       return { code: 0, failed: false, stdout: 'OfficeCLI 1.0.123' };
     }
-    return originalMachine.execute(executable, args, options);
+    throw new Error(`Unexpected runtime command: ${executable} ${args.join(' ')}`);
   },
 };
 const ccw = createCcw({ machine, home, claudeRoot, cclineRoot, platform: process.platform });
@@ -96,31 +146,18 @@ const ccw = createCcw({ machine, home, claudeRoot, cclineRoot, platform: process
 async function settings() {
   const batch = await ccw.plan({
     task: 'install',
-    selected: [
-      { id: 'settings', fields: { language: '中文' } },
-      { id: 'mcp:context7' },
-      { id: 'skill:amirc-research' },
-    ],
+    selected: [{ id: 'settings', fields: { language: '中文' } }, { id: 'skill:amirc-research' }],
   });
-  assert.ok(batch.items.every(item => item.problem === null));
-  assert.equal((await ccw.apply(batch.id)).state, 'done');
-  assert.equal(JSON.parse(await fs.readFile(path.join(claudeRoot, 'settings.json'), 'utf8')).language, '中文');
-  assert.equal(
-    JSON.parse(await fs.readFile(path.join(claudeRoot, '.claude.json'), 'utf8')).mcpServers.context7.url,
-    'https://mcp.context7.com/mcp',
+  assert.ok(
+    batch.items.every(item => item.problem === null),
+    JSON.stringify(batch),
   );
-  const state = JSON.parse(await fs.readFile(path.join(claudeRoot, '.claude.json'), 'utf8'));
-  assert.equal(state.mcpServers.amirc, undefined);
+  const result = await ccw.apply(batch.id);
+  assert.equal(result.state, 'done', JSON.stringify(result));
+  assert.equal(JSON.parse(await fs.readFile(path.join(claudeRoot, 'settings.json'), 'utf8')).language, '中文');
   assert.match(
     await fs.readFile(path.join(claudeRoot, 'skills/amirc-research/SKILL.md'), 'utf8'),
     /name: amirc-research/,
-  );
-  assert.equal(
-    await fs.stat(path.join(runtime, 'packages/amirc_academic_mcp')).then(
-      () => true,
-      () => false,
-    ),
-    false,
   );
 }
 const scenarios = {
@@ -147,7 +184,7 @@ const scenarios = {
   async officecli() {
     const officePlan = await ccw.plan({
       task: 'install',
-      selected: [{ id: 'officecli', fields: { connection: 'mcp' } }],
+      selected: [{ id: 'officecli' }],
     });
     assert.ok(
       officePlan.items.every(item => item.problem === null),
@@ -160,27 +197,15 @@ const scenarios = {
         .digest('hex'),
       officeDigest,
     );
-    assert.equal(
-      JSON.parse(await fs.readFile(path.join(claudeRoot, '.claude.json'), 'utf8')).mcpServers.officecli.command,
-      officeBinary,
-    );
+    assert.match(await fs.readFile(path.join(claudeRoot, 'skills/officecli/SKILL.md'), 'utf8'), /name: officecli/);
     const officeRemove = await ccw.plan({ task: 'uninstall', selected: [{ id: 'officecli' }] });
     assert.ok(
       officeRemove.items.every(item => item.problem === null),
       JSON.stringify(officeRemove),
     );
     assert.equal((await ccw.apply(officeRemove.id)).state, 'done');
-    assert.equal(
-      await fs.stat(officeBinary).then(
-        () => true,
-        () => false,
-      ),
-      false,
-    );
-    assert.equal(
-      JSON.parse(await fs.readFile(path.join(claudeRoot, '.claude.json'), 'utf8')).mcpServers.officecli,
-      undefined,
-    );
+    await assert.rejects(fs.stat(officeBinary), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(path.join(claudeRoot, 'skills/officecli')), { code: 'ENOENT' });
   },
 };
 if (!Object.hasOwn(scenarios, scenario)) throw new Error('unknown-runtime-scenario');

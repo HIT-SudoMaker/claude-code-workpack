@@ -3,7 +3,6 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createCcw } from './ccw.js';
-import { collectLogs } from './collect.js';
 import { acquireInstance } from './instance.js';
 import type { CcwOptions } from './model.js';
 import { createMachine, errorCode, isObject } from './machine.js';
@@ -11,21 +10,10 @@ import { BRAND, describeInspection, HELP_TEXT, startupFailure } from './render.j
 import { runTerminal } from './terminal.js';
 import { createTerminal } from './terminal-view.js';
 
-/** CLI 模式清单单一出处：新增模式仍需人工同步 errors.ts 与 HELP_TEXT 的散文枚举 */
-const CLI_MODES = ['--help', '--version', '--inspect', '--collect-logs'] as const;
-const CLI_MODE_VALUES: readonly string[] = CLI_MODES;
+/** 可与 --details 组合的互斥命令行模式 */
+const CLI_MODES = ['--help', '--version', '--inspect'] as const;
+
 type Mode = (typeof CLI_MODES)[number] | undefined;
-const isMode = (value: string): value is (typeof CLI_MODES)[number] => CLI_MODE_VALUES.includes(value);
-function parseArguments(args: readonly string[]): { mode: Mode; hasDetails: boolean } {
-  let mode: Mode;
-  let hasDetails = false;
-  for (const argument of args) {
-    if (argument === '--details' && !hasDetails) hasDetails = true;
-    else if (isMode(argument) && mode === undefined) mode = argument;
-    else throw new Error('unknown-argument');
-  }
-  return { mode, hasDetails };
-}
 
 async function main() {
   const { mode: argument, hasDetails } = parseArguments(process.argv.slice(2));
@@ -64,7 +52,6 @@ async function main() {
       claudeState: path.join(claudeConfig ? claudeRoot : home, '.claude.json'),
       inheritedKeys: Object.keys(process.env),
       ...(process.platform === 'win32' && process.env.LOCALAPPDATA ? { localAppData: process.env.LOCALAPPDATA } : {}),
-      ...(process.platform === 'win32' && process.env.SCOOP ? { scoopRoot: process.env.SCOOP } : {}),
       arch: /arm64|aarch64/i.test(machineArch) ? 'arm64' : /x86_64|amd64|x64/i.test(machineArch) ? 'x64' : process.arch,
       ...(process.platform === 'linux' ? { libc } : {}),
       platform: process.platform,
@@ -76,15 +63,10 @@ async function main() {
       if (view.problems.length || view.items.some(item => item.problem)) process.exitCode = 1;
       return;
     }
-    if (argument === '--collect-logs') {
-      const collected = await collectLogs(ccw, options);
-      process.stdout.write(`${collected.summary}\n`);
-      return;
-    }
     if (!terminal) return;
     process.on('SIGINT', stop);
     try {
-      await runTerminal(ccw, terminal, abort.signal);
+      await runTerminal(ccw, terminal, abort.signal, hasDetails);
     } finally {
       process.off('SIGINT', stop);
       await terminal.close();
@@ -93,6 +75,19 @@ async function main() {
     await instance.release();
   }
 }
+
+function parseArguments(args: readonly string[]): { mode: Mode; hasDetails: boolean } {
+  let mode: Mode;
+  let hasDetails = false;
+  for (const argument of args) {
+    if (argument === '--details' && !hasDetails) hasDetails = true;
+    else if (isMode(argument) && mode === undefined) mode = argument;
+    else throw new Error('unknown-argument');
+  }
+  return { mode, hasDetails };
+}
+
+const isMode = (value: string): value is (typeof CLI_MODES)[number] => CLI_MODES.some(mode => mode === value);
 
 main().catch(error => {
   process.stderr.write(`${startupFailure(errorCode(error), process.argv.slice(2).includes('--details'))}\n`);

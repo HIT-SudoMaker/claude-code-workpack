@@ -8,16 +8,17 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const main = fileURLToPath(new URL('../dist/main.js', import.meta.url));
+const STARTUP_TIMEOUT_MS = 5_000;
+const SCENARIO_TIMEOUT_MS = 15_000;
 
-function temporaryRoot(t) {
+function temporaryRoot(testContext) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccw-startup-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  testContext.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
 }
 
-function startCli(t, home, args = [], endpoint) {
-  // Only replace OS boundaries: give this test file a stable user identity and
-  // supply TTY input over a pipe. The real CLI and terminal run unchanged.
+function startCli(testContext, home, args = [], endpoint) {
+  // 隔离系统用户并通过管道提供终端输入，保留真实 CLI 与终端流程
   const script = `
     import os from 'node:os';
     import net from 'node:net';
@@ -72,7 +73,7 @@ function startCli(t, home, args = [], endpoint) {
     child.on('error', reject);
     child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
-  t.after(async () => {
+  testContext.after(async () => {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     await closed;
   });
@@ -80,11 +81,14 @@ function startCli(t, home, args = [], endpoint) {
     child,
     closed,
     ready: async () => {
-      if (stdout.includes('退出')) return;
+      if (stdout.includes('退出程序')) return;
       await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => finish(new Error(`CLI did not become ready: ${stdout}\n${stderr}`)), 5000);
+        const timer = setTimeout(
+          () => finish(new Error(`CLI did not become ready: ${stdout}\n${stderr}`)),
+          STARTUP_TIMEOUT_MS,
+        );
         const check = () => {
-          if (stdout.includes('退出')) finish();
+          if (stdout.includes('退出程序')) finish();
         };
         const exited = () => finish(new Error(`CLI exited before ready: ${stdout}\n${stderr}`));
         function finish(error) {
@@ -101,64 +105,13 @@ function startCli(t, home, args = [], endpoint) {
   };
 }
 
-test('同一用户的第二个 CLI 在初始化终端或配置前拒绝启动', { timeout: 15000 }, async t => {
-  const root = temporaryRoot(t);
-  const first = startCli(t, root);
-  await first.ready();
-  const second = startCli(t, root);
-  const result = await Promise.race([
-    second.closed,
-    second.ready().then(() => ({ code: null, stdout: 'interactive terminal opened', stderr: '' })),
-  ]);
-  assert.equal(result.code, 1);
-  assert.equal(result.stdout, '');
-  assert.equal(result.stderr, 'CCW 已在运行\n');
-  assert.deepEqual(fs.readdirSync(root), []);
-});
-
-test('正常关闭 CLI 后当前用户可以重新启动', { timeout: 15000 }, async t => {
-  const root = temporaryRoot(t);
-  const first = startCli(t, root);
-  await first.ready();
-  first.child.stdin.write('\u001b');
-  const result = await first.closed;
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stderr, /RAW_MODE=false/);
-  await startCli(t, root).ready();
-});
-
-test('强制终止 CLI 后当前用户可以接管启动', { timeout: 15000 }, async t => {
-  const root = temporaryRoot(t);
-  const first = startCli(t, root);
-  await first.ready();
-  first.child.kill('SIGKILL');
-  assert.equal((await first.closed).signal, 'SIGKILL');
-  await startCli(t, root).ready();
-});
-
-test('更换用户目录与 Claude 配置根不能绕过实例限制', { timeout: 15000 }, async t => {
-  const root = temporaryRoot(t);
-  const first = startCli(t, root);
-  await first.ready();
-  const otherHome = path.join(root, 'other');
-  fs.mkdirSync(otherHome);
-  for (const mode of ['--inspect', '--collect-logs']) {
-    const result = await startCli(t, otherHome, [mode, '--details']).closed;
-    assert.equal(result.code, 1);
-    assert.equal(result.stdout, '');
-    assert.match(result.stderr, /^CCW 已在运行\n/);
-    assert.match(result.stderr, /代码：instance-already-running/);
-    assert.doesNotMatch(result.stderr, /RAW_MODE/);
-    assert.deepEqual(fs.readdirSync(otherHome), []);
-  }
-});
-
-test('已有实例运行时帮助和版本仍不接触用户环境', { timeout: 15000 }, async t => {
-  const root = temporaryRoot(t);
-  const first = startCli(t, root);
+// 只读入口与启动释放
+test('已有实例运行时帮助和版本仍不接触用户环境', { timeout: SCENARIO_TIMEOUT_MS }, async testContext => {
+  const root = temporaryRoot(testContext);
+  const first = startCli(testContext, root);
   await first.ready();
   for (const mode of ['--help', '--version']) {
-    const result = await startCli(t, root, [mode]).closed;
+    const result = await startCli(testContext, root, [mode]).closed;
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stderr, '');
     assert.ok(result.stdout.length > 0);
@@ -166,19 +119,69 @@ test('已有实例运行时帮助和版本仍不接触用户环境', { timeout: 
   }
 });
 
-test('启动端点被无关程序占用时安全拒绝且不误报已有 CCW', { timeout: 15000 }, async t => {
-  const root = temporaryRoot(t);
+test('正常关闭 CLI 后当前用户可以重新启动', { timeout: SCENARIO_TIMEOUT_MS }, async testContext => {
+  const root = temporaryRoot(testContext);
+  const first = startCli(testContext, root);
+  await first.ready();
+  first.child.stdin.write('\u001b');
+  const result = await first.closed;
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /RAW_MODE=false/);
+  await startCli(testContext, root).ready();
+});
+
+test('强制终止 CLI 后当前用户可以接管启动', { timeout: SCENARIO_TIMEOUT_MS }, async testContext => {
+  const root = temporaryRoot(testContext);
+  const first = startCli(testContext, root);
+  await first.ready();
+  first.child.kill('SIGKILL');
+  assert.equal((await first.closed).signal, 'SIGKILL');
+  await startCli(testContext, root).ready();
+});
+
+// 并发实例与端点冲突
+test('同一用户的第二个 CLI 在初始化终端或配置前拒绝启动', { timeout: SCENARIO_TIMEOUT_MS }, async testContext => {
+  const root = temporaryRoot(testContext);
+  const first = startCli(testContext, root);
+  await first.ready();
+  const second = startCli(testContext, root);
+  const result = await Promise.race([
+    second.closed,
+    second.ready().then(() => ({ code: null, stdout: 'interactive terminal opened', stderr: '' })),
+  ]);
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'CCW 启动失败：CCW 已在运行\n');
+  assert.deepEqual(fs.readdirSync(root), []);
+});
+
+test('更换用户目录与 Claude 配置根不能绕过实例限制', { timeout: SCENARIO_TIMEOUT_MS }, async testContext => {
+  const root = temporaryRoot(testContext);
+  const first = startCli(testContext, root);
+  await first.ready();
+  const otherHome = path.join(root, 'other');
+  fs.mkdirSync(otherHome);
+  const result = await startCli(testContext, otherHome, ['--inspect', '--details']).closed;
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /^CCW 启动失败：CCW 已在运行\n/);
+  assert.match(result.stderr, /代码：instance-already-running/);
+  assert.doesNotMatch(result.stderr, /RAW_MODE/);
+  assert.deepEqual(fs.readdirSync(otherHome), []);
+});
+
+test('启动端点被无关程序占用时安全拒绝且不误报已有 CCW', { timeout: SCENARIO_TIMEOUT_MS }, async testContext => {
+  const root = temporaryRoot(testContext);
   const unrelated = createServer(socket => socket.end('unrelated service\n'));
-  t.after(() => unrelated.close());
+  testContext.after(() => unrelated.close());
   await new Promise(resolve => unrelated.listen({ host: '127.0.0.1', port: 0 }, resolve));
   const address = unrelated.address();
   assert.ok(address && typeof address === 'object');
-  // Redirect only network syscalls to a real occupied test endpoint. The CLI
-  // still binds exclusively and verifies the response through its public startup.
-  const result = await startCli(t, root, ['--details'], address.port).closed;
+  // 重定向网络调用至已占用端口，保留真实启动与独占绑定检查
+  const result = await startCli(testContext, root, ['--details'], address.port).closed;
   assert.equal(result.code, 1);
   assert.equal(result.stdout, '');
-  assert.match(result.stderr, /^启动资格不可用\n/);
+  assert.match(result.stderr, /^CCW 启动失败：无法取得启动资格\n/);
   assert.match(result.stderr, /代码：instance-lock-unavailable/);
   assert.doesNotMatch(result.stderr, /CCW 已在运行|RAW_MODE/);
   assert.deepEqual(fs.readdirSync(root), []);
