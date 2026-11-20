@@ -1,4 +1,4 @@
-# CCW 0.5.1
+# CCW 0.5.2
 
 CCW 是一个管理 Claude Code 及其常用扩展的终端工具。安装、更新和移除前，CCW 会先展示变更预览，确认后再执行。
 
@@ -18,12 +18,12 @@ ccw
 | 菜单     | 用途                                   |
 | -------- | -------------------------------------- |
 | 安装配置 | 安装或更新所选项目，编辑模型和偏好设置 |
-| 检查状态 | 查看安装状态和配置路径                 |
+| 检查状态 | 查看安装状态、模型字段和配置路径       |
 | 移除程序 | 移除受管程序或解除所选接入             |
 | 清理数据 | 按类别清理 Claude 数据                 |
 | 退出程序 | 关闭 CCW                               |
 
-在“安装配置”中勾选已安装的项目，即可更新。已有的有效模型连接、语言和输出风格会直接复用；需要修改时，可以在列表中进入对应的设置项。检查状态是只读操作。
+在“安装配置”中勾选已安装的项目，即可更新。已有的有效模型连接、语言和输出风格会直接复用；需要修改时，可以在列表中进入对应的设置项。检查状态是只读操作，会显示默认模型、Fable、Opus、Sonnet 和 Haiku，未设置的字段标为“未配置”。
 
 方向键移动，空格勾选，`A` 全选或取消全选，`Enter` 确认，`Esc` 返回。长页面可用 `PgUp` 和 `PgDn` 翻页。执行过程中按 `Ctrl+C` 会停止后续操作，已经发生的变更不会回滚。
 
@@ -72,15 +72,15 @@ npm start
 ```powershell
 New-Item -ItemType Directory -Force .scratch | Out-Null
 npm pack ./packages/ccw --pack-destination .scratch
-pnpm add --global --force ./.scratch/hit-sudomaker-ccw-0.5.1.tgz
+pnpm add --global --force ./.scratch/hit-sudomaker-ccw-0.5.2.tgz
 ```
 
 重新打包后再安装，关闭旧的 CCW 窗口并运行 `ccw`，即可使用新版本。如果原来使用 npm 全局安装，可将最后一行换成 `npm install -g`，并指定同一个安装包。打包和本地安装不会发布版本。
 
 开发检查使用 `npm run check`；独立运行包可用 `npm run package:runtime` 构建，并用 `npm run test:runtime` 验证。Windows 终端交互使用 ConPTY 测试；macOS 和 Linux 目前主要通过平台模拟覆盖。
 
-开发资料：[接入说明](https://github.com/HIT-SudoMaker/claude-code-workpack/blob/main/docs/integrations.md) · [产品与执行合同](https://github.com/HIT-SudoMaker/claude-code-workpack/blob/main/docs/specs/operation-state-machine.md) · [CSU 编码规范](https://github.com/HIT-SudoMaker/claude-code-workpack/blob/main/docs/standards/typescript-csu.md)
+开发资料：[接入说明](https://github.com/HIT-SudoMaker/ccw/blob/main/docs/integrations.md) · [产品与执行合同](https://github.com/HIT-SudoMaker/ccw/blob/main/docs/specs/operation-state-machine.md) · [CSU 编码规范](https://github.com/HIT-SudoMaker/ccw/blob/main/docs/standards/typescript-csu.md)
 
 交互设计参考了 [ZCF](https://github.com/UfoMiao/zcf)。本项目集成的工具与扩展归各自作者所有。
 
-[MIT](https://github.com/HIT-SudoMaker/claude-code-workpack/blob/main/LICENSE) © HIT-SudoMaker
+[MIT](https://github.com/HIT-SudoMaker/ccw/blob/main/LICENSE) © HIT-SudoMaker

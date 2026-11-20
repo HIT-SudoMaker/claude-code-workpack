@@ -127,6 +127,22 @@ export interface Machine {
    */
   treeStamp(file: string, signal?: AbortSignal): Promise<string | null>;
   /**
+   * 按摘要移除普通文件
+   *
+   * @param expectedFingerprint - 操作前要求匹配的 SHA-256 文件摘要
+   * @throws Error - 类型或摘要不匹配、父路径含链接或文件操作失败时拒绝 Promise
+   * @remarks 分开执行摘要核对与文件移除，不创建父目录
+   */
+  removeFile(file: string, expectedFingerprint: string): Promise<void>;
+  /**
+   * 仅移除空目录
+   *
+   * @returns 目录已移除或原先就不存在时完成
+   * @throws Error - 根路径、目录非空、类型变化、父路径含链接或文件操作失败时拒绝 Promise
+   * @remarks 由文件系统在移除时检查目录是否为空，不递归删除或创建父目录
+   */
+  removeEmptyDirectory(directory: string): Promise<void>;
+  /**
    * 核对摘要后删除目标，或将目标移到保留位置
    *
    * @param file - 待移除的非根路径
@@ -246,7 +262,16 @@ export interface Machine {
 /** 可产生受管目标或进程效果的能力集合；需通过执行资格包装后交给工具域 */
 export type EffectMachine = Pick<
   Machine,
-  'initialize' | 'editJson' | 'npm' | 'removeTree' | 'replaceTree' | 'execute' | 'replaceFile' | 'ensureUserPath'
+  | 'initialize'
+  | 'editJson'
+  | 'npm'
+  | 'removeFile'
+  | 'removeEmptyDirectory'
+  | 'removeTree'
+  | 'replaceTree'
+  | 'execute'
+  | 'replaceFile'
+  | 'ensureUserPath'
 >;
 
 /** 观察与来源暂存能力；不含受管目标写入方法，命令仍需经过可信查询门 */
@@ -330,6 +355,8 @@ export function createMachine(
     editJson,
     entries,
     treeStamp,
+    removeFile,
+    removeEmptyDirectory,
     removeTree,
     replaceFile,
     async realpath(file) {
@@ -702,6 +729,27 @@ async function treeStamp(file: string, signal?: AbortSignal): Promise<string | n
   }
 }
 
+async function removeFile(file: string, expectedFingerprint: string) {
+  await checkParentLinks(file);
+  if ((await fingerprint(file)) !== expectedFingerprint) throw new Error('target-changed');
+  await fs.unlink(file);
+}
+
+async function removeEmptyDirectory(directory: string) {
+  if (path.resolve(directory) === path.parse(path.resolve(directory)).root) throw new Error('invalid-target');
+  await checkParentLinks(directory);
+  try {
+    if (!(await fs.lstat(directory)).isDirectory()) throw new Error('target-changed');
+    await fs.rmdir(directory);
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === 'ENOENT') return;
+    if (code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'ENOTDIR')
+      throw new Error('target-changed', { cause: error });
+    throw error;
+  }
+}
+
 async function removeTree(file: string, expected: string, preserveAt?: string) {
   if (path.resolve(file) === path.parse(path.resolve(file)).root) throw new Error('invalid-target');
   await prepareParent(file);
@@ -998,7 +1046,12 @@ function relativeFile(root: string, relative: string) {
 }
 
 async function prepareParent(file: string) {
-  // 拒绝通过已有链接目录写到其他根；不追随链接部署或删除资产
+  await checkParentLinks(file);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+}
+
+/** 检查父路径，阻止通过符号链接修改目标 */
+async function checkParentLinks(file: string) {
   let directory = path.dirname(file);
   while (directory !== path.dirname(directory)) {
     try {
@@ -1008,7 +1061,6 @@ async function prepareParent(file: string) {
     }
     directory = path.dirname(directory);
   }
-  await fs.mkdir(path.dirname(file), { recursive: true });
 }
 
 async function fileStat(file: string) {

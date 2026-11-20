@@ -3,7 +3,7 @@ import { step, sequence } from './work.js';
 import { knownTitle } from './management-catalog.js';
 import { isObject } from './machine.js';
 import { commandReceipt, json, object, success } from './model.js';
-import type { Context, Item, Prepared, Selection, Json, ClaudeCommand } from './model.js';
+import type { Context, Domain, Item, Prepared, Selection, Json, ClaudeCommand } from './model.js';
 import { applyFrozenJson, assessFrozenJson, jsonField, jsonFingerprint as digest } from './frozen-json.js';
 
 interface OrderedField {
@@ -22,7 +22,7 @@ type RootField = OrderedField &
 type EnvField = OrderedField &
   (
     | { readonly role: 'preserve' | 'base' | 'key' | 'token' }
-    | { readonly role: 'model'; readonly editor: 'model' | 'fable' | 'opus' | 'sonnet' | 'haiku' }
+    | { readonly role: 'model'; readonly modelField: { readonly key: string; readonly label: string } }
     | {
         readonly role: 'default';
         readonly when: 'configure' | 'win32' | 'custom-base';
@@ -38,7 +38,7 @@ type SettingsPatch = {
   readonly value: Json;
 };
 
-// 保留字段只定位已有键；偏好默认值由编辑器提交，不在安装初始化时补齐
+// 保留字段只参与排序，偏好默认值由编辑表单提交
 const ROOT_FIELDS = {
   $schema: { placement: 'prefix', role: 'preserve' },
   defaultShell: { placement: 'prefix', role: 'preserve' },
@@ -71,17 +71,26 @@ const ENV_FIELDS = {
   ANTHROPIC_CUSTOM_HEADERS: { placement: 'suffix', role: 'preserve' },
   ANTHROPIC_API_KEY: { placement: 'suffix', role: 'key' },
   ANTHROPIC_AUTH_TOKEN: { placement: 'suffix', role: 'token' },
-  ANTHROPIC_MODEL: { placement: 'suffix', role: 'model', editor: 'model' },
+  ANTHROPIC_MODEL: { placement: 'suffix', role: 'model', modelField: { key: 'model', label: '默认模型' } },
   ANTHROPIC_DEFAULT_MODEL: { placement: 'suffix', role: 'preserve' },
-  ANTHROPIC_DEFAULT_FABLE_MODEL: { placement: 'suffix', role: 'model', editor: 'fable' },
-  ANTHROPIC_DEFAULT_OPUS_MODEL: { placement: 'suffix', role: 'model', editor: 'opus' },
-  ANTHROPIC_DEFAULT_SONNET_MODEL: { placement: 'suffix', role: 'model', editor: 'sonnet' },
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: { placement: 'suffix', role: 'model', editor: 'haiku' },
+  ANTHROPIC_DEFAULT_FABLE_MODEL: { placement: 'suffix', role: 'model', modelField: { key: 'fable', label: 'Fable' } },
+  ANTHROPIC_DEFAULT_OPUS_MODEL: { placement: 'suffix', role: 'model', modelField: { key: 'opus', label: 'Opus' } },
+  ANTHROPIC_DEFAULT_SONNET_MODEL: {
+    placement: 'suffix',
+    role: 'model',
+    modelField: { key: 'sonnet', label: 'Sonnet' },
+  },
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: { placement: 'suffix', role: 'model', modelField: { key: 'haiku', label: 'Haiku' } },
 } as const satisfies Readonly<Record<string, EnvField>>;
 
 const rootFields = Object.entries(ROOT_FIELDS);
 
 const envFields = Object.entries(ENV_FIELDS);
+
+/** 模型字段和显示名称的只读清单，沿用配置顺序 */
+export const MODEL_FIELDS = Object.freeze(
+  envFields.flatMap(([, field]) => (field.role === 'model' ? [Object.freeze({ ...field.modelField })] : [])),
+);
 
 const connectionKeys = envFields
   .filter(([, field]) => ['base', 'key', 'token', 'model'].includes(field.role))
@@ -90,16 +99,42 @@ const connectionKeys = envFields
 const helperKeys = rootFields.filter(([, field]) => field.role === 'helper').map(([key]) => key);
 
 /**
- * 准备模型连接、偏好和默认设置变更
+ * 创建用户设置域
  *
- * @param selection - configure 可留空凭据以沿用所选认证类型；detach 只移除连接字段和凭据助手
- * @param claude - 官方登录所需的绑定命令
- * @returns 预览不含凭据的延迟流程，执行时复核字段并保留无关设置
- * @throws Error - 读取、动作、连接字段、登录依赖无效，无连接可解除或继承环境变量冲突时拒绝
- * @remarks 登录失败或取消不回滚已保存设置
+ * @returns 管理模型连接和偏好的设置域，检查时仅返回公开字段和凭据存在标记
+ * @remarks 仅在显式请求官方登录时获取计划绑定的 Claude 命令
  */
-export async function prepareSettings(ctx: Context, selection: Selection, claude?: ClaudeCommand): Promise<Prepared> {
+export function createSettingsDomain(ctx: Context): Domain {
+  return {
+    inspect: async () => ({ items: [await inspectSettings(ctx)], problems: [] }),
+    async prepare(selection, getClaudeCommand) {
+      if (selection.id !== 'settings') throw new Error('unknown-selection');
+      return prepareSettings(ctx, selection, getClaudeCommand);
+    },
+  };
+}
+
+/**
+ * 准备安装后的默认设置
+ *
+ * @returns 供安装核验后执行的工作项
+ * @throws Error - 设置文件读取失败或内容不是有效的 JSON 对象时拒绝 Promise
+ * @remarks 准备时只读取用户设置，执行时将自动更新通道设为 stable 并补齐其余缺失的默认项
+ */
+export function prepareDefaultSettings(ctx: Context): Promise<Prepared> {
+  return prepareSettings(ctx, { action: 'configure' });
+}
+
+/** 准备用户设置变更，官方登录失败或取消时保留已保存的设置 */
+async function prepareSettings(
+  ctx: Context,
+  selection: Pick<Selection, 'action' | 'fields'>,
+  getClaudeCommand?: () => Promise<ClaudeCommand>,
+): Promise<Prepared> {
   if (!['configure', 'detach'].includes(selection.action)) throw new Error('action-unavailable');
+  const fields = selection.action === 'detach' ? {} : (selection.fields ?? {});
+  const shouldLogIn = fields.mode === 'official' && fields.login === 'yes';
+  const loginCommand = shouldLogIn ? await getClaudeCommand?.() : undefined;
   const settings = await json(ctx.machine, ctx.settingsFile);
   const env = object(settings.env);
   if (
@@ -108,11 +143,9 @@ export async function prepareSettings(ctx: Context, selection: Selection, claude
     !helperKeys.some(key => settings[key] !== undefined)
   )
     throw new Error('no-connection');
-  const fields = selection.action === 'detach' ? {} : (selection.fields ?? {});
   const changes: Record<string, unknown> = {};
   const preferences: Record<string, unknown> = {};
-  const shouldLogin = fields.mode === 'official' && fields.login === 'yes';
-  if (shouldLogin && !claude) throw new Error('claude-not-installed');
+  if (shouldLogIn && !loginCommand) throw new Error('claude-not-installed');
   const shouldControlHelper = selection.action === 'detach' || fields.mode === 'official' || fields.mode === 'api';
   if (selection.action === 'detach' || fields.mode === 'official') {
     for (const key of connectionKeys) changes[key] = undefined;
@@ -137,8 +170,8 @@ export async function prepareSettings(ctx: Context, selection: Selection, claude
   }
   if (shouldControlHelper) for (const key of helperKeys) preferences[key] = undefined;
   for (const [key, field] of envFields)
-    if (field.role === 'model' && fields[field.editor] !== undefined)
-      changes[key] = fields[field.editor]?.trim() || undefined;
+    if (field.role === 'model' && fields[field.modelField.key] !== undefined)
+      changes[key] = fields[field.modelField.key]?.trim() || undefined;
   for (const [key, field] of rootFields)
     if (field.role === 'preference' && fields[key] !== undefined) preferences[key] = fields[key] || undefined;
   if ((ctx.inheritedKeys ?? []).some(key => Object.hasOwn(changes, key)))
@@ -186,20 +219,20 @@ export async function prepareSettings(ctx: Context, selection: Selection, claude
   const write = writeSettings(ctx, patches, fields.secret?.trim() || undefined, [
     { code: selection.action === 'detach' ? 'settings-disconnect' : 'settings-edit', detail: ctx.settingsFile },
   ]);
-  return shouldLogin && claude
+  return loginCommand
     ? sequence([
         step([], async () => {
-          await claude.verify();
+          await loginCommand.verify();
           return { state: 'complete' };
         }),
         write,
-        loginWork(claude),
+        loginWork(loginCommand),
       ])
     : write;
 }
 
-/** 供 Claude 管理域检查模型设置；只返回公开字段和凭据存在标记 */
-export async function inspectSettings(ctx: Context): Promise<Item> {
+/** 读取模型与偏好设置，隐去凭据内容 */
+async function inspectSettings(ctx: Context): Promise<Item> {
   const settings = await json(ctx.machine, ctx.settingsFile);
   const env = object(settings.env);
   const hasApiConfiguration = envFields.some(
@@ -207,7 +240,7 @@ export async function inspectSettings(ctx: Context): Promise<Item> {
   );
   const values: Record<string, string> = {};
   if (hasApiConfiguration || Object.keys(settings).length > 0) values.mode = hasApiConfiguration ? 'api' : 'official';
-  // 仅提示本文件的编辑选择，不代表已解析当前会话的认证来源
+  // 仅从用户设置推断表单的认证选项，实际会话由 Claude 解析
   values.auth = envFields.some(
     ([key, field]) => field.role === 'token' && typeof env[key] === 'string' && env[key].trim() !== '',
   )
@@ -217,7 +250,7 @@ export async function inspectSettings(ctx: Context): Promise<Item> {
     const value = env[key];
     if (typeof value === 'string') {
       if (field.role === 'base') values.baseUrl = value;
-      if (field.role === 'model') values[field.editor] = value;
+      if (field.role === 'model') values[field.modelField.key] = value;
     }
   }
   for (const [key, field] of rootFields)
@@ -246,6 +279,7 @@ export async function inspectSettings(ctx: Context): Promise<Item> {
   };
 }
 
+/** 准备字段级写入，执行时复核目标字段并保留无关设置 */
 function writeSettings(
   ctx: Context,
   patches: readonly SettingsPatch[],
@@ -330,6 +364,7 @@ function writeSettings(
   );
 }
 
+/** 准备交互登录，通过 Claude 认证状态核验结果 */
 function loginWork(claude: ClaudeCommand): Prepared {
   const login = step(
     [{ code: 'login-browser' }],
@@ -349,7 +384,7 @@ function loginWork(claude: ClaudeCommand): Prepared {
   return login;
 }
 
-/** 补齐安装默认值；保留显式值和继承变量声明 */
+/** 固定自动更新通道，跳过已有值和继承变量以补齐其余默认项 */
 function initializeDefaults(settings: Record<string, unknown>, ctx: Context) {
   const env = object(settings.env);
   const hasCustomBase = envFields.some(([key, field]) => {
@@ -380,7 +415,6 @@ function initializeDefaults(settings: Record<string, unknown>, ctx: Context) {
       settings[key] = { ...field.value };
       root[key] = settings[key];
     }
-  // 始终使用 stable 通道；首次危险模式确认使用官方设置
   if (settings.autoUpdatesChannel !== 'stable') {
     settings.autoUpdatesChannel = 'stable';
     root.autoUpdatesChannel = 'stable';
@@ -389,7 +423,7 @@ function initializeDefaults(settings: Record<string, unknown>, ctx: Context) {
     settings.skipDangerousModePermissionPrompt = true;
     root.skipDangerousModePermissionPrompt = true;
   }
-  // 权限默认模式只在缺失时补齐；已有选择（含更保守模式）不覆盖，allow/ask/deny 原样保留
+  // 仅在缺少默认模式时补齐，保留已有权限规则
   const permissions = object(settings.permissions);
   if (permissions.defaultMode === undefined) {
     permissions.defaultMode = 'bypassPermissions';
@@ -399,7 +433,7 @@ function initializeDefaults(settings: Record<string, unknown>, ctx: Context) {
   return { env: added, root };
 }
 
-/** 只重排 root/env 自身属性；未知键保持相对顺序，嵌套值保持原样 */
+/** 重排配置对象的自身属性，保留未知键的相对顺序与嵌套值 */
 function orderFields(value: Record<string, unknown>, fields: readonly (readonly [string, OrderedField])[]) {
   const known = new Set(fields.map(([key]) => key));
   const ordered = Object.fromEntries(
@@ -410,7 +444,7 @@ function orderFields(value: Record<string, unknown>, fields: readonly (readonly 
     ].map(([key]) => [key, value[key]]),
   );
   for (const key of Object.keys(value)) delete value[key];
-  // JSON 可包含 __proto__；以自身属性重建，不触发原型 setter
+  // 重建自身属性，避免 __proto__ 触发原型 setter
   Object.defineProperties(value, Object.getOwnPropertyDescriptors(ordered));
 }
 
@@ -428,11 +462,12 @@ function jsonValue(value: unknown): Json {
 }
 
 /**
- * 校验 API 地址和凭据存在性，不连接远端服务
+ * 校验 API 地址与凭据是否齐备
  *
  * @param baseUrl - 可带首尾空白的 HTTP 或 HTTPS 地址
- * @param hasCredential - 调用方已确认是否存在有效凭据
- * @returns 缺少字段或地址格式的问题码；校验通过时为 null
+ * @param hasCredential - 是否有可提交或可保留的凭据
+ * @returns 校验通过时为 null，缺少字段或地址无效时返回问题码
+ * @remarks 仅校验本地输入
  */
 export function apiConfigurationProblem(baseUrl: string | undefined, hasCredential: boolean): string | null {
   if (!baseUrl?.trim()) return hasCredential ? 'base-url-required' : 'api-fields-required';

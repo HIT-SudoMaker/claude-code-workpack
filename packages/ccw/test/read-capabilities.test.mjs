@@ -90,13 +90,24 @@ test('读取能力：不暴露受管写方法', () => {
     read: async () => null,
     initialize: async () => true,
     editJson: async () => {},
+    removeFile: async () => {},
+    removeEmptyDirectory: async () => {},
     removeTree: async () => {},
     replaceFile: async () => {},
     replaceTree: async () => {},
     ensureUserPath: async () => {},
   };
   const reading = createReadMachine(machine, () => undefined);
-  for (const method of ['initialize', 'editJson', 'removeTree', 'replaceFile', 'replaceTree', 'ensureUserPath'])
+  for (const method of [
+    'initialize',
+    'editJson',
+    'removeFile',
+    'removeEmptyDirectory',
+    'removeTree',
+    'replaceFile',
+    'replaceTree',
+    'ensureUserPath',
+  ])
     assert.equal(method in reading, false, method);
 });
 

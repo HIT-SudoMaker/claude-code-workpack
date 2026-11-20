@@ -174,7 +174,10 @@ test('检查页对齐模型字段和同组状态，共用插件路径只显示�
   const fields = lines.filter(line => /^ {2}(默认模型|Fable|Opus|Sonnet|Haiku|默认语言|输出风格|路径)/.test(line));
   const modelFields = fields.slice(0, 8);
   assert.equal(modelFields.length, 8);
-  assert.match(text, /Fable\s*：model-fable/);
+  assert.deepEqual(
+    modelFields.slice(0, 5).map(line => line.trim().replace(/\s+：/, '：')),
+    ['默认模型：model-default', 'Fable：model-fable', 'Opus：model-opus', 'Sonnet：model-sonnet', 'Haiku：model-haiku'],
+  );
   assert.equal(new Set(modelFields.map(line => stringWidth(line.split('：')[0]))).size, 1);
   const pluginLines = lines.filter(line => /^(GitHub|Frontend Design|Serena)/.test(line));
   assert.equal(pluginLines.length, 3);
@@ -190,6 +193,26 @@ test('检查页对齐模型字段和同组状态，共用插件路径只显示�
   });
   assert.match(detailed, /\/github\/settings.json/);
   assert.match(detailed, /\/serena\/settings.json/);
+});
+
+test('检查页显示五个模型字段并标明未配置项', () => {
+  const text = describeInspection({
+    items: [
+      {
+        id: 'settings',
+        title: '模型配置',
+        kind: 'settings',
+        facts: [],
+        values: { fable: ' ', sonnet: 'model-sonnet' },
+      },
+    ],
+    problems: [],
+  });
+  const modelLines = text.split('\n').filter(line => line.startsWith('  '));
+  assert.deepEqual(
+    modelLines.map(line => line.trim().replace(/\s+：/, '：')),
+    ['默认模型：未配置', 'Fable：未配置', 'Opus：未配置', 'Sonnet：model-sonnet', 'Haiku：未配置'],
+  );
 });
 
 test('选择列表使用简洁且符合对象含义的状态', () => {

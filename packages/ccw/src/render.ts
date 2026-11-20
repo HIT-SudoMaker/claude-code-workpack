@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import stringWidth from 'string-width';
 import { MESSAGES } from './messages.js';
 import { isObject } from './machine.js';
+import { MODEL_FIELDS } from './settings.js';
 import type {
   Action,
   Change,
@@ -91,19 +92,10 @@ const ACTION_NAMES: Readonly<Record<Action, string>> = {
   clean: '清理',
 };
 
-/** 模型配置表单的字段键与显示顺序 */
-export const MODEL_FIELDS = [
-  { key: 'model', label: '默认模型' },
-  { key: 'fable', label: 'Fable' },
-  { key: 'opus', label: 'Opus' },
-  { key: 'sonnet', label: 'Sonnet' },
-  { key: 'haiku', label: 'Haiku' },
-] as const;
-
 /** 配置表单在缺少已有值时采用的偏好 */
 export const DEFAULT_PREFERENCES = { language: 'Simplified Chinese', outputStyle: 'Explanatory' } as const;
 
-/** 模型连接、语言和风格分别编辑，计划阶段仍合并为同一配置对象 */
+/** 模型连接、语言和输出风格的独立编辑项 */
 export const SETTINGS_EDITORS = ['connection', 'language', 'outputStyle'] as const;
 export type SettingsEditor = (typeof SETTINGS_EDITORS)[number];
 
@@ -140,7 +132,7 @@ const GROUPS: Readonly<Record<Kind, string>> = {
   data: '清理数据',
 };
 
-/** 按终端菜单的类别顺序返回新数组，不修改输入 */
+/** 按终端菜单的类别顺序排列条目，返回新数组 */
 export function contentOrder(items: readonly Item[]) {
   const order: Kind[] = ['claude', 'settings', 'plugin', 'skill', 'officecli', 'ccline', 'data'];
   return [...items].sort((left, right) => order.indexOf(left.kind) - order.indexOf(right.kind));
@@ -151,7 +143,7 @@ export function contentRow(item: Item): MenuRow {
   return { label: contentName(item), detail: shortStatus(item), group: GROUPS[item.kind] };
 }
 
-/** 按当前值和本次草稿显示独立设置入口，不读取或写入配置 */
+/** 根据当前值和表单草稿生成设置菜单行 */
 export function settingsRow(item: Item, editor: SettingsEditor, fields?: Readonly<Record<string, string>>): MenuRow {
   const values = { ...item.values, ...fields };
   if (editor === 'connection')
@@ -176,9 +168,10 @@ export function settingsRow(item: Item, editor: SettingsEditor, fields?: Readonl
 }
 
 /**
- * 汇总检查条目和检查问题的显示文本
+ * 生成检查报告文本
  *
- * @param details - 为 true 时附带事实诊断代码；输入详情必须已脱敏
+ * @param details - 为 true 时附带事实诊断码
+ * @remarks 调用方须先对输入详情脱敏
  */
 export function describeInspection(view: Inspection, details = false) {
   const lines: string[] = [];
@@ -211,7 +204,7 @@ export function describeInspection(view: Inspection, details = false) {
   return lines.join('\n');
 }
 
-/** 优先采用表单中的显式连接模式，否则从已有配置事实推断初始选项 */
+/** 解析表单连接模式，显式选项优先于已有配置 */
 export function effectiveConnection(values: Readonly<Record<string, string>>, facts: readonly Change[]) {
   return values.mode === 'api' || (values.mode !== 'official' && facts.some(fact => fact.code === 'api-configured'))
     ? 'api'
@@ -223,7 +216,7 @@ export function describePreparation(event: PreparationProgress) {
   return '准备：' + contentName(event);
 }
 
-/** 按产品类别展示计划，详细模式展开执行步骤 */
+/** 按产品类别生成计划预览，详细模式展开执行步骤 */
 export function describePlan(plan: Plan, details = false) {
   const counts = new Map<string, number>();
   for (const item of plan.items) {
@@ -299,11 +292,11 @@ export function describePlan(plan: Plan, details = false) {
 }
 
 /**
- * 将计划、进度事件和最终结果转换为执行视图
+ * 创建执行视图生成器
  *
  * @param task - 整批失败时的任务名称，省略时显示通用失败文案
- * @param details - 显示原因码，不改变执行状态
- * @returns 仅更新内存的视图生成器，保留计划中的条目标题
+ * @param details - 是否显示原因码
+ * @returns 接收进度和最终结果的视图生成器，保留计划中的条目标题
  */
 export function createRunPresentation(
   plan: { readonly items: readonly PlanItem[] },
@@ -328,7 +321,7 @@ export function createRunPresentation(
     }
   };
   return {
-    /** 记录已知条目的事件并返回当前视图；省略事件只读取视图 */
+    /** 更新已知条目的进度，省略事件时仅返回当前视图 */
     progress(event?: Progress): RunView {
       if (event) {
         const previous = execution.get(event.id);
@@ -345,7 +338,7 @@ export function createRunPresentation(
       }
       return progressView(items(), details);
     },
-    /** 合入最终条目结果并返回结果视图 */
+    /** 合并最终条目结果，返回结果视图 */
     result(result: RunResult): RunView {
       recordResult(result);
       return resultView(result, items(), details, task);
@@ -353,7 +346,7 @@ export function createRunPresentation(
   };
 }
 
-/** 将执行视图转换为标题、汇总和状态行组成的多行文本 */
+/** 生成包含标题、汇总和状态行的执行文本 */
 export function describeRun(view: RunView) {
   return [view.title, view.summary, ...view.rows.map(statusLine)].filter(Boolean).join('\n');
 }
@@ -370,7 +363,7 @@ function describeItem(item: Item, nameWidth: number, details: boolean, commonPat
   if (item.kind === 'ccline')
     information.push(['状态栏', facts.some(fact => fact.code === 'connected') ? '已配置' : '未配置']);
   if (item.kind === 'settings' && !item.problem) {
-    for (const { key, label } of MODEL_FIELDS) if (values[key]) information.push([label, values[key]]);
+    for (const { key, label } of MODEL_FIELDS) information.push([label, values[key]?.trim() || '未配置']);
     if (values.language) information.push(['默认语言', values.language]);
     if (values.outputStyle) information.push(['输出风格', values.outputStyle]);
   }

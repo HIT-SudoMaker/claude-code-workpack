@@ -1,8 +1,8 @@
-import { inspectSettings, prepareSettings } from './settings.js';
+import { prepareDefaultSettings } from './settings.js';
 import { knownTitle } from './management-catalog.js';
 import type { Context, Domain, Inspection, Prepared, Selection } from './model.js';
 import path from 'node:path';
-import { errorCode, isObject } from './machine.js';
+import { isObject } from './machine.js';
 import { claudeRunning } from './claude-program.js';
 import { isExactVersion, NPM_OFFICIAL, resolveNpmView } from './npm-registry.js';
 import type { NpmResolution } from './npm-registry.js';
@@ -17,42 +17,21 @@ import { freezeNpmScope } from './program-channels.js';
 import type { ClaudeProgram } from './claude-program.js';
 import { npmProgram } from './program-operations.js';
 import { step, sequence } from './work.js';
-import { prepareDataCleanup } from './cleanup.js';
+import { kindOf } from './model.js';
 
 const STABLE_METADATA_TIMEOUT_MS = 5_000;
 
 /**
- * 管理 Claude 程序、默认设置、模型配置和官方登录
+ * 管理 Claude Code 程序
  *
- * @remarks 仅管理 npm 渠道，安装与更新使用当次 stable 并补齐默认设置
- * 卸载要求 Claude 已停止；外部安装只展示
+ * @remarks 通过 npm 安装或更新当次 stable 版本，并补齐默认设置
+ * 显示外部安装状态，卸载受管程序前须确认 Claude 已停止
  */
 export function createClaudeDomain(ctx: Context): Domain {
   return {
-    async inspect() {
-      const checks = [
-        ['claude', () => inspectClaudePrograms(ctx)],
-        ['settings', async () => ({ items: [await inspectSettings(ctx)], problems: [] })],
-      ] as const;
-      const results = await Promise.all(
-        checks.map(async ([name, read]): Promise<Inspection> => {
-          try {
-            return await read();
-          } catch (error) {
-            return { items: [], problems: [{ code: errorCode(error), detail: name }] };
-          }
-        }),
-      );
-      return { items: results.flatMap(result => result.items), problems: results.flatMap(result => result.problems) };
-    },
-    async prepare(selection, claude) {
-      if (selection.id.startsWith('data:')) return prepareDataCleanup(ctx, selection);
-      if (selection.id === 'settings') {
-        const login =
-          selection.action === 'configure' && selection.fields?.mode === 'official' && selection.fields.login === 'yes';
-        return prepareSettings(ctx, selection, login ? await claude?.() : undefined);
-      }
-      if (selection.id.split(':')[0] !== 'claude') throw new Error('unknown-selection');
+    inspect: () => inspectClaudePrograms(ctx),
+    async prepare(selection) {
+      if (kindOf(selection.id) !== 'claude') throw new Error('unknown-selection');
       return prepareClaudeProgram(ctx, selection);
     },
   };
@@ -91,9 +70,9 @@ async function prepareClaudeProgram(ctx: Context, selection: Selection): Promise
     throw new Error('program-changed');
   const operation = await prepareClaudeInstallation(ctx, action, program);
   if (action !== 'install') return operation;
-  const defaults = await prepareSettings(ctx, { id: 'settings', action: 'configure' });
+  const defaultSettings = await prepareDefaultSettings(ctx);
   return {
-    ...sequence([operation, defaults]),
+    ...sequence([operation, defaultSettings]),
     action: operation.action ?? 'install',
     ...(operation.claude ? { claude: operation.claude } : {}),
   };
@@ -170,7 +149,7 @@ async function prepareClaudeInstallation(
 async function stableClaudeVersion(ctx: Context): Promise<NpmResolution<string>> {
   const release = await resolveNpmView(ctx.machine, `${CLAUDE_PACKAGE}@stable`, 'version', exactVersion);
   if (release !== null) return release;
-  // npm 查询未得到有效版本时才读取官方稳定版元数据，返回值仍绑定官方来源
+  // 改查官方 stable 元数据时，将安装来源也固定为官方 registry
   try {
     const metadata: unknown = JSON.parse(
       await ctx.machine.fetchText(`${NPM_OFFICIAL}/@anthropic-ai%2Fclaude-code/stable`, {
@@ -189,7 +168,7 @@ function exactVersion(value: unknown) {
   return isExactVersion(value) ? value : null;
 }
 
-/** 卸载前后核对 Claude 进程，通用 npm 执行器不识别具体包名 */
+/** 确认 Claude 进程已停止，供卸载前后核验 */
 async function assertClaudeStopped(ctx: Context) {
   const running = await claudeRunning(ctx.machine);
   if (running !== false) throw new Error(running ? 'claude-running' : 'process-state-unconfirmed');

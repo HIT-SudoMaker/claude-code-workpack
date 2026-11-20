@@ -6,7 +6,9 @@
 
 CCW 通过 npm 查询并安装当次 `@anthropic-ai/claude-code@stable`，根据包清单选择 JavaScript 或原生入口。准备计划时会固定 npm 的安装范围和程序身份，执行前再次核对。
 
-Claude 域负责模型连接、语言、输出风格和默认设置。安装时将 `autoUpdatesChannel` 设为 `stable`；`permissions.defaultMode` 和 `skipDangerousModePermissionPrompt` 只在缺失时分别设为 `bypassPermissions` 和 `true`。危险模式确认使用 Claude 的[公开设置](https://code.claude.com/docs/en/settings-reference#skipdangerousmodepermissionprompt)，不会修改私有 API 密钥确认缓存或默认开启 `IS_DEMO`。
+设置模块负责模型连接、语言、输出风格和官方登录。模型配置包含默认模型、Fable、Opus、Sonnet 和 Haiku。默认模型对应 `ANTHROPIC_MODEL`，其余四项对应各自的 Claude 模型别名环境变量。
+
+程序安装核验后，设置模块将 `autoUpdatesChannel` 设为 `stable`。缺少 `permissions.defaultMode` 或 `skipDangerousModePermissionPrompt` 时，分别补为 `bypassPermissions` 和 `true`。危险模式确认使用 Claude 的[公开设置](https://code.claude.com/docs/en/settings-reference#skipdangerousmodepermissionprompt)。
 
 ## Plugins
 

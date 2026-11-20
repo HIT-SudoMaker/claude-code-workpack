@@ -1,6 +1,6 @@
 import type { Ccw, Item, Pick, Request } from './ccw.js';
 import { errorCode } from './machine.js';
-import { apiConfigurationProblem } from './settings.js';
+import { apiConfigurationProblem, MODEL_FIELDS } from './settings.js';
 import {
   HOME_TITLE,
   BACK_TO_HOME,
@@ -11,7 +11,6 @@ import {
   describePreparation,
   describeRun,
   describePlan,
-  MODEL_FIELDS,
   DEFAULT_PREFERENCES,
   effectiveConnection,
   SETTINGS_EDITORS,
@@ -65,7 +64,7 @@ export interface SelectionPage {
 /** 切换单行或整页勾选状态的事件 */
 export type SelectionChange = { readonly kind: 'toggle'; readonly index: number } | { readonly kind: 'all' };
 
-/** 表单字段的初始值和显示属性；secret 只控制输入的遮蔽显示 */
+/** 表单字段的初始值和显示属性，secret 仅控制屏幕遮蔽 */
 export interface FormField {
   readonly key: string;
   readonly label: string;
@@ -74,23 +73,24 @@ export interface FormField {
   readonly placeholder?: string;
 }
 
-/** 表单校验结果；null 表示通过，field 用于定位未通过的字段 */
+/** 表单校验结果，null 表示通过，field 定位未通过的字段 */
 export type FormProblem = { readonly message: string; readonly field: string } | null;
 
 /**
- * 交互终端的页面、输入与外部命令交接能力
+ * 管理交互页面、输入和外部命令交接
  *
- * @remarks 等待输入的方法须依次调用，不能并行打开页面；等待期间终端关闭、渲染失败或重复等待输入会拒绝 Promise
+ * @remarks 按顺序等待页面输入
+ * 终端关闭、渲染失败或重复等待输入会拒绝 Promise
  */
 export interface Terminal {
   /**
-   * 显示等待页并运行可取消任务
+   * 运行等待页任务
    *
-   * @param work - 接收页面专用取消信号和可选进度更新函数；离开页面后忽略迟到结果
+   * @param work - 接收页面取消信号和可选的进度更新函数
    * @param signal - 外部取消信号，已取消时不启动任务
-   * @returns 任务结果；Esc 或信号取消返回 null
+   * @returns 任务结果，Esc 或信号取消时返回 null
    * @throws Error - 未取消时任务失败会拒绝 Promise
-   * @remarks 不限制任务的读写能力；取消只发出停止信号，不等待任务结束或回滚已有效果
+   * @remarks 取消时发出停止信号并忽略迟到结果，不等待任务结束或回滚已有效果
    */
   wait<T>(
     title: string,
@@ -98,7 +98,7 @@ export interface Terminal {
     signal?: AbortSignal,
   ): Promise<T | null>;
   /**
-   * 显示菜单并等待确认或返回
+   * 显示单选菜单
    *
    * @param choices - 至少包含一个选项
    * @param defaultIndex - 初始焦点，省略时为首项
@@ -112,11 +112,12 @@ export interface Terminal {
     options?: { readonly home?: boolean },
   ): Promise<number>;
   /**
-   * 原地编辑整页字段，校验失败时保留输入并定位字段
+   * 编辑表单字段
    *
    * @param validate - 提交时校验当前字段，返回 null 才交付结果
-   * @returns 通过校验的字段值；取消返回 null，不交付草稿
-   * @remarks secret 字段在屏幕上遮蔽，返回值仍含原文，调用方须避免将其写入公开结果或日志
+   * @returns 通过校验的字段值，取消时返回 null
+   * @remarks 校验失败时保留输入并定位字段
+   * secret 字段仅在屏幕上遮蔽，调用方须避免将原文写入公开结果或日志
    */
   form(
     title: string,
@@ -124,34 +125,40 @@ export interface Terminal {
     validate: (values: Readonly<Record<string, string>>) => FormProblem,
   ): Promise<Record<string, string> | null>;
   /**
-   * 暂停已启动的界面并释放终端输入，供外部交互命令使用
+   * 将终端交给外部交互命令
    *
-   * @returns work 的结果；work 失败时恢复界面后继续拒绝 Promise
-   * @remarks 仅在执行屏活动且无待决输入时调用；交接期间用 show 缓存进度
-   * work 结束后恢复界面；恢复失败也会拒绝 Promise，不回滚命令效果
+   * @returns work 的结果
+   * @throws Error - work 或界面恢复失败时拒绝 Promise
+   * @remarks 仅在执行屏活动且无待决输入时交接，交接期间用 show 缓存进度
+   * work 结束后恢复界面，不回滚命令效果
    */
   handoff<T>(work: () => Promise<T>): Promise<T>;
   /**
-   * 显示多选页面，将勾选变化同步交给调用方更新
+   * 显示多选页面
    *
    * @param change - 更新调用方草稿并同步返回新页面
-   * @returns 提交、取消或请求编辑的行索引；勾选状态由调用方通过 change 维护
-   * @remarks 默认焦点为首项；page.focus 可恢复编辑前所在行
+   * @returns 提交、取消，或带行索引的编辑请求
+   * @remarks 默认聚焦首项，可通过 page.focus 恢复编辑前的焦点
    */
   select(
     page: SelectionPage,
     change: (event: SelectionChange) => SelectionPage,
   ): Promise<'submit' | 'cancel' | { readonly kind: 'edit'; readonly index: number }>;
-  /** 无待决输入时更新执行视图；终端交接期间保存视图，恢复后重放 */
+  /**
+   * 更新执行视图
+   *
+   * @remarks 仅在没有待决输入时更新，交接期间缓存到界面恢复时显示
+   */
   show(view: RunView): void;
 }
 
 /**
- * 驱动主菜单、配置草稿、变更预览和确认后的执行
+ * 运行终端工作流
  *
  * @param signal - 传递给检查、计划准备与执行；取消不会唤醒正在等待输入的菜单或表单
  * @param details - 在检查、预览、执行结果和操作失败说明中附带原因码
- * @remarks 只有用户确认预览后才调用 apply；取消不回滚已执行变更，终端由调用方关闭
+ * @remarks 仅在用户确认预览后执行变更，取消不回滚已执行变更
+ * 调用方负责关闭终端
  * @throws Error - 未在操作页处理的终端或检查失败会拒绝 Promise
  */
 export async function runTerminal(ccw: Ccw, terminal: Terminal, signal?: AbortSignal, details = false) {
@@ -334,7 +341,7 @@ async function configure(item: Item, editor: SettingsEditor, terminal: Terminal,
         login: 'yes',
       },
     };
-  const kept = item.hasCredential === true;
+  const hasSavedCredential = item.hasCredential === true;
   const fields = await terminal.form(
     '第三方 API',
     [
@@ -344,17 +351,17 @@ async function configure(item: Item, editor: SettingsEditor, terminal: Terminal,
         label: 'API Key',
         value: prior?.fields?.secret ?? '',
         secret: true,
-        placeholder: kept ? '留空保留现有凭据' : '必填',
+        placeholder: hasSavedCredential ? '留空保留现有凭据' : '必填',
       },
-      ...MODEL_FIELDS.map(field => ({
-        key: field.key,
-        label: field.label,
-        value: values[field.key] ?? '',
+      ...MODEL_FIELDS.map(({ key, label }) => ({
+        key,
+        label,
+        value: values[key] ?? '',
         placeholder: '选填',
       })),
     ],
     value => {
-      const problem = apiConfigurationProblem(value.baseUrl, !!value.secret?.trim() || kept);
+      const problem = apiConfigurationProblem(value.baseUrl, Boolean(value.secret?.trim()) || hasSavedCredential);
       return problem
         ? { message: reason(problem), field: problem === 'credential-required' ? 'secret' : 'baseUrl' }
         : null;

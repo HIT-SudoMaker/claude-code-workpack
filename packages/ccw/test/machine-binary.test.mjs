@@ -7,6 +7,23 @@ import { test } from 'node:test';
 import { createMachine } from '../dist/machine.js';
 import { createTemporaryDirectory } from './test-environment.mjs';
 
+test('移除空目录：目录非空时保留内容，清空后可以移除', async testContext => {
+  const root = await createTemporaryDirectory(testContext);
+  const machine = createMachine({}, root);
+  const directory = path.join(root, 'cache');
+  const file = path.join(directory, 'item');
+  await fs.mkdir(directory);
+  await fs.writeFile(file, 'keep');
+
+  await assert.rejects(machine.removeEmptyDirectory(directory), /target-changed/);
+  assert.equal(await fs.readFile(file, 'utf8'), 'keep');
+
+  await machine.removeFile(file, createHash('sha256').update('keep').digest('hex'));
+  await machine.removeEmptyDirectory(directory);
+  await machine.removeEmptyDirectory(directory);
+  assert.deepEqual(await fs.readdir(root), []);
+});
+
 // 部署与已有 PATH
 test('替换二进制：校验前置摘要', async testContext => {
   const root = await createTemporaryDirectory(testContext);

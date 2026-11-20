@@ -51,6 +51,44 @@ test('清理数据保护预览后修改的文件及共享链接目标', async te
   assert.equal(await fs.readFile(path.join(shared, 'keep'), 'utf8'), 'shared');
 });
 
+test('清理检查与预览以二进制单位显示逻辑文件大小', async testContext => {
+  const workspace = await createTestEnvironment(testContext);
+  const ccw = workspace.ccw(workspace.machine({ processes: async () => [] }));
+  const directory = path.join(workspace.claudeRoot, 'cache');
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'first.bin'), Buffer.alloc(512));
+
+  for (const [secondFileSizeBytes, expectedSize] of [
+    [511, '1023 B'],
+    [512, '1.0 KiB'],
+    [768, '1.3 KiB'],
+  ]) {
+    await fs.writeFile(path.join(directory, 'second.bin'), Buffer.alloc(secondFileSizeBytes));
+    const expectedSummary = `2 个文件 · 1 个目录 · ${expectedSize}`;
+    const inspection = await ccw.inspect(undefined, 'data');
+    const cache = inspection.items.find(item => item.id === 'data:cache');
+    assert.equal(cache.facts.find(fact => fact.code === 'data-size').detail, expectedSummary);
+    const plan = await ccw.plan({ task: 'clean', selected: [{ id: 'data:cache' }] });
+    assert.ok(describePlan(plan).includes(expectedSummary));
+  }
+});
+
+test('清理准备：无法获取已清点文件的摘要时不生成可执行条目', async testContext => {
+  const workspace = await createTestEnvironment(testContext);
+  const file = path.join(workspace.claudeRoot, 'cache', 'sample.bin');
+  await workspace.write(file, 'keep');
+  const machine = workspace.machine({ processes: async () => [] });
+  const ccw = workspace.ccw({
+    ...machine,
+    fingerprint: (target, signal) => (target === file ? Promise.resolve(null) : machine.fingerprint(target, signal)),
+  });
+  const plan = await ccw.plan({ task: 'clean', selected: [{ id: 'data:cache' }] });
+  assert.equal(plan.items[0].problem, 'target-changed');
+  assert.deepEqual(plan.items[0].changes, []);
+  assert.equal((await ccw.apply(plan.id)).state, 'failed');
+  assert.equal(await fs.readFile(file, 'utf8'), 'keep');
+});
+
 test('Claude 运行时拒绝清理数据，不影响普通安装入口', async testContext => {
   const workspace = await createTestEnvironment(testContext);
   const ccw = workspace.ccw(workspace.machine({ processes: async () => [{ name: 'claude.exe', command: 'claude' }] }));
@@ -100,8 +138,8 @@ test('取消清理只停止后续删除，保留已完成结果', async testCont
   const base = workspace.machine({ processes: async () => [] });
   const ccw = workspace.ccw({
     ...base,
-    async removeTree(...args) {
-      await base.removeTree(...args);
+    async removeFile(...args) {
+      await base.removeFile(...args);
       abort.abort();
     },
   });
@@ -166,9 +204,13 @@ for (const hasFile of [false, true])
     let blocked = true;
     const ccw = workspace.ccw({
       ...base,
-      removeTree: async (...args) => {
+      removeFile: async (...args) => {
         if (blocked) throw Object.assign(new Error('fixture'), { code: 'EACCES' });
-        return base.removeTree(...args);
+        return base.removeFile(...args);
+      },
+      removeEmptyDirectory: async (...args) => {
+        if (blocked) throw Object.assign(new Error('fixture'), { code: 'EACCES' });
+        return base.removeEmptyDirectory(...args);
       },
     });
     const request = { task: 'clean', selected: [{ id: 'data:cache' }] };
